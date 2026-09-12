@@ -1,57 +1,68 @@
-# fauxFAT overview and programmer's guide
+# fauxFAT overview
 
-Status: current design and implemented API; explicit physical placement and recovered-fd binding remain planned.
+The fauxFAT format, parser, reopen path, and payload recovery are implemented. Host compatibility still needs qualification.
 
-`fauxFAT` is a deliberately restricted exFAT 1.00 volume generator and block translator. It presents a normal-looking removable filesystem to a consumer OS, but the storage layout is fixed in advance. The host is allowed to overwrite the contents of predefined files. It is not allowed to allocate files, resize them, move them, extend the root directory, or otherwise redesign the volume behind our back.
+fauxFAT exposes a fixed exFAT volume over storage whose physical layout stays under application control. Hosts can overwrite predefined files; the application owns the backing data and reserved ranges.
 
-The point is to use exFAT as a transport-shaped view over storage we control, not to implement a general exFAT filesystem.
+See `fauxfat-disk-format.md` for the disk layout and `fauxfat-usage.md` for the API and recovery flow.
 
-The normative byte-level format is in `fauxfat-disk-format.md`. Remaining placement/fd-binding work and qualification tasks are tracked in `fauxfat-format-verify-plan.md`.
+## 1. Purpose
 
-## 1. Mental model
+fauxFAT gives the host a few ordinary files while firmware keeps each file at a known physical range. The host can overwrite file data, but cannot allocate or resize files or grow the root directory. Strict validation rejects those changes.
 
-A fauxFAT volume contains three kinds of physical space:
+## 2. Physical model
 
-| Kind | Host view | fauxFAT behavior |
+A fauxFAT volume has four relevant kinds of space:
+
+| Kind | Host-visible meaning | Firmware rule |
 | --- | --- | --- |
-| Public file | Ordinary root file | Host may overwrite existing bytes. Allocation and length are fixed. |
-| Opaque range | Not useful as a normal host file | Reserved for private/versioned/raw data and never writable through the public block-write translator. |
-| Filesystem structure / padding | exFAT metadata or unused defined space | Generated and validated by fauxFAT. Some padding is explicitly undefined and may be skipped during formatting. |
+| Public file | Ordinary root file | Host may overwrite bytes inside fixed `DataLength`. |
+| Named opaque range | Hidden descriptor plus private allocation | Not writable through host block translation; recoverable by logical name and physical range. |
+| Anonymous opaque reserve | No useful directory object | Preserved physical capacity for application use or later layout changes. |
+| Filesystem structure / undefined padding | exFAT metadata or semantically irrelevant bytes | Generated, verified, zeroed, or skipped according to the format contract. |
 
-Every data allocation is contiguous. Public files use exFAT `NoFatChain`; their physical block address is therefore arithmetic from `FirstCluster`. Opaque ranges are also contiguous, but their FAT entries are marked `0xFFFFFFF7` so ordinary allocation logic treats those clusters as unavailable.
+Every useful data allocation is contiguous. Public files are exFAT `NoFatChain` streams. Opaque and anonymous reserved clusters are marked allocated in the exFAT allocation bitmap and carry `0xFFFFFFF7` in the FAT, which fauxFAT uses as its deterministic private/reserved marker.
 
-The allocation bitmap is saturated: every cluster is already allocated from the moment the volume is created. The one-cluster root directory is also full. Unused root slots contain canonical benign padding entries rather than free entries. In normal operation there is nowhere for the host to create extra files or allocate extra clusters.
+The allocation bitmap is saturated. The fixed one-cluster root directory is also saturated with defined entries or benign padding. There is no free namespace or free cluster pool for normal host allocation.
 
-This gives the volume a simple contract:
+The resulting rule is intentionally narrow:
 
 ```text
-host may change:       bytes inside predefined public files
-host may not change:   allocation, file length, file placement, names,
-                       root layout, FAT ownership, bitmap, geometry,
-                       opaque descriptors, or fauxFAT structural metadata
+host may change:
+    payload bytes inside predefined public files
+    documented exFAT timestamp/archive fields
+    Main VolumeDirty
+
+host may not change:
+    geometry
+    allocation
+    file lengths or physical placement
+    fauxFAT logical identity records
+    opaque descriptors
+    FAT ownership map
+    allocation bitmap
+    structural OEM seal
 ```
 
-Normal exFAT timestamp/archive changes are tolerated where the format explicitly allows them.
+## 3. Fixed exFAT profile
 
-## 2. On-disk structure in one page
-
-fauxFAT v1 fixes the important geometry:
+The current format fixes the major geometry and parser bounds:
 
 ```text
-logical block          512 bytes
-cluster                64 KiB = 128 blocks
-FATs                   1
-root directory         exactly 1 cluster
-filesystem revision    exFAT 1.00
-file names             1..15 ISO-8859-1 bytes
-upcase table           128-byte fauxFAT table
+logical sector          512 bytes
+cluster                 64 KiB = 128 sectors
+FAT count               1
+root directory          exactly one cluster
+filesystem revision     exFAT 1.00
+logical names           1..15 ISO-8859-1 bytes
+upcase table            128-byte generated table
 ```
 
 The volume is laid out as:
 
 ```text
-main exFAT boot region
-backup exFAT boot region
+main boot region
+backup boot region
 FAT alignment
 FAT
 cluster heap:
@@ -59,186 +70,81 @@ cluster heap:
     upcase table
     root directory
     payload arena:
-        public file extents
-        anonymous opaque gaps/reserve
-        opaque/private descriptors
-        anonymous opaque tail reserve
+        public extents
+        opaque descriptors and extents
+        anonymous reserved gaps/tail
 ```
 
-Public file clusters have FAT value `0` because `NoFatChain` files do not use those entries as a chain. Opaque ranges use `0xFFFFFFF7`. Filesystem metadata clusters use normal fixed EOC/chain values.
-
-A public file uses the ordinary exFAT namespace entries plus two benign fauxFAT identity records:
+A public file uses five root entries:
 
 ```text
 File
 Stream Extension, NoFatChain=1
 File Name
-Vendor Extension, original-name bytes 0..12
-Vendor Extension, original-name bytes 13..14 + length check
+Vendor Extension, persisted logical-name part 0
+Vendor Extension, persisted logical-name part 1
 ```
 
-The two vendor records preserve the manufactured logical name. If a host performs a legal rename, parsers still return the original name and set `FAUXFAT_DISK_FILE_NAME_CHANGED`; whole-volume strict validation still reports the façade as changed. This keeps application-facing identity stable without pretending namespace mutation was authorized.
+The vendor records preserve the manufactured logical name independently of the mutable visible namespace name. If a host renames the file, bounded parsing can still recover its original identity and sets `FAUXFAT_DISK_FILE_NAME_CHANGED`. Strict whole-volume validation still treats the rename as a structural change.
 
-An opaque range which must be rediscoverable uses a hidden inert file set plus fauxFAT vendor records:
+A named opaque allocation also uses a five-entry set:
 
 ```text
 File, hidden/system/read-only
-Stream Extension, zero length
-File Name, internal $FFxxxxxxxx name
-Vendor Extension, carries the logical fauxFAT name
-Vendor Allocation, carries the real contiguous private extent
+Stream Extension, zero-length inert namespace stream
+File Name, deterministic internal stub
+Vendor Extension, logical name
+Vendor Allocation, contiguous private range
 ```
 
-The logical opaque name is not the exFAT namespace name. This allows a visible staging file and one or more private A/B or versioned copies to share the same logical name without creating duplicate host-visible file names.
+The namespace stub is not the application-visible identity. This allows a public file and one or more private generations to use the same logical name without creating duplicate visible exFAT names.
 
-## 3. Structural seal
+## 4. Structural fingerprints
 
-fauxFAT stores a structural fingerprint in exFAT OEM Parameters.
+fauxFAT stores one XXH32 structural fingerprint in exFAT OEM Parameters and separate XXH32 component fingerprints for FAT, bitmap, root, and upcase data.
 
-The main fingerprint is one XXH32 over canonical structural data:
+The structural fingerprint covers canonical metadata, not payload bytes. Large application files therefore do not make validation proportional to payload size. With 64 KiB clusters, metadata hashing grows roughly with FAT/bitmap size plus the fixed root cluster.
 
-- fixed boot geometry fields;
-- meaningful FAT entries;
-- meaningful allocation bitmap bytes;
-- the exact fauxFAT upcase table;
-- the root directory after masking only host-mutable timestamp/archive fields.
+The hash is corruption/change detection, not authentication. A writer with arbitrary block access can rewrite both metadata and an unkeyed hash. If hostile-writer authenticity is ever required, it needs a key or signature anchored outside the writable fauxFAT presentation.
 
-Payload bytes are not hashed. A 2 GiB solver file does not cause 2 GiB of hashing. With 64 KiB clusters, the structural stream is roughly 66 KiB per GiB of volume plus the fixed root/geometry overhead.
+Native exFAT checksums remain in use where the exFAT format requires them: boot checksum, entry-set checksum, NameHash, and upcase-table checksum.
 
-Additional XXH32 values fingerprint the FAT, bitmap, root, and upcase table separately for diagnostics.
+## 5. Two I/O sides
 
-These hashes detect accidental corruption and writers which do not understand fauxFAT. They are not authentication. A hostile writer which can rewrite the disk can also rewrite an unkeyed OEM hash; if authentication is ever needed, it belongs in a keyed MAC or signature outside this mechanism.
+fauxFAT separates application payload storage from the synthetic block device.
 
-## 4. Two interfaces: file backend and block device
-
-The library deliberately separates file contents from the synthetic disk view.
-
-At the top, the caller gives fauxFAT logical files backed by integer descriptors and range callbacks:
-
-```c
-typedef struct fauxfat_file {
-    const char *name;
-    int fd;
-    uint64_t size;
-    time_t mtime;
-    uint32_t data_cluster;
-} fauxfat_file;
-```
-
-The descriptor is opaque to fauxFAT. It can mean an SD extent, NOR object, host file, test object, RPC-backed stream, or anything else the caller can address with `{fd, offset, length}`.
-
-Payload I/O is performed through:
+Application payloads are identified by an integer descriptor and are accessed through bounded callbacks:
 
 ```c
 int read(void *ctx, int fd, uint64_t offset, void *dst, size_t length);
 int write(void *ctx, int fd, uint64_t offset, const void *src, size_t length);
 ```
 
-fauxFAT never requires a whole file to be buffered in RAM.
+The descriptor is opaque to fauxFAT. It may represent a raw extent, another filesystem object, a host file in tests, or any other backing store which can service `{fd, offset, length}`.
 
-At the bottom, fauxFAT exposes or materializes a 512-byte block device. Filesystem metadata is synthesized internally. A block landing inside a file is translated into the corresponding descriptor/range callback.
-
-This is the important mapping:
+The block-facing side works in volume-relative 512-byte sectors:
 
 ```text
-host block read
-    -> fauxFAT classifies the block
-       -> metadata: synthesize 512 bytes
-       -> public/opaque payload: read(fd, offset, length)
+block read
+    metadata / required-zero / undefined / anonymous reserve
+        -> synthesize deterministic bytes
+    public payload
+        -> read(fd, offset, length)
+    named opaque payload
+        -> read(fd, offset, 512)
 
-host block write
-    -> fauxFAT classifies the block
-       -> public payload: write(fd, offset, length)
-       -> anything else: reject as unmapped
+block write
+    public payload
+        -> write(fd, offset, length)
+    everything else
+        -> FAUXFAT_EUNMAPPED
 ```
 
-Opaque payload may be read through the raw block view, but is never writable through the host-facing block-write translator.
+This path requires no whole-file buffer and no extent index proportional to file count or volume size.
 
-## 5. Creating a synthetic view
+## 6. Direct physical descriptors
 
-A minimal caller supplies the public file table, optional opaque range table, and backend callbacks:
-
-```c
-static int storage_read(void *ctx, int fd, uint64_t off,
-                        void *dst, size_t len)
-{
-    /* map fd + off to the real backing store */
-    return 0;
-}
-
-static int storage_write(void *ctx, int fd, uint64_t off,
-                         const void *src, size_t len)
-{
-    /* write only the requested bounded range */
-    return 0;
-}
-
-static const fauxfat_file files[] = {
-    { "SOLVER.DB",  10, 2ULL * 1024 * 1024 * 1024, 1789161600, 0 },
-    { "CONFIG.BIN", 11, 64 * 1024,                  1789161600, 32772 },
-};
-
-static const fauxfat_opaque_file private_files[] = {
-    { "SOLVER.DB", 20, 2ULL * 1024 * 1024 * 1024, 1789161600, 32776 },
-};
-
-fauxfat_config cfg = {
-    .files = files,
-    .file_count = sizeof(files) / sizeof(files[0]),
-    .opaque_files = private_files,
-    .opaque_file_count = sizeof(private_files) / sizeof(private_files[0]),
-    .data_cluster_count = 65548,
-    .read = storage_read,
-    .write = storage_write,
-    .io_context = storage_context,
-    .partition_lba = 2048,
-    .volume_serial = 0x12345678,
-    .structural_epoch = 1,
-    .volume_guid = { /* stable 16-byte on-disk GUID */ },
-    .volume_label = "RP UPDATE",
-};
-
-fauxfat_view view;
-int rc = fauxfat_init(&view, &cfg);
-```
-
-`fauxfat_init()` allocates nothing. The configuration and file arrays must outlive the view.
-
-`data_cluster` is a zero-based cluster offset inside the payload arena. `FAUXFAT_CLUSTER_AUTO` packs an extent immediately after the previous one. Explicit entries must remain in increasing, nonoverlapping order. A gap between entries, or unused space up to `cfg.data_cluster_count`, is an anonymous opaque reservation: the bitmap stays allocated, the FAT entry is `0xFFFFFFF7`, formatting never touches the bytes, and no root descriptor is required. This makes fixed A/B slots, tail reserve, and future carve-outs possible without an in-RAM extent index.
-
-## 6. Serving the view as a block device
-
-The volume size is:
-
-```c
-uint64_t blocks = fauxfat_block_count(&view);
-```
-
-Read one or more volume-relative sectors with:
-
-```c
-fauxfat_read_block(&view, block, sector);
-fauxfat_read_blocks(&view, first_block, count, buffer);
-```
-
-`partition_lba` is written into the exFAT boot metadata; it is not included in the block address passed to these functions. A whole-disk adapter subtracts the partition start before dispatching to fauxFAT.
-
-Writes use:
-
-```c
-fauxfat_write_block(&view, block, sector);
-fauxfat_write_blocks(&view, first_block, count, buffer);
-```
-
-Only public file payload maps writable. Metadata, opaque/private ranges, and file-allocation slack return `FAUXFAT_EUNMAPPED`.
-
-For a final sector whose `DataLength` is not sector-aligned, fauxFAT writes only the valid prefix. The remainder is outside the file and is not passed to the backend.
-
-`fauxfat_write_blocks()` preflights the full block mapping before issuing the first backend call. This prevents a bad block in the request from causing a partially applied mapping operation. It does not make backend storage transactional: if callback 2 fails after callback 1 succeeded, callback 1 has already happened.
-
-## 7. Direct physical descriptors
-
-The public interchange type for a recognized contiguous allocation is:
+The common interchange type between view generation, parsing, preservation decisions, and recovered-range I/O is `fauxfat_disk_file`:
 
 ```c
 typedef struct fauxfat_disk_file {
@@ -252,211 +158,139 @@ typedef struct fauxfat_disk_file {
 } fauxfat_disk_file;
 ```
 
-For recognized fauxFAT public files, `name` is the persisted manufactured logical name rather than blindly trusting the mutable namespace entry. `FAUXFAT_DISK_FILE_NAME_CHANGED` reports that the visible exFAT name no longer matches it.
+It intentionally describes only a recognized contiguous physical object. It is not a filesystem object graph.
 
-For the current synthetic view:
+Descriptors can be obtained from a manufactured view, from the strict root parser, from the loose scanner, or from schema-free `fauxfat_reopen()`. The same descriptor can then be used for bounded byte I/O directly against a block device with `fauxfat_disk_file_read()` and `fauxfat_disk_file_write()`.
 
-```c
-size_t n = fauxfat_disk_file_count(&view);
-fauxfat_describe_disk_file(&view, i, &desc);
-```
+The library does not allocate or retain a file-descriptor table. A caller which wants ordinary integer handles stores one recovered descriptor in each of its own open-handle slots.
 
-These descriptors are intentionally physical and small. They contain enough information to:
+## 7. Sparse formatting and in-place regeneration
 
-- bind a recovered file to a caller-owned descriptor;
-- map byte offsets directly onto a contiguous block range;
-- decide whether an existing payload can be preserved in place during a reformat;
-- represent both public and opaque logical files without a general filesystem object model.
+`fauxfat_format()` materializes a manufactured view onto a block device without building an image in RAM. The destination interface distinguishes four operations:
 
-The bounded root parser emits this exact type rather than inventing a second parser-only representation.
-
-A recovered descriptor can be used directly as bounded byte-addressable backing on the same block device:
-
-```c
-fauxfat_disk_file_read(&device, &desc, offset, dst, length);
-fauxfat_disk_file_write(&device, &desc, offset, src, length);
-```
-
-These helpers expose only `data_length`; allocation slack is never addressable through them. Whole-block I/O is forwarded directly to the block device. Unaligned reads use one 512-byte scratch block; unaligned writes use read-modify-write so bytes outside the requested logical range are preserved. Public and opaque descriptors are both accepted here because this is the application-side physical adapter, not the host write translator. Whether a private/opaque descriptor may be written is higher-level policy.
-
-The library still does not allocate integer fds or retain a descriptor table. A caller that wants ordinary small integer handles stores one `fauxfat_disk_file` in each open-file slot and calls these helpers from its existing `fauxfat_read_fn` / `fauxfat_write_fn` callbacks. Thus reopen cost is paid when the file is opened, not on every I/O, and RAM remains proportional only to the number of actually open files.
-
-## 8. Sparse / in-place formatting
-
-`fauxfat_format()` writes a manufactured view to an arbitrary block device without constructing an image in RAM.
-
-The destination callback set is:
-
-```c
-read(first_block, block_count, dst)   /* verifier/reopen */
-write(first_block, block_count, src)
-zero(first_block, block_count)
-skip(first_block, block_count, kind)
-```
-
-Formatting distinguishes four physical meanings:
-
-| Operation | Meaning |
+| Operation | Required meaning |
 | --- | --- |
-| generated/write | Exact filesystem bytes must be written. |
-| zero | Range must read back as zero. |
-| skip undefined | fauxFAT does not care what bytes already exist there. |
-| skip preserve | Known payload/private data exists there and must not be touched. |
+| generated write | Exact structural bytes must be written. |
+| zero | The range must read back as zero. |
+| skip undefined | fauxFAT places no condition on existing bytes. |
+| skip preserve | Existing payload/private bytes must remain untouched. |
 
-`zero` and `undefined` are not synonyms. On a sparse host file, `zero` may be implemented by a hole only if holes are guaranteed to read as zero. On reused media, stale bytes in a required-zero range must actually be cleared. Undefined ranges may simply be skipped.
+`zero` and `undefined` are deliberately different. A sparse-file backend may implement zero with a hole if holes read as zero. A reused physical device must actually clear a required-zero range. Undefined space may simply be skipped.
 
-Opaque ranges are always preserve-only.
+Named opaque ranges and anonymous reservations are preserve ranges. Public payload is zero-initialized by default, but the caller may preserve an exact existing public allocation through the formatter's preservation callback.
 
-Public payload is normally zeroed on a fresh format. The caller may preserve an exact public allocation in place with the optional callback:
-
-```c
-int preserve(void *ctx, const fauxfat_disk_file *wanted);
-```
-
-Return greater than zero to preserve the complete allocation, zero to initialize it normally, or a negative value to abort formatting.
-
-This is the intended repair path; strict verification, bounded loose salvage, and schema-free reopen are implemented:
+That enables the core recovery loop:
 
 ```text
-parse / validate existing volume
-    -> emit fauxfat_disk_file descriptors
-    -> compare desired descriptor with recovered descriptor
-    -> preserve exact matching payload ranges
-    -> regenerate filesystem metadata around them
+validate / reopen existing volume
+    -> emit understood fauxfat_disk_file descriptors
+    -> application decides which exact ranges remain useful
+    -> build desired fauxfat_view
+    -> format canonical metadata while preserving accepted ranges
+    -> strict-validate result
 ```
 
-No payload relocation is implied by reformatting. If a desired object moved or changed size, a higher layer must explicitly copy or rebuild it.
+fauxFAT never moves payload as part of reformatting. If an object must move or resize, the caller performs that transaction separately.
 
-## 9. Validation and reopen model
+## 8. Validation modes
 
-Strict whole-volume validation against a trusted `fauxfat_view`, the bounded loose scanner, and schema-free block-device reopen are implemented.
+There are two acceptance levels.
 
-With trusted geometry already in a `fauxfat_view`, the implemented bounded pass is:
+Strict validation answers: "is this still the fauxFAT structure we manufactured, allowing only the small set of metadata changes expected from a compliant exFAT mount and in-place overwrite cycle?"
 
-```c
-fauxfat_parse_root_strict(&view, &device, emit_file, ctx, &count);
-```
+It verifies fixed geometry, both boot regions and native checksums, the upcase table, saturated bitmap, bounded root grammar, deterministic FAT classification, OEM identity, and the XXH32 structural/component fingerprints. Payload bytes and explicitly undefined padding are not inspected.
 
-It reads the fixed root a block at a time, emits `fauxfat_disk_file` descriptors directly, accepts only the documented Archive/modify/access metadata churn, and rejects malformed checksums, duplicate public names, opaque-stub collisions, noncanonical entry ordering, overlaps, and out-of-range extents. It does not inspect or follow file FAT chains. This is a root-grammar pass, not yet proof that the boot/FAT/bitmap/OEM seal agrees with it.
+Loose scanning is bounded salvage. It can return:
 
-Whole-volume strict validation is:
+- exact fauxFAT public descriptors;
+- exact fauxFAT opaque descriptors;
+- simple foreign root files which directly prove a contiguous `NoFatChain` allocation.
 
-```c
-fauxfat_volume_class cls;
-fauxfat_validate_strict(&view, &device, &cls);
-```
+It may skip unsupported but well-bounded file sets. It aborts on malformed or ambiguous structure. It does not walk arbitrary FAT chains, recurse directories, repair allocation state, or interpret TexFAT transactions.
 
-It validates both boot regions and their native exFAT checksums, exact fixed geometry, the fauxFAT OEM records, exact upcase bytes, meaningful saturated bitmap bytes, the strict root grammar, and the complete meaningful FAT map. It recomputes the XXH32 component/map fingerprints from the device and compares them with the OEM seal and the expected view. Payload bytes and explicitly undefined alignment/slack are never read.
-
-Main `VolumeDirty`, stale Backup Boot volatile fields, and the documented File Archive/modify/access fields are canonicalized away. Everything else remains structural. A recognizable fauxFAT OEM identity with a strict mismatch reports `FAUXFAT_CHANGED`; loss of the identity reports `INVALID`. Device read errors are still ordinary errors, not classifications.
-
-Strict validation asks whether the volume is still the fauxFAT structure we manufactured, allowing only metadata changes expected from a normal compliant mount and in-place write cycle. It verifies fixed geometry, boot checksums, the exact upcase table, the saturated bitmap, root layout, public and opaque descriptor sets, FAT classification, exFAT entry checksums, and the OEM XXH32 seals.
-
-Loose validation is a bounded salvage mode. It may return simple root files whose Stream Extension proves they are contiguous `NoFatChain` files, and exact fauxFAT opaque descriptors. It may skip valid objects it does not support. It aborts rather than guessing when the structure is malformed or ambiguous.
-
-The trusted-view entry point is:
-
-```c
-fauxfat_scan_loose(&view, &device, emit_file, ctx, &count, &cls);
-```
-
-When no schema/view is available, use:
-
-```c
-fauxfat_reopen(&device, emit_file, ctx, &count, &cls, &info);
-```
-
-`fauxfat_reopen()` derives the supported fixed fauxFAT geometry from the boot sector, validates native boot envelopes/checksums, reads identity from either OEM copy, reconstructs label/GUID/epoch information, recomputes the structural XXH32 seals directly from disk, and emits the same `fauxfat_disk_file` physical descriptors. No file table or manufactured view is needed. One damaged OEM copy remains recognizable `FAUXFAT_CHANGED`; with both identities gone, a sane bounded root can still be returned as `EXFAT_BEST_EFFORT`.
-
-`fauxfat_scan_loose()` uses the trusted view for geometry, then performs the same bounded root scan. Exact fauxFAT public files recover their persisted manufactured name from the two benign vendor records; a live namespace rename sets `FAUXFAT_DISK_FILE_NAME_CHANGED` while leaving `desc.name` stable. Ordinary three-entry contiguous root files are also emitted. Directories, fragmented files, and otherwise well-bounded unsupported File sets are skipped. Bad set checksums, orphan secondaries, impossible counts, overlap/order ambiguity, or unknown critical primaries abort the scan.
-
-The intended classifications are:
+The classification is separate from descriptor recovery:
 
 ```text
-INVALID             malformed or ambiguous; descriptors are not trustworthy
-EXFAT_BEST_EFFORT   bounded scan found usable simple exFAT files, but no valid fauxFAT identity
-FAUXFAT_CHANGED     recognizable fauxFAT, but the strict structural contract was violated
-FAUXFAT_VALID       strict fauxFAT structure and seal are intact
+FAUXFAT_VOLUME_INVALID
+    structure is malformed or outside the bounded parser contract
+
+FAUXFAT_VOLUME_EXFAT_BEST_EFFORT
+    bounded exFAT parsing recovered simple files, but fauxFAT identity is absent
+
+FAUXFAT_VOLUME_FAUXFAT_CHANGED
+    fauxFAT is recognizable but its strict structural contract was violated
+
+FAUXFAT_VOLUME_FAUXFAT_VALID
+    strict fauxFAT structure and seal are intact
 ```
 
-Even loose mode reports an intact fauxFAT volume as `FAUXFAT_VALID`. Conversely, recovering some simple files from a damaged fauxFAT volume does not turn it back into trusted state; it remains `FAUXFAT_CHANGED`.
+Recovering a useful file from a changed volume never promotes that volume back to trusted fauxFAT state.
 
-The parser is deliberately bounded. It will not grow general exFAT behavior merely because a disk happens to contain it.
+## 9. Schema-free reopen
 
-Specifically excluded:
+`fauxfat_reopen()` needs only a block-device reader. It derives the supported fauxFAT geometry from the Main Boot Sector, checks the bounded boot/OEM/root/FAT/bitmap/upcase structures, emits direct physical descriptors, and reports the classification above.
 
-- arbitrary FAT-chain walking;
-- directory recursion;
+Reopen needs no file table from the caller. One surviving recognizable OEM identity copy is enough to classify a damaged presentation as fauxFAT-changed. If fauxFAT identity is gone but the supported bounded exFAT geometry/root remains sane, reopen may return `FAUXFAT_VOLUME_EXFAT_BEST_EFFORT` descriptors.
+
+This is intentionally not a general exFAT mount operation.
+
+## 10. Higher-level payload policy is outside fauxFAT
+
+fauxFAT says which physical ranges a host may overwrite and which ranges must remain opaque. It does not decide application commit semantics.
+
+A caller may use the same mechanisms for, for example:
+
+- a staged replacement object with one public ingress extent and one private committed extent;
+- a continuously edited public configuration file whose accepted generations are copied into a private version store;
+- private raw objects which never appear to the host;
+- anonymous reserve space which is carved into named objects only while the device is private.
+
+The structural epoch is a presentation-generation number. Change it when the manufactured fauxFAT structure changes materially. Ordinary payload writes do not change it.
+
+A second prebuilt metadata image is not part of the core format. It may be useful as an optional quick-regeneration/checkpoint cache or comparison copy, but the same resilience can also be obtained by regenerating canonical metadata from authoritative state. Application generation-selection policy does not depend on such a mirror.
+
+## 11. Explicit non-goals
+
+fauxFAT deliberately does not implement:
+
+- arbitrary path lookup;
+- general directory traversal;
+- FAT-chain traversal for fragmented files;
+- allocation or free-space reconstruction;
 - root-directory growth;
-- allocator reconstruction;
 - orphan recovery;
 - filesystem repair;
-- TexFAT;
-- intent-log or journal replay;
-- fragmented-file support in the normal fauxFAT path.
+- TexFAT or journal/intent-log replay;
+- authentication of hostile writers;
+- transactional payload movement.
 
-A loose scanner may ignore unsupported entries when their boundaries are unambiguous. If understanding an object requires unbounded filesystem interpretation, fauxFAT ignores it or rejects the volume.
+If a future host behavior requires one of those features merely to accept a volume as strict-valid, the preferred response is to reject and regenerate the façade rather than turn fauxFAT into another filesystem stack.
 
-## 10. Recovery policy
-
-The structural seal tells the caller whether the exFAT façade is still structurally trustworthy. It does not decide which application payload generation is authoritative.
-
-That distinction is deliberate.
-
-For example, a product may simultaneously have:
-
-```text
-SOLVER.DB public      host-visible staging slot
-SOLVER.DB opaque      current private A/B slot
-CONFIG.BIN public     host-editable configuration
-CONFIG.BIN opaque     private version store
-```
-
-If the host changes filesystem structure unexpectedly, strict validation fails. Higher-level authoritative state decides which payloads are still meaningful. Any payload whose exact range can still be positively described may be preserved while fauxFAT regenerates the presentation metadata.
-
-The façade is disposable. The application data is not.
-
-## 11. Current implementation boundary
+## 12. Current implementation and remaining qualification
 
 Implemented now:
 
-- deterministic exFAT v1 geometry and metadata generation;
-- public contiguous files;
-- persisted original/logical names for public files using two benign Vendor Extension records;
-- opaque/private contiguous descriptors and ranges;
-- 128-byte ISO-8859-1-oriented exFAT upcase table;
-- callback-backed payload reads and writes;
-- synthetic 512-byte block view;
-- bounded public-file write translation;
-- physical descriptor enumeration from a synthetic view;
-- strict bounded parsing of the fixed one-cluster root into the same descriptors;
-- whole-volume strict validation against a trusted view, including both boot checksums, FAT/bitmap/upcase/root checks, OEM identity, and recomputed XXH32 seals;
-- bounded loose root scanning with original-name recovery and rename flagging;
-- single structural XXH32 seal plus component XXH32 fingerprints;
-- sparse/in-place formatter with generated/zero/undefined/preserve range semantics;
-- Unix `time_t` input for file timestamps;
-- explicit payload-arena placement, anonymous F7 gaps, and an optional anonymous tail reserve;
-- schema-free validation of those sparse layouts without retaining an extent table;
-- direct bounded byte I/O through any recovered `fauxfat_disk_file`, suitable for caller-owned fd tables.
+- deterministic exFAT 1.00 metadata generation;
+- callback-backed public and opaque payloads;
+- synthetic sector reads and bounded public-sector writes;
+- explicit payload-arena placement and anonymous reserved gaps/tail;
+- persisted public logical names and opaque vendor descriptors;
+- direct physical descriptor enumeration;
+- sparse/in-place formatting with generated/zero/undefined/preserve semantics;
+- strict bounded root parsing;
+- strict whole-volume validation against a trusted view;
+- bounded loose scanning;
+- schema-free reopen;
+- direct bounded byte I/O using recovered descriptors;
+- structural XXH32 and component fingerprints;
+- Unix `time_t` input for manufactured file timestamps.
 
-Planned, not implemented yet:
+Still required before treating the host contract as production-qualified:
 
-- optional dual-view A/B presentation optimization;
-- host qualification against real Windows/Linux exFAT stacks.
+- exercise the supported mount/read/in-place-write/flush/eject cycle on the actual Windows versions and exFAT drivers we intend to support;
+- exercise at least one independent exFAT implementation for comparison;
+- verify preservation of the benign vendor records, opaque Vendor Allocation descriptors, `0xFFFFFFF7` blockers, saturated bitmap, and full padded root;
+- record any real host mutations which need to be added to the strict canonicalization allowlist;
+- fault-test block-device I/O and interrupted regeneration separately from host compatibility.
 
-That boundary is important. The library can now manufacture and serve sparse fixed layouts, prove that a volume matches a trusted manufactured view, reopen the supported fauxFAT geometry directly from a block device with no schema in hand, and bind any recovered contiguous descriptor straight back to the device without constructing another filesystem object model. It still does not grow arbitrary exFAT geometry/traversal.
-
-## 12. Design rules worth preserving
-
-The project should keep these rules even as the API evolves:
-
-1. File payload storage is callback-backed; fauxFAT does not own file buffers.
-2. Every normal fauxFAT file is contiguous and directly addressable.
-3. Metadata parsing remains bounded by fixed structures, especially the one-cluster root.
-4. Strict validation accepts only known compliant host mutations.
-5. Loose validation may salvage understood objects but never upgrades damaged fauxFAT into trusted state.
-6. Reformatting distinguishes generated, zero, undefined, and preserve ranges.
-7. The parser and formatter exchange the same `fauxfat_disk_file` descriptor.
-8. Structural hashes cover structure, not payload.
-9. fauxFAT does not become a general exFAT implementation to accommodate unexpected host behavior.
-10. When the host does something structurally incompatible, rebuild the façade from authoritative state rather than trying to repair arbitrary exFAT.
+The core rule remains simple: payload storage is valuable; the exFAT façade is reproducible metadata.

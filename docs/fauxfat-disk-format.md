@@ -12,7 +12,7 @@ A fauxFAT volume shall have these properties:
 2. A fixed set of host-visible files exists in fixed root-directory slots. Each file is a contiguous `NoFatChain` extent.
 3. An ordinary host may overwrite bytes inside an existing file without changing allocation metadata.
 4. The root directory has no free directory entries and cannot grow.
-5. Project-private and reserved ranges are blocked from ordinary file allocation by canonical `0xFFFFFFF7` FAT markers. Ranges whose identity must survive a façade rebuild additionally carry a fauxFAT opaque descriptor entry set in the root.
+5. Private and reserved ranges are blocked from ordinary file allocation by canonical `0xFFFFFFF7` FAT markers. Ranges whose identity must survive a façade rebuild additionally carry a fauxFAT opaque descriptor entry set in the root.
 6. An opaque descriptor is an ordinary hidden zero-length File set followed by fauxFAT Vendor Extension and Vendor Allocation secondaries; the logical private-file name is stored in vendor data while the Vendor Allocation points at the preserved contiguous range.
 7. Structural state is checksummed in the OEM Parameters sectors. Any structural mutation outside the explicit host-mutable fields is incompatible.
 8. On incompatible mutation the firmware does not repair arbitrary exFAT. It preserves only payload ranges it can positively describe, then rebuilds the façade from authoritative private state.
@@ -242,9 +242,9 @@ FAT[cluster] = 0xFFFFFFF7   // exFAT bad-cluster marker
 AllocationBitmap[cluster] = 1
 ```
 
-The bad-cluster marker is fauxFAT's physical blocker and structural range classifier. A range may additionally have an opaque descriptor entry set (section 10.5). The descriptor does not make the range host-writable; it gives firmware a standards-defined, bounded way to recover a logical name and the associated `FirstCluster/DataLength` after parsing a damaged-but-understandable façade.
+The bad-cluster marker is fauxFAT's physical blocker and structural range classifier. A range may additionally have an opaque descriptor entry set (section 10.6). The descriptor does not make the range host-writable; it gives firmware a standards-defined, bounded way to recover a logical name and the associated `FirstCluster/DataLength` after parsing a damaged-but-understandable façade.
 
-exFAT treats `0xFFFFFFF7` as a bad cluster, while the Allocation Bitmap marks it unavailable. Firmware is knowingly lying about media health and may use those physical clusters for littlefs, A/B inactive copies, version stores, raw databases, or future reserve space.
+exFAT treats `0xFFFFFFF7` as a bad cluster, while the Allocation Bitmap marks it unavailable. Firmware is knowingly lying about media health and may use those physical clusters for private objects, staged or previous generations, embedded filesystems, raw block stores, or future reserve space.
 
 For a fauxFAT opaque descriptor the Vendor Allocation secondary sets `NoFatChain=1`, so a generic exFAT implementation shall not interpret the corresponding FAT entries as a chain. fauxFAT nevertheless keeps `0xFFFFFFF7` there as its independent blocker/classification marker.
 
@@ -321,7 +321,7 @@ root descriptor           = none
 
 Anonymous reservations are intentional physical ownership, not free space and not undefined padding. Sparse/in-place formatting must preserve their bytes. The synthetic block view returns zero for such raw sectors because there is no caller fd associated with them; their contents are not host-visible through a file.
 
-This lets a schema reserve fixed A/B slots, alignment holes, and tail capacity without allocating RAM for an extent map. Named opaque state that must be rediscovered after losing the schema still uses the vendor descriptor in section 10.6.
+This lets a schema reserve fixed staging slots, alignment holes, private capacity, and tail reserve without allocating RAM for an extent map. Named opaque state that must be rediscovered after losing the schema still uses the vendor descriptor in section 10.6.
 
 ## 9. Root directory layout
 
@@ -349,11 +349,11 @@ The theoretical maximum is therefore 408 file/descriptor sets in any mixture. Re
 
 ### 9.1 Volume Label
 
-Entry 2 is a normal `0x83` Volume Label. The product chooses one fixed label of at most 11 UTF-16 code units. `RP UPDATE` is the current suggested label.
+Entry 2 is a normal `0x83` Volume Label. fauxFAT v1 deliberately restricts this label to at most 11 printable ASCII bytes (`0x20..0x7e`), widened directly to UTF-16 code units. The C API uses `FAUXFAT` when the caller leaves the label unset.
 
 ### 9.2 Volume GUID
 
-Entry 3 is a normal `0xA0` Volume GUID entry with `SecondaryCount = 0`, `GeneralPrimaryFlags = 0`, and a stable product-generated GUID. Its one-entry `SetChecksum` is valid.
+Entry 3 is a normal `0xA0` Volume GUID entry with `SecondaryCount = 0`, `GeneralPrimaryFlags = 0`, and a stable caller-generated GUID. Its one-entry `SetChecksum` is valid.
 
 Keeping this GUID stable across façade regeneration encourages the host to regard the rebuilt volume as the same volume.
 
@@ -574,7 +574,7 @@ VendorExtension.VendorDefined[1..13]
 truncated to VendorExtension.VendorDefined[0]
 ```
 
-This indirection is intentional. A visible staging file and one or more opaque A/B alternatives may all carry the same *logical* name without creating duplicate exFAT namespace names.
+This indirection is intentional. A visible file and one or more opaque private or previous generations may all carry the same *logical* name without creating duplicate exFAT namespace names.
 
 The five-entry `SetChecksum` covers all 160 bytes. The descriptor itself is part of the structural seal.
 
@@ -649,59 +649,39 @@ This seal detects every change to physical extent ownership, file positions/size
 
 ## 12. Physical allocation policy
 
-The disk format does not require one high-level object policy, but v1 lays out the usable heap in a deliberately simple direction:
+The on-disk format does not prescribe an application commit policy or require one particular use of the payload arena. The implemented schema has a smaller set of physical rules:
 
-```
-low cluster numbers
-    Allocation Bitmap
-    Up-case Table
-    root
-    large host-visible bulk extent(s)
-    ...
-    tail allocations carved downward
-    opaque/private/version storage
-    reserve
-high cluster numbers
-```
+1. public extents are configured first, in monotonically increasing non-overlapping payload-arena order;
+2. named opaque extents follow, also in monotonically increasing non-overlapping order;
+3. `FAUXFAT_CLUSTER_AUTO` resolves an extent immediately after the previous configured extent;
+4. any gap before/between configured extents is an anonymous opaque reservation;
+5. if `DataClusterCount` extends beyond the last configured extent, the remaining tail is an anonymous opaque reservation;
+6. anonymous reservations have bitmap bit `1`, FAT value `0xFFFFFFF7`, no root descriptor, and preserve semantics during formatting.
 
-The large bulk file begins at `DataFirstCluster` and grows upward. The reserve/private tail begins at the last cluster and grows downward.
+A schema may therefore leave capacity unused without making it host-allocatable. Turning anonymous reserve into a named public or opaque extent is a structural change performed while the volume is private: update the desired schema, increment the structural epoch, regenerate the canonical metadata, and strict-validate it before exposing the volume again.
 
-To create another small predefined file from the tail while the card is private:
+The core formatter does not move payload data. If a new schema assigns an existing logical object to a different physical range, the caller must copy/rebuild that object separately under its own durability policy.
 
-1. choose a contiguous tail range currently marked `0xFFFFFFF7`;
-2. change only those FAT entries to `0x00000000`;
-3. keep all Allocation Bitmap bits at `1`;
-4. replace five padding entries with the canonical public `File/Stream/Name/VendorName0/VendorName1` set pointing at that range;
-5. increment the structural epoch;
-6. recompute FAT/root/bitmap/upcase XXH32 component fingerprints and the map fingerprint;
-7. update both OEM sectors and both boot checksums;
-8. validate the rebuilt façade before exposing it.
+## 13. Higher-level payload policies
 
-To retire that file, reverse the operation: convert its extent back to `0xFFFFFFF7`, turn its five root entries back into padding, and reseal.
+fauxFAT intentionally does not specify which copy or generation of an application object is authoritative. Common policies can all use the same disk primitives:
 
-The same operation may shorten the high end of a large bulk extent and hand the released clusters to new tail files. No Allocation Bitmap change is required because all clusters remain unavailable throughout.
+```text
+staged replacement
+    public ingress extent     FAT = 0, named public file
+    committed/private extent FAT = 0xFFFFFFF7, optionally named opaque descriptor
 
-## 13. A/B and continuously versioned data on the same volume
+continuously versioned edit
+    public edit extent        FAT = 0, named public file
+    private version store     FAT = 0xFFFFFFF7, optionally named opaque descriptor
 
-Nothing special is required in the disk format.
-
-A staged A/B object can use two fixed raw extents:
-
-```
-visible staging slot       FAT = 0, named file entry exists
-current/private slot       FAT = 0xFFFFFFF7, opaque descriptor may name the range
+private-only object
+    private extent            FAT = 0xFFFFFFF7
 ```
 
-After validation firmware may swap their roles with one structural update. The optional dual-view exFAT trick may later make this swap cheaper, but it is not part of fauxFAT v1.
+Promoting a staged object, retaining old generations, copying an edit into a version store, or choosing which private generation is authoritative are all higher-layer transactions. fauxFAT only describes host-visible write windows and opaque physical ownership.
 
-A continuously versioned configuration object can simultaneously use:
-
-```
-small visible edit file    FAT = 0, named file entry exists
-private version store      FAT = 0xFFFFFFF7, opaque descriptor may name the range
-```
-
-The version store format is outside fauxFAT. fauxFAT only reserves its physical range from the host.
+A prebuilt second copy of the fauxFAT metadata may be used as an optional quick-regeneration/checkpoint mechanism, comparison image, or recovery aid. That is not part of the v1 disk format and is not required for any staged/private policy. An implementation may instead regenerate canonical metadata from the authoritative schema and descriptors.
 
 ## 14. Host mutation contract
 
@@ -743,7 +723,7 @@ NumberOfFats != 1
 TexFAT state
 ```
 
-Failure of this strict mutation contract means the presentation is no longer accepted as intact fauxFAT. Product recovery returns to authoritative private state and regenerates the façade. An optional loose scanner may still enumerate simple contiguous root files for diagnostics or salvage, but it never upgrades a strict failure into trusted fauxFAT state.
+Failure of this strict mutation contract means the presentation is no longer accepted as intact fauxFAT. Application recovery returns to authoritative private state and regenerates the façade. An optional loose scanner may still enumerate simple contiguous root files for diagnostics or salvage, but it never upgrades a strict failure into trusted fauxFAT state.
 
 ## 15. Validation order after host use
 
@@ -758,7 +738,7 @@ Strict validation performs this bounded sequence:
 7. verify each public/opaque File set checksum and permit only the host-mutable timestamp/archive fields listed above;
 8. recompute FAT, bitmap, root, and upcase XXH32 component fingerprints and the map fingerprint;
 9. compare those values to OEM Parameters;
-10. only then inspect candidate file payloads.
+10. only after structural validation may the higher layer inspect or promote candidate payloads.
 
 The optional loose scanner is a separate acceptance level. It may scan the same bounded one-cluster root, skip valid-but-unsupported entries, and return only regular root files whose Stream Extension directly proves a contiguous `NoFatChain` allocation. It aborts on malformed/ambiguous structures and never walks a FAT chain or descends into directories. A volume which still satisfies the strict fauxFAT seal is reported as fauxFAT-valid even when reached through the loose API; recognizable fauxFAT with a failed structural seal is reported as changed, not valid.
 
@@ -766,7 +746,7 @@ There is no general path lookup, cluster allocator, directory repair, orphan rec
 
 ## 16. Important qualification points
 
-The format is intentionally legal-but-hostile. Before treating it as product behavior, qualify at least:
+The format is intentionally legal-but-hostile. Before treating it as qualified host behavior, qualify at least:
 
 - Windows 10 and 11 native exFAT;
 - ordinary Explorer mount/eject and file overwrite;
@@ -775,4 +755,4 @@ The format is intentionally legal-but-hostile. Before treating it as product beh
 - Linux exFAT if cards may be handled there;
 - `chkdsk` only to document how it damages/reclassifies the deliberately fake bad clusters. `chkdsk` is not an accepted writer.
 
-The central empirical question is whether desktop exFAT implementations leave the manufactured bad-cluster ranges, fauxFAT Vendor Extension/Vendor Allocation descriptor sets, and `0xA1` root padding alone during ordinary mount/write/unmount. The base compatibility rules say unknown benign vendor secondaries and their allocations should survive that cycle. Product qualification gets the final vote, because storage software enjoys interpretive dance.
+The central empirical question is whether desktop exFAT implementations leave the manufactured bad-cluster ranges, fauxFAT Vendor Extension/Vendor Allocation descriptor sets, and `0xA1` root padding alone during ordinary mount/write/unmount. The base compatibility rules say unknown benign vendor secondaries and their allocations should survive that cycle. Host qualification gets the final vote, because storage software enjoys interpretive dance.

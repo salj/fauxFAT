@@ -44,8 +44,8 @@ typedef struct fauxfat_file {
  * but is not exposed as ordinary file data.  fauxFAT describes it on disk
  * using a hidden zero-length File entry set with fauxFAT Vendor Extension +
  * Vendor Allocation secondaries.  The logical name is stored in the vendor
- * records, not in the host-visible namespace, so A/B alternatives may use the
- * same logical name.
+ * records, not in the host-visible namespace, so private or previous
+ * generations may use the same logical name.
  *
  * size is the complete preserved allocation and must be a non-zero multiple
  * of FAUXFAT_CLUSTER_SIZE.  Raw block reads are served through fd/read(); raw
@@ -159,8 +159,8 @@ typedef struct fauxfat_write_mapping {
 } fauxfat_write_mapping;
 
 /*
- * Direct physical descriptor used by the synthetic view now and by the
- * bounded on-disk parser later.  It is intentionally not a filesystem object
+ * Direct physical descriptor shared by the synthetic view and the
+ * bounded on-disk parsers.  It is intentionally not a filesystem object
  * model: it says only what contiguous range a recognized logical file owns.
  */
 typedef enum fauxfat_disk_file_kind {
@@ -193,10 +193,8 @@ typedef int (*fauxfat_file_emit_fn)(void *context,
                                     const fauxfat_disk_file *file);
 
 /*
- * Whole-volume structural classification. Strict validation currently
- * produces INVALID, FAUXFAT_CHANGED, or FAUXFAT_VALID. BEST_EFFORT is
- * reserved for the bounded loose scanner so callers can share one result
- * type without inventing another enum later.
+ * Whole-volume structural classification shared by strict validation,
+ * bounded loose scanning, and schema-free reopen.
  */
 typedef enum fauxfat_volume_class {
     FAUXFAT_VOLUME_INVALID = 0,
@@ -225,7 +223,7 @@ typedef struct fauxfat_reopen_info {
 } fauxfat_reopen_info;
 
 /*
- * Raw block-device side of sparse formatting and (later) validation.
+ * Raw block-device side of sparse formatting, validation, and reopen.
  * Addresses are volume-relative 512-byte blocks, matching fauxfat_read_block.
  */
 typedef int (*fauxfat_dev_read_fn)(void *context,
@@ -367,8 +365,8 @@ int fauxfat_format(const fauxfat_view *view,
 /*
  * Parse and validate only the fixed one-cluster fauxFAT root directory using
  * geometry already present in view. This is intentionally not whole-volume
- * validation: boot/upcase/bitmap/FAT/OEM verification is layered on top in
- * later passes.
+ * validation: use fauxfat_validate_strict() when boot/upcase/bitmap/FAT/OEM
+ * verification is also required.
  *
  * The parser accepts only the strict fauxFAT root grammar: four fixed system
  * entries, canonical public five-entry sets, canonical fauxFAT opaque
