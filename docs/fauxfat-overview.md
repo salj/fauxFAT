@@ -270,6 +270,17 @@ These descriptors are intentionally physical and small. They contain enough info
 
 The bounded root parser emits this exact type rather than inventing a second parser-only representation.
 
+A recovered descriptor can be used directly as bounded byte-addressable backing on the same block device:
+
+```c
+fauxfat_disk_file_read(&device, &desc, offset, dst, length);
+fauxfat_disk_file_write(&device, &desc, offset, src, length);
+```
+
+These helpers expose only `data_length`; allocation slack is never addressable through them. Whole-block I/O is forwarded directly to the block device. Unaligned reads use one 512-byte scratch block; unaligned writes use read-modify-write so bytes outside the requested logical range are preserved. Public and opaque descriptors are both accepted here because this is the application-side physical adapter, not the host write translator. Whether a private/opaque descriptor may be written is higher-level policy.
+
+The library still does not allocate integer fds or retain a descriptor table. A caller that wants ordinary small integer handles stores one `fauxfat_disk_file` in each open-file slot and calls these helpers from its existing `fauxfat_read_fn` / `fauxfat_write_fn` callbacks. Thus reopen cost is paid when the file is opened, not on every I/O, and RAM remains proportional only to the number of actually open files.
+
 ## 8. Sparse / in-place formatting
 
 `fauxfat_format()` writes a manufactured view to an arbitrary block device without constructing an image in RAM.
@@ -425,14 +436,15 @@ Implemented now:
 - sparse/in-place formatter with generated/zero/undefined/preserve range semantics;
 - Unix `time_t` input for file timestamps;
 - explicit payload-arena placement, anonymous F7 gaps, and an optional anonymous tail reserve;
-- schema-free validation of those sparse layouts without retaining an extent table.
+- schema-free validation of those sparse layouts without retaining an extent table;
+- direct bounded byte I/O through any recovered `fauxfat_disk_file`, suitable for caller-owned fd tables.
 
 Planned, not implemented yet:
 
-- binding recovered descriptors to caller-backed bounded block/range fds;
-- optional dual-view A/B presentation optimization.
+- optional dual-view A/B presentation optimization;
+- host qualification against real Windows/Linux exFAT stacks.
 
-That boundary is important. The library can now manufacture and serve sparse fixed layouts, prove that a volume matches a trusted manufactured view, or reopen the supported fauxFAT geometry directly from a block device with no schema in hand. It still does not grow arbitrary exFAT geometry/traversal, and recovered descriptors are not yet bound to application fds by the library itself.
+That boundary is important. The library can now manufacture and serve sparse fixed layouts, prove that a volume matches a trusted manufactured view, reopen the supported fauxFAT geometry directly from a block device with no schema in hand, and bind any recovered contiguous descriptor straight back to the device without constructing another filesystem object model. It still does not grow arbitrary exFAT geometry/traversal.
 
 ## 12. Design rules worth preserving
 

@@ -3845,3 +3845,145 @@ int fauxfat_reopen(const fauxfat_device *device,
         return rc;
     return FAUXFAT_OK;
 }
+
+static int ff_disk_file_range_valid(const fauxfat_disk_file *file)
+{
+    uint64_t allocation_bytes;
+
+    if (!file ||
+        (file->kind != FAUXFAT_DISK_FILE_PUBLIC &&
+         file->kind != FAUXFAT_DISK_FILE_OPAQUE) ||
+        file->data_length == 0u || file->allocation_blocks == 0u ||
+        file->allocation_blocks > UINT64_MAX / FAUXFAT_BLOCK_SIZE)
+        return 0;
+    allocation_bytes = file->allocation_blocks * FAUXFAT_BLOCK_SIZE;
+    if (file->data_length > allocation_bytes ||
+        file->allocation_blocks > UINT64_MAX - file->first_block)
+        return 0;
+    return 1;
+}
+
+static int ff_disk_file_access_valid(const fauxfat_disk_file *file,
+                                     uint64_t offset, size_t length)
+{
+    if (!ff_disk_file_range_valid(file))
+        return FAUXFAT_ESTRUCTURE;
+    if (offset > file->data_length ||
+        (uint64_t)length > file->data_length - offset)
+        return FAUXFAT_ERANGE;
+    return FAUXFAT_OK;
+}
+
+int fauxfat_disk_file_read(const fauxfat_device *device,
+                           const fauxfat_disk_file *file,
+                           uint64_t offset,
+                           void *data,
+                           size_t length)
+{
+    uint8_t scratch[FAUXFAT_BLOCK_SIZE];
+    uint8_t *dst = (uint8_t *)data;
+    uint64_t block;
+    size_t done = 0u;
+    int rc;
+
+    if (!device || !device->read || (!data && length != 0u))
+        return FAUXFAT_EINVAL;
+    rc = ff_disk_file_access_valid(file, offset, length);
+    if (rc != FAUXFAT_OK || length == 0u)
+        return rc;
+
+    block = file->first_block + offset / FAUXFAT_BLOCK_SIZE;
+
+    if ((offset % FAUXFAT_BLOCK_SIZE) != 0u) {
+        size_t in_block = (size_t)(offset % FAUXFAT_BLOCK_SIZE);
+        size_t n        = FAUXFAT_BLOCK_SIZE - in_block;
+        if (n > length)
+            n = length;
+        rc = device->read(device->context, block, 1u, scratch);
+        if (rc != 0)
+            return rc;
+        memcpy(dst, scratch + in_block, n);
+        done = n;
+        ++block;
+    }
+
+    if (length - done >= FAUXFAT_BLOCK_SIZE) {
+        size_t blocks = (length - done) / FAUXFAT_BLOCK_SIZE;
+        rc            = device->read(device->context, block, blocks, dst + done);
+        if (rc != 0)
+            return rc;
+        done += blocks * FAUXFAT_BLOCK_SIZE;
+        block += blocks;
+    }
+
+    if (done < length) {
+        rc = device->read(device->context, block, 1u, scratch);
+        if (rc != 0)
+            return rc;
+        memcpy(dst + done, scratch, length - done);
+    }
+
+    return FAUXFAT_OK;
+}
+
+int fauxfat_disk_file_write(const fauxfat_device *device,
+                            const fauxfat_disk_file *file,
+                            uint64_t offset,
+                            const void *data,
+                            size_t length)
+{
+    uint8_t scratch[FAUXFAT_BLOCK_SIZE];
+    const uint8_t *src = (const uint8_t *)data;
+    uint64_t block;
+    size_t done = 0u;
+    int rc;
+
+    if (!device || !device->write || (!data && length != 0u))
+        return FAUXFAT_EINVAL;
+    rc = ff_disk_file_access_valid(file, offset, length);
+    if (rc != FAUXFAT_OK || length == 0u)
+        return rc;
+
+    block = file->first_block + offset / FAUXFAT_BLOCK_SIZE;
+
+    if ((offset % FAUXFAT_BLOCK_SIZE) != 0u) {
+        size_t in_block = (size_t)(offset % FAUXFAT_BLOCK_SIZE);
+        size_t n        = FAUXFAT_BLOCK_SIZE - in_block;
+        if (n > length)
+            n = length;
+        if (!device->read)
+            return FAUXFAT_EINVAL;
+        rc = device->read(device->context, block, 1u, scratch);
+        if (rc != 0)
+            return rc;
+        memcpy(scratch + in_block, src, n);
+        rc = device->write(device->context, block, 1u, scratch);
+        if (rc != 0)
+            return rc;
+        done = n;
+        ++block;
+    }
+
+    if (length - done >= FAUXFAT_BLOCK_SIZE) {
+        size_t blocks = (length - done) / FAUXFAT_BLOCK_SIZE;
+        rc            = device->write(device->context, block, blocks, src + done);
+        if (rc != 0)
+            return rc;
+        done += blocks * FAUXFAT_BLOCK_SIZE;
+        block += blocks;
+    }
+
+    if (done < length) {
+        if (!device->read)
+            return FAUXFAT_EINVAL;
+        rc = device->read(device->context, block, 1u, scratch);
+        if (rc != 0)
+            return rc;
+        memcpy(scratch, src + done, length - done);
+        rc = device->write(device->context, block, 1u, scratch);
+        if (rc != 0)
+            return rc;
+    }
+
+    return FAUXFAT_OK;
+}

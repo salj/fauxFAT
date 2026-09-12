@@ -451,6 +451,35 @@ int fauxfat_reopen(const fauxfat_device *device,
                    fauxfat_volume_class *classification,
                    fauxfat_reopen_info *info);
 
+/*
+ * Use one recovered/direct physical descriptor as bounded byte-addressable
+ * backing storage.  These helpers operate only inside file->data_length;
+ * allocation slack is never exposed.  `offset` is relative to the logical
+ * file, not the volume.
+ *
+ * Reads require device.read.  Writes require device.write; a write touching
+ * only whole 512-byte blocks goes straight to the device, while an unaligned
+ * first or final block is read-modify-written and therefore also requires
+ * device.read.  Public and opaque descriptors are both accepted: whether an
+ * opaque/private file is writable is an application policy decision above
+ * this physical range adapter.
+ *
+ * No allocation or retained binding table is used.  A caller that wants
+ * integer fds can store one fauxfat_disk_file in each open-file slot and use
+ * these helpers from its existing fauxfat_read_fn/fauxfat_write_fn callbacks.
+ */
+int fauxfat_disk_file_read(const fauxfat_device *device,
+                           const fauxfat_disk_file *file,
+                           uint64_t offset,
+                           void *data,
+                           size_t length);
+
+int fauxfat_disk_file_write(const fauxfat_device *device,
+                            const fauxfat_disk_file *file,
+                            uint64_t offset,
+                            const void *data,
+                            size_t length);
+
 #ifdef __cplusplus
 }
 #endif

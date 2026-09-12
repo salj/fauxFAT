@@ -1578,6 +1578,21 @@ int main(void)
         assert(got.file[0].first_block == 640u);
         assert(got.file[1].first_block == 1152u);
         assert(got.file[2].first_block == 1536u);
+
+        /* Reopened descriptors bind directly back onto the block device. */
+        {
+            uint8_t in[700];
+            uint8_t out[700];
+            fill_pattern(in, sizeof(in), 0x42u);
+            assert(fauxfat_disk_file_write(&pdev, &got.file[1], 123u,
+                                           in, sizeof(in)) == FAUXFAT_OK);
+            memset(out, 0, sizeof(out));
+            assert(fauxfat_disk_file_read(&pdev, &got.file[1], 123u,
+                                          out, sizeof(out)) == FAUXFAT_OK);
+            assert(memcmp(in, out, sizeof(in)) == 0);
+            assert(fauxfat_validate_strict(&pv, &pdev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+        }
         free(pmedia.data);
 
         /* Placement is ordered, nonoverlapping, and bounded by the arena. */
@@ -1589,6 +1604,91 @@ int main(void)
         placed_opaque.data_cluster = 7u;
         pcfg.data_cluster_count    = 7u;
         assert(fauxfat_init(&pv, &pcfg) == FAUXFAT_EGEOMETRY);
+    }
+
+    /*
+     * A recovered fauxfat_disk_file is itself enough to bind a caller file
+     * handle to the underlying block device. Byte I/O remains bounded by
+     * DataLength and preserves bytes outside unaligned writes.
+     */
+    {
+        fauxfat_disk_file range;
+        fauxfat_device range_dev;
+        test_device media;
+        uint8_t *storage;
+        uint8_t input[900];
+        uint8_t output[900];
+        uint8_t aligned[512];
+        uint64_t blocks = 192u;
+        size_t bytes    = (size_t)(blocks * FAUXFAT_BLOCK_SIZE);
+        size_t base;
+        size_t i;
+
+        storage = (uint8_t *)malloc(bytes);
+        assert(storage != NULL);
+        memset(storage, 0xa5, bytes);
+        memset(&media, 0, sizeof(media));
+        media.data   = storage;
+        media.blocks = blocks;
+        memset(&range_dev, 0, sizeof(range_dev));
+        range_dev.read    = dev_read;
+        range_dev.write   = dev_write;
+        range_dev.context = &media;
+
+        memset(&range, 0, sizeof(range));
+        strcpy(range.name, "BOUND.BIN");
+        range.kind              = FAUXFAT_DISK_FILE_PUBLIC;
+        range.first_block       = 32u;
+        range.data_length       = 700u;
+        range.allocation_blocks = FAUXFAT_BLOCKS_PER_CLUSTER;
+        base                    = (size_t)(range.first_block * FAUXFAT_BLOCK_SIZE);
+
+        fill_pattern(input, sizeof(input), 0x31u);
+        assert(fauxfat_disk_file_write(&range_dev, &range, 100u,
+                                       input, 600u) == FAUXFAT_OK);
+        for (i = 0u; i < 100u; ++i)
+            assert(storage[base + i] == 0xa5u);
+        assert(memcmp(storage + base + 100u, input, 600u) == 0);
+        for (i = 700u; i < 1024u; ++i)
+            assert(storage[base + i] == 0xa5u);
+
+        memset(output, 0, sizeof(output));
+        assert(fauxfat_disk_file_read(&range_dev, &range, 73u,
+                                      output, 627u) == FAUXFAT_OK);
+        assert(memcmp(output, storage + base + 73u, 627u) == 0);
+
+        /* The logical file boundary, not allocation slack, is authoritative. */
+        assert(fauxfat_disk_file_read(&range_dev, &range, 699u,
+                                      output, 2u) == FAUXFAT_ERANGE);
+        assert(fauxfat_disk_file_write(&range_dev, &range, 701u,
+                                       input, 0u) == FAUXFAT_ERANGE);
+        assert(fauxfat_disk_file_read(&range_dev, &range, 700u,
+                                      NULL, 0u) == FAUXFAT_OK);
+
+        /* Whole-block writes need no read callback; partial writes do RMW. */
+        memset(aligned, 0x6c, sizeof(aligned));
+        range.data_length = 1024u;
+        range_dev.read    = NULL;
+        assert(fauxfat_disk_file_write(&range_dev, &range, 0u,
+                                       aligned, sizeof(aligned)) == FAUXFAT_OK);
+        assert(memcmp(storage + base, aligned, sizeof(aligned)) == 0);
+        assert(fauxfat_disk_file_write(&range_dev, &range, 1u,
+                                       input, 1u) == FAUXFAT_EINVAL);
+        range_dev.read = dev_read;
+
+        /* Private descriptors use the same physical adapter when authorized. */
+        range.kind = FAUXFAT_DISK_FILE_OPAQUE;
+        assert(fauxfat_disk_file_write(&range_dev, &range, 517u,
+                                       input, 17u) == FAUXFAT_OK);
+        memset(output, 0, 17u);
+        assert(fauxfat_disk_file_read(&range_dev, &range, 517u,
+                                      output, 17u) == FAUXFAT_OK);
+        assert(memcmp(output, input, 17u) == 0);
+
+        range.data_length = range.allocation_blocks * FAUXFAT_BLOCK_SIZE + 1u;
+        assert(fauxfat_disk_file_read(&range_dev, &range, 0u,
+                                      output, 1u) == FAUXFAT_ESTRUCTURE);
+        free(storage);
     }
 
     /* exFAT cannot encode dates before 1980 or after 2107. */
