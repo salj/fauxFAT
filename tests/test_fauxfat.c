@@ -139,6 +139,78 @@ static int test_write(void *context, int fd, uint64_t offset,
     return 0;
 }
 
+typedef struct test_device {
+    uint8_t *data;
+    uint64_t blocks;
+    unsigned write_calls;
+    unsigned zero_calls;
+    unsigned undefined_skips;
+    unsigned preserve_skips;
+    uint64_t preserve_blocks;
+} test_device;
+
+static int dev_write(void *context, uint64_t first_block,
+                     size_t block_count, const void *data)
+{
+    test_device *d = (test_device *)context;
+    uint64_t bytes = (uint64_t)block_count * FAUXFAT_BLOCK_SIZE;
+
+    assert(first_block <= d->blocks);
+    assert((uint64_t)block_count <= d->blocks - first_block);
+    assert(bytes <= SIZE_MAX);
+    memcpy(d->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE),
+           data, (size_t)bytes);
+    ++d->write_calls;
+    return 0;
+}
+
+static int dev_zero(void *context, uint64_t first_block,
+                    uint64_t block_count)
+{
+    test_device *d = (test_device *)context;
+    uint64_t bytes = block_count * FAUXFAT_BLOCK_SIZE;
+
+    assert(first_block <= d->blocks);
+    assert(block_count <= d->blocks - first_block);
+    assert(bytes <= SIZE_MAX);
+    memset(d->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE),
+           0, (size_t)bytes);
+    ++d->zero_calls;
+    return 0;
+}
+
+static int dev_skip(void *context, uint64_t first_block,
+                    uint64_t block_count, fauxfat_skip_kind kind)
+{
+    test_device *d = (test_device *)context;
+
+    assert(first_block <= d->blocks);
+    assert(block_count <= d->blocks - first_block);
+    if (kind == FAUXFAT_SKIP_PRESERVE) {
+        ++d->preserve_skips;
+        d->preserve_blocks += block_count;
+    } else {
+        assert(kind == FAUXFAT_SKIP_UNDEFINED);
+        ++d->undefined_skips;
+    }
+    return 0;
+}
+
+typedef struct preserve_test {
+    const char *name;
+    unsigned calls;
+    fauxfat_disk_file last;
+} preserve_test;
+
+static int preserve_named(void *context, const fauxfat_disk_file *wanted)
+{
+    preserve_test *p = (preserve_test *)context;
+
+    ++p->calls;
+    p->last = *wanted;
+    return strcmp(wanted->name, p->name) == 0;
+}
+
 int main(void)
 {
     static uint8_t solver[2u * FAUXFAT_CLUSTER_SIZE];
@@ -613,6 +685,18 @@ int main(void)
         /* The raw bytes exist, but the host block-write translator cannot hit them. */
         assert(fauxfat_translate_write(&ov, oblock, &m) == FAUXFAT_EUNMAPPED);
 
+        /* Opaque reads now share the same range classifier and coalesce too. */
+        {
+            uint8_t pair[1024];
+            unsigned reads_before = io.read_calls;
+            assert(fauxfat_read_blocks(&ov, oblock + 4u, 2u, pair) == FAUXFAT_OK);
+            assert(io.read_calls == reads_before + 1u);
+            assert(io.last_fd == 13);
+            assert(io.last_offset == 4u * 512u);
+            assert(io.last_length == sizeof(pair));
+            assert(memcmp(pair, opaque_data + 4u * 512u, sizeof(pair)) == 0);
+        }
+
         {
             fauxfat_disk_file d;
             assert(fauxfat_disk_file_count(&ov) == 3u);
@@ -624,6 +708,127 @@ int main(void)
             assert(d.allocation_blocks == FAUXFAT_BLOCKS_PER_CLUSTER);
             assert(fauxfat_describe_disk_file(&ov, 3u, &d) == FAUXFAT_ERANGE);
         }
+    }
+
+    /*
+     * Sparse formatting distinguishes exact writes, must-be-zero ranges,
+     * don't-care holes, and payload/private preservation.  Dirty backing
+     * makes accidental zeroing/skipping visible instead of rewarding us with
+     * a test that only passes because calloc is excessively polite.
+     */
+    {
+        uint8_t short_data[1234];
+        fauxfat_file short_file = {
+            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045
+        };
+        fauxfat_opaque_file opaque = {
+            "SECRET.BIN", 13, sizeof(opaque_data), (time_t)1735787045
+        };
+
+        fauxfat_config fcfg = cfg;
+        fauxfat_view fv;
+        fauxfat_device dev;
+        test_device media;
+        fauxfat_disk_file pubd, opqd;
+        preserve_test keep;
+        uint8_t expected[512];
+        uint64_t upcase_block;
+        uint64_t bytes;
+        unsigned reads_before  = io.read_calls;
+        unsigned writes_before = io.write_calls;
+
+        fcfg.files             = &short_file;
+        fcfg.file_count        = 1u;
+        fcfg.opaque_files      = &opaque;
+        fcfg.opaque_file_count = 1u;
+        assert(fauxfat_init(&fv, &fcfg) == FAUXFAT_OK);
+        assert(fauxfat_describe_disk_file(&fv, 0u, &pubd) == FAUXFAT_OK);
+        assert(fauxfat_describe_disk_file(&fv, 1u, &opqd) == FAUXFAT_OK);
+
+        bytes = fv.volume_blocks * FAUXFAT_BLOCK_SIZE;
+        assert(bytes <= SIZE_MAX);
+        memset(&media, 0, sizeof(media));
+        media.blocks = fv.volume_blocks;
+        media.data   = (uint8_t *)malloc((size_t)bytes);
+        assert(media.data != NULL);
+        memset(media.data, 0xa9, (size_t)bytes);
+
+        memset(&dev, 0, sizeof(dev));
+        dev.write   = dev_write;
+        dev.zero    = dev_zero;
+        dev.skip    = dev_skip;
+        dev.context = &media;
+
+        assert(fauxfat_format(&fv, &dev, NULL, NULL, 0u) == FAUXFAT_OK);
+        assert(io.read_calls == reads_before);
+        assert(io.write_calls == writes_before);
+        assert(media.write_calls != 0u);
+        assert(media.zero_calls != 0u);
+        assert(media.undefined_skips != 0u);
+        assert(media.preserve_skips == 1u);
+        assert(media.preserve_blocks == opqd.allocation_blocks);
+
+        /* Structural bytes are rendered exactly. */
+        assert(fauxfat_read_block(&fv, 0u, expected) == FAUXFAT_OK);
+        assert(memcmp(media.data, expected, sizeof(expected)) == 0);
+
+        /* FAT alignment is undefined, not required-zero. */
+        for (i = 0; i < FAUXFAT_BLOCK_SIZE; ++i)
+            assert(media.data[24u * FAUXFAT_BLOCK_SIZE + i] == 0xa9u);
+
+        /* Public valid bytes are zeroed, allocation slack is left alone. */
+        for (i = 0; i < 3u * FAUXFAT_BLOCK_SIZE; ++i)
+            assert(media.data[pubd.first_block * FAUXFAT_BLOCK_SIZE + i] == 0u);
+        for (i = 3u * FAUXFAT_BLOCK_SIZE;
+             i < 4u * FAUXFAT_BLOCK_SIZE; ++i)
+            assert(media.data[pubd.first_block * FAUXFAT_BLOCK_SIZE + i] == 0xa9u);
+
+        /* The complete opaque allocation is untouched. */
+        for (i = 0; i < FAUXFAT_BLOCK_SIZE; ++i)
+            assert(media.data[opqd.first_block * FAUXFAT_BLOCK_SIZE + i] == 0xa9u);
+
+        /* Upcase contents are generated, the rest of its cluster is undefined. */
+        upcase_block = fv.cluster_heap_block +
+                       (uint64_t)(fv.upcase_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        assert(fauxfat_read_block(&fv, upcase_block, expected) == FAUXFAT_OK);
+        assert(memcmp(media.data + upcase_block * FAUXFAT_BLOCK_SIZE,
+                      expected, sizeof(expected)) == 0);
+        for (i = 0; i < FAUXFAT_BLOCK_SIZE; ++i)
+            assert(media.data[(upcase_block + 1u) * FAUXFAT_BLOCK_SIZE + i] == 0xa9u);
+
+        /* ZERO_UNDEFINED strengthens don't-care holes but never touches opaque. */
+        memset(media.data, 0xa9, (size_t)bytes);
+        media.write_calls = media.zero_calls = 0u;
+        media.undefined_skips = media.preserve_skips = 0u;
+        media.preserve_blocks                        = 0u;
+        assert(fauxfat_format(&fv, &dev, NULL, NULL,
+                              FAUXFAT_FORMAT_ZERO_UNDEFINED) == FAUXFAT_OK);
+        for (i = 0; i < FAUXFAT_BLOCK_SIZE; ++i) {
+            assert(media.data[24u * FAUXFAT_BLOCK_SIZE + i] == 0u);
+            assert(media.data[(upcase_block + 1u) * FAUXFAT_BLOCK_SIZE + i] == 0u);
+            assert(media.data[opqd.first_block * FAUXFAT_BLOCK_SIZE + i] == 0xa9u);
+        }
+        assert(media.undefined_skips == 0u);
+        assert(media.preserve_skips == 1u);
+
+        /* An exact public descriptor can be preserved in place as well. */
+        memset(media.data, 0x6du, (size_t)bytes);
+        media.undefined_skips = media.preserve_skips = 0u;
+        media.preserve_blocks                        = 0u;
+        memset(&keep, 0, sizeof(keep));
+        keep.name = "SHORT.BIN";
+        assert(fauxfat_format(&fv, &dev, preserve_named, &keep, 0u) == FAUXFAT_OK);
+        assert(keep.calls == 1u);
+        assert(keep.last.kind == FAUXFAT_DISK_FILE_PUBLIC);
+        assert(keep.last.first_block == pubd.first_block);
+        assert(keep.last.allocation_blocks == pubd.allocation_blocks);
+        for (i = 0; i < FAUXFAT_BLOCK_SIZE; ++i)
+            assert(media.data[pubd.first_block * FAUXFAT_BLOCK_SIZE + i] == 0x6du);
+        assert(media.preserve_skips == 2u); /* public + opaque */
+        assert(media.preserve_blocks == pubd.allocation_blocks + opqd.allocation_blocks);
+
+        assert(fauxfat_format(&fv, &dev, NULL, NULL, 2u) == FAUXFAT_EINVAL);
+        free(media.data);
     }
 
     /* Maximum-length logical opaque names spill their last two bytes into

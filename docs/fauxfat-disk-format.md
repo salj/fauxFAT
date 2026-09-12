@@ -566,6 +566,7 @@ Boot Sector bytes 64..105           geometry through FileSystemRevision
 Boot Sector bytes 108..111          sector/cluster shifts, NumberOfFats, DriveSelect
 canonical FAT bytes
 meaningful Allocation Bitmap bytes
+exact Up-case Table bytes through its DataLength
 canonicalized root cluster
 ```
 
@@ -573,7 +574,7 @@ The current `VolumeFlags` and `PercentInUse` are intentionally absent.
 
 The SHA-256 of that exact byte stream is OEM Parameter 0.
 
-This seal detects every change to physical extent ownership, file positions/sizes/names, FAT bad-cluster reservations, root slot use, filesystem metadata chains, and geometry while tolerating ordinary timestamp/archive updates.
+This seal detects every change to physical extent ownership, file positions/sizes/names, FAT bad-cluster reservations, root slot use, the fauxFAT case-folding table, filesystem metadata chains, and geometry while tolerating ordinary timestamp/archive updates.
 
 ## 12. Physical allocation policy
 

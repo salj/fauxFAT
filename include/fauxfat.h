@@ -158,6 +158,59 @@ typedef struct fauxfat_disk_file {
     time_t mtime;
 } fauxfat_disk_file;
 
+/*
+ * Raw block-device side of sparse formatting and (later) validation.
+ * Addresses are volume-relative 512-byte blocks, matching fauxfat_read_block.
+ */
+typedef int (*fauxfat_dev_read_fn)(void *context,
+                                   uint64_t first_block,
+                                   size_t block_count,
+                                   void *data);
+
+typedef int (*fauxfat_dev_write_fn)(void *context,
+                                    uint64_t first_block,
+                                    size_t block_count,
+                                    const void *data);
+
+/* After success every block in the range must read as all-zero. */
+typedef int (*fauxfat_dev_zero_fn)(void *context,
+                                   uint64_t first_block,
+                                   uint64_t block_count);
+
+typedef enum fauxfat_skip_kind {
+    /* fauxFAT places no condition on existing bytes in this range. */
+    FAUXFAT_SKIP_UNDEFINED = 0,
+    /* Existing bytes are payload/private state and must remain untouched. */
+    FAUXFAT_SKIP_PRESERVE = 1
+} fauxfat_skip_kind;
+
+typedef int (*fauxfat_dev_skip_fn)(void *context,
+                                   uint64_t first_block,
+                                   uint64_t block_count,
+                                   fauxfat_skip_kind kind);
+
+typedef struct fauxfat_device {
+    fauxfat_dev_read_fn read;
+    fauxfat_dev_write_fn write;
+    fauxfat_dev_zero_fn zero;
+    fauxfat_dev_skip_fn skip;
+    void *context;
+} fauxfat_device;
+
+/*
+ * Called once for each public allocation before fresh-format zeroing.
+ * >0 preserves the complete exact allocation, 0 initializes it normally,
+ * <0 aborts and is propagated unchanged. Opaque allocations are always
+ * preserve ranges and do not need this callback.
+ */
+typedef int (*fauxfat_preserve_fn)(void *context,
+                                   const fauxfat_disk_file *wanted);
+
+enum {
+    /* Stronger reproducibility mode: zero ranges normally left undefined. */
+    FAUXFAT_FORMAT_ZERO_UNDEFINED = 1u << 0
+};
+
 enum {
     FAUXFAT_OK        = 0,
     FAUXFAT_EINVAL    = -1,
@@ -224,6 +277,24 @@ int fauxfat_write_blocks(const fauxfat_view *view,
                          uint64_t first_block,
                          size_t block_count,
                          const uint8_t *in);
+
+/*
+ * Materialize the manufactured filesystem into an arbitrary block device
+ * without constructing an image in RAM. Structural blocks are generated one
+ * block at a time; public payload is zeroed in ranges; undefined and opaque
+ * allocations are reported as skip ranges. A preserve callback can convert
+ * an exact public allocation from zeroing to preserve-in-place.
+ *
+ * device.write and device.zero are required. device.skip is optional; when
+ * omitted, skipped ranges simply cause no callback. device.read is unused by
+ * formatting and exists for the verifier/reopen API which shares this device
+ * description.
+ */
+int fauxfat_format(const fauxfat_view *view,
+                   const fauxfat_device *device,
+                   fauxfat_preserve_fn preserve,
+                   void *preserve_context,
+                   unsigned flags);
 
 #ifdef __cplusplus
 }

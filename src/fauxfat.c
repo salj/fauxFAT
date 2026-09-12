@@ -879,66 +879,153 @@ static void ff_make_fat_block(const fauxfat_view *v,
     }
 }
 
-static int ff_locate_file_block(const fauxfat_view *v,
-                                uint32_t cluster,
-                                uint32_t block_in_cluster,
-                                size_t *file_index,
-                                uint64_t *file_offset,
-                                size_t *length);
+/*
+ * The synthetic block view, formatter and verifier all need the same answer
+ * to the only geometry question that matters: what does this physical block
+ * mean?  Keep that answer here rather than letting each consumer rediscover
+ * exFAT layout with a slightly different off-by-one.
+ *
+ * REQUIRED_ZERO is structural zero data.  UNDEFINED is deliberately weaker:
+ * the synthetic view returns zero for deterministic reads, but a sparse/in-
+ * place formatter is free to skip those blocks entirely.
+ */
+typedef enum ff_range_kind {
+    FF_RANGE_GENERATED,
+    FF_RANGE_REQUIRED_ZERO,
+    FF_RANGE_PUBLIC_PAYLOAD,
+    FF_RANGE_OPAQUE_PRESERVE,
+    FF_RANGE_UNDEFINED
+} ff_range_kind;
 
-static int ff_locate_opaque_block(const fauxfat_view *v,
-                                  uint32_t cluster,
-                                  uint32_t block_in_cluster,
-                                  size_t *opaque_index,
-                                  uint64_t *file_offset);
+typedef enum ff_generated_kind {
+    FF_GENERATED_BOOT,
+    FF_GENERATED_EXTENDED_BOOT,
+    FF_GENERATED_OEM,
+    FF_GENERATED_CHECKSUM,
+    FF_GENERATED_FAT,
+    FF_GENERATED_BITMAP,
+    FF_GENERATED_UPCASE,
+    FF_GENERATED_ROOT
+} ff_generated_kind;
 
-static int ff_read_file_block(const fauxfat_view *v,
-                              uint32_t cluster,
-                              uint32_t block_in_cluster,
-                              uint8_t out[512])
-{
-    size_t file_index;
-    uint64_t file_offset;
+typedef struct ff_block_mapping {
+    ff_range_kind kind;
+    ff_generated_kind generated_kind;
+    uint32_t generated_index;
+    size_t object_index;
+    uint64_t object_offset;
     size_t length;
-    int rc = ff_locate_file_block(v, cluster, block_in_cluster,
-                                  &file_index, &file_offset, &length);
+} ff_block_mapping;
 
-    if (rc == FAUXFAT_OK) {
-        memset(out, 0, 512);
-        if (length) {
-            const fauxfat_file *f = &v->config->files[file_index];
-            rc                    = v->config->read(v->config->io_context, f->fd,
-                                                    file_offset, out, length);
-            if (rc != 0)
-                return rc;
+static int ff_classify_block(const fauxfat_view *v,
+                             uint64_t block_address,
+                             ff_block_mapping *m)
+{
+    uint64_t heap_rel;
+    uint32_t cluster;
+    uint32_t block_in_cluster;
+    uint64_t fat_meaningful_bytes;
+    uint32_t fat_meaningful_blocks;
+    uint64_t bitmap_bytes;
+    uint32_t bitmap_data_blocks;
+    uint32_t first;
+    size_t i;
+
+    if (block_address >= v->volume_blocks)
+        return FAUXFAT_ERANGE;
+
+    memset(m, 0, sizeof(*m));
+
+    if (block_address == 0u || block_address == 12u) {
+        m->kind           = FF_RANGE_GENERATED;
+        m->generated_kind = FF_GENERATED_BOOT;
+        return FAUXFAT_OK;
+    }
+
+    if ((block_address >= 1u && block_address <= 8u) ||
+        (block_address >= 13u && block_address <= 20u)) {
+        m->kind           = FF_RANGE_GENERATED;
+        m->generated_kind = FF_GENERATED_EXTENDED_BOOT;
+        return FAUXFAT_OK;
+    }
+
+    if (block_address == 9u || block_address == 21u) {
+        m->kind           = FF_RANGE_GENERATED;
+        m->generated_kind = FF_GENERATED_OEM;
+        return FAUXFAT_OK;
+    }
+
+    if (block_address == 10u || block_address == 22u) {
+        m->kind = FF_RANGE_REQUIRED_ZERO;
+        return FAUXFAT_OK;
+    }
+
+    if (block_address == 11u || block_address == 23u) {
+        m->kind           = FF_RANGE_GENERATED;
+        m->generated_kind = FF_GENERATED_CHECKSUM;
+        return FAUXFAT_OK;
+    }
+
+    if (block_address >= 24u && block_address < FF_FAT_OFFSET_BLOCKS) {
+        m->kind = FF_RANGE_UNDEFINED;
+        return FAUXFAT_OK;
+    }
+
+    if (block_address >= FF_FAT_OFFSET_BLOCKS &&
+        block_address < FF_FAT_OFFSET_BLOCKS + v->fat_length_blocks) {
+        fat_meaningful_bytes  = ((uint64_t)v->cluster_count + 2u) * 4u;
+        fat_meaningful_blocks = (uint32_t)((fat_meaningful_bytes + 511u) / 512u);
+        m->generated_index    = (uint32_t)(block_address - FF_FAT_OFFSET_BLOCKS);
+        if (m->generated_index < fat_meaningful_blocks) {
+            m->kind           = FF_RANGE_GENERATED;
+            m->generated_kind = FF_GENERATED_FAT;
+        } else {
+            m->kind = FF_RANGE_UNDEFINED;
         }
         return FAUXFAT_OK;
     }
 
-    {
-        size_t opaque_index;
-        rc = ff_locate_opaque_block(v, cluster, block_in_cluster,
-                                    &opaque_index, &file_offset);
-        if (rc == FAUXFAT_OK) {
-            const fauxfat_opaque_file *f = &v->config->opaque_files[opaque_index];
-            return v->config->read(v->config->io_context, f->fd,
-                                   file_offset, out, FAUXFAT_BLOCK_SIZE);
+    if (block_address < v->cluster_heap_block)
+        return FAUXFAT_EGEOMETRY;
+
+    heap_rel         = block_address - v->cluster_heap_block;
+    cluster          = 2u + (uint32_t)(heap_rel / FAUXFAT_BLOCKS_PER_CLUSTER);
+    block_in_cluster = (uint32_t)(heap_rel % FAUXFAT_BLOCKS_PER_CLUSTER);
+
+    if (cluster >= 2u && cluster < 2u + v->bitmap_clusters) {
+        uint32_t bitmap_block = (cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER +
+                                block_in_cluster;
+        bitmap_bytes       = ((uint64_t)v->cluster_count + 7u) / 8u;
+        bitmap_data_blocks = (uint32_t)((bitmap_bytes + 511u) / 512u);
+        m->generated_index = bitmap_block;
+        if (bitmap_block < bitmap_data_blocks) {
+            m->kind           = FF_RANGE_GENERATED;
+            m->generated_kind = FF_GENERATED_BITMAP;
+        } else {
+            m->kind = FF_RANGE_UNDEFINED;
         }
+        return FAUXFAT_OK;
     }
 
-    return rc;
-}
+    if (cluster == v->upcase_cluster) {
+        if (block_in_cluster == 0u) {
+            m->kind            = FF_RANGE_GENERATED;
+            m->generated_kind  = FF_GENERATED_UPCASE;
+            m->generated_index = 0u;
+        } else {
+            m->kind = FF_RANGE_UNDEFINED;
+        }
+        return FAUXFAT_OK;
+    }
 
-static int ff_locate_file_block(const fauxfat_view *v,
-                                uint32_t cluster,
-                                uint32_t block_in_cluster,
-                                size_t *file_index,
-                                uint64_t *file_offset,
-                                size_t *length)
-{
-    uint32_t first = v->data_first_cluster;
-    size_t i;
+    if (cluster == v->root_cluster) {
+        m->kind            = FF_RANGE_GENERATED;
+        m->generated_kind  = FF_GENERATED_ROOT;
+        m->generated_index = block_in_cluster;
+        return FAUXFAT_OK;
+    }
 
+    first = v->data_first_cluster;
     for (i = 0; i < v->config->file_count; ++i) {
         const fauxfat_file *f = &v->config->files[i];
         uint32_t nclusters    = (uint32_t)ff_file_clusters(f);
@@ -946,48 +1033,31 @@ static int ff_locate_file_block(const fauxfat_view *v,
         if (cluster >= first && cluster < first + nclusters) {
             uint64_t off = ((uint64_t)(cluster - first) * FAUXFAT_CLUSTER_SIZE) +
                            ((uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE);
-            size_t n = 0;
-
             if (off < f->size) {
-                uint64_t left = f->size - off;
-                n             = left > FAUXFAT_BLOCK_SIZE ? FAUXFAT_BLOCK_SIZE : (size_t)left;
+                uint64_t left    = f->size - off;
+                m->kind          = FF_RANGE_PUBLIC_PAYLOAD;
+                m->object_index  = i;
+                m->object_offset = off;
+                m->length        = left > FAUXFAT_BLOCK_SIZE ? FAUXFAT_BLOCK_SIZE : (size_t)left;
+            } else {
+                m->kind = FF_RANGE_UNDEFINED;
             }
-
-            if (file_index)
-                *file_index = i;
-            if (file_offset)
-                *file_offset = off;
-            if (length)
-                *length = n;
             return FAUXFAT_OK;
         }
         first += nclusters;
     }
-
-    return FAUXFAT_EGEOMETRY;
-}
-
-static int ff_locate_opaque_block(const fauxfat_view *v,
-                                  uint32_t cluster,
-                                  uint32_t block_in_cluster,
-                                  size_t *opaque_index,
-                                  uint64_t *file_offset)
-{
-    uint32_t first = (uint32_t)((uint64_t)v->data_first_cluster +
-                                ff_public_cluster_count(v));
-    size_t i;
 
     for (i = 0; i < v->config->opaque_file_count; ++i) {
         const fauxfat_opaque_file *f = &v->config->opaque_files[i];
         uint32_t nclusters           = (uint32_t)ff_opaque_clusters(f);
 
         if (cluster >= first && cluster < first + nclusters) {
-            uint64_t off = ((uint64_t)(cluster - first) * FAUXFAT_CLUSTER_SIZE) +
-                           ((uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE);
-            if (opaque_index)
-                *opaque_index = i;
-            if (file_offset)
-                *file_offset = off;
+            m->kind         = FF_RANGE_OPAQUE_PRESERVE;
+            m->object_index = i;
+            m->object_offset =
+                ((uint64_t)(cluster - first) * FAUXFAT_CLUSTER_SIZE) +
+                ((uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE);
+            m->length = FAUXFAT_BLOCK_SIZE;
             return FAUXFAT_OK;
         }
         first += nclusters;
@@ -996,44 +1066,76 @@ static int ff_locate_opaque_block(const fauxfat_view *v,
     return FAUXFAT_EGEOMETRY;
 }
 
+static int ff_render_classified_block(const fauxfat_view *v,
+                                      const ff_block_mapping *m,
+                                      uint8_t out[512])
+{
+    if (m->kind == FF_RANGE_REQUIRED_ZERO || m->kind == FF_RANGE_UNDEFINED) {
+        memset(out, 0, 512);
+        return FAUXFAT_OK;
+    }
+    if (m->kind != FF_RANGE_GENERATED)
+        return FAUXFAT_EUNMAPPED;
+
+    switch (m->generated_kind) {
+    case FF_GENERATED_BOOT:
+        ff_make_boot_sector(v, out);
+        return FAUXFAT_OK;
+    case FF_GENERATED_EXTENDED_BOOT:
+        ff_make_extended_boot(out);
+        return FAUXFAT_OK;
+    case FF_GENERATED_OEM:
+        ff_make_oem_sector(v, out);
+        return FAUXFAT_OK;
+    case FF_GENERATED_CHECKSUM:
+        ff_make_checksum_sector(v, out);
+        return FAUXFAT_OK;
+    case FF_GENERATED_FAT:
+        ff_make_fat_block(v, m->generated_index, out);
+        return FAUXFAT_OK;
+    case FF_GENERATED_BITMAP:
+        ff_make_bitmap_block(v, m->generated_index, out);
+        return FAUXFAT_OK;
+    case FF_GENERATED_UPCASE:
+        ff_make_upcase_block(m->generated_index, out);
+        return FAUXFAT_OK;
+    case FF_GENERATED_ROOT:
+        ff_make_root_block(v, m->generated_index, out);
+        return FAUXFAT_OK;
+    }
+
+    return FAUXFAT_EGEOMETRY;
+}
+
+static int ff_render_structural_block(const fauxfat_view *v,
+                                      uint64_t block_address,
+                                      uint8_t out[512])
+{
+    ff_block_mapping m;
+    int rc = ff_classify_block(v, block_address, &m);
+
+    if (rc != FAUXFAT_OK)
+        return rc;
+    return ff_render_classified_block(v, &m, out);
+}
+
 static int ff_translate_data_block(const fauxfat_view *v,
                                    uint64_t block_address,
                                    fauxfat_write_mapping *mapping)
 {
-    uint64_t heap_rel;
-    uint32_t cluster;
-    uint32_t block_in_cluster;
-    size_t file_index;
-    uint64_t file_offset;
-    size_t length;
+    ff_block_mapping m;
     int rc;
 
-    if (block_address >= v->volume_blocks)
-        return FAUXFAT_ERANGE;
-    if (block_address < v->cluster_heap_block)
-        return FAUXFAT_EUNMAPPED;
-
-    heap_rel         = block_address - v->cluster_heap_block;
-    cluster          = 2u + (uint32_t)(heap_rel / FAUXFAT_BLOCKS_PER_CLUSTER);
-    block_in_cluster = (uint32_t)(heap_rel % FAUXFAT_BLOCKS_PER_CLUSTER);
-
-    if (cluster < v->data_first_cluster)
-        return FAUXFAT_EUNMAPPED;
-    if (cluster >= (uint32_t)((uint64_t)v->data_first_cluster +
-                              ff_public_cluster_count(v)))
-        return FAUXFAT_EUNMAPPED;
-
-    rc = ff_locate_file_block(v, cluster, block_in_cluster,
-                              &file_index, &file_offset, &length);
+    rc = ff_classify_block(v, block_address, &m);
     if (rc != FAUXFAT_OK)
         return rc;
-    if (length == 0u)
+    if (m.kind != FF_RANGE_PUBLIC_PAYLOAD || m.length == 0u)
         return FAUXFAT_EUNMAPPED;
 
-    mapping->file_index  = file_index;
-    mapping->fd          = v->config->files[file_index].fd;
-    mapping->file_offset = file_offset;
-    mapping->length      = length;
+    mapping->file_index  = m.object_index;
+    mapping->fd          = v->config->files[m.object_index].fd;
+    mapping->file_offset = m.object_offset;
+    mapping->length      = m.length;
     return FAUXFAT_OK;
 }
 
@@ -1042,7 +1144,6 @@ static void ff_compute_component_hashes(fauxfat_view *v)
     uint8_t block[512];
     uint32_t crc;
     ff_sha256 sha;
-    uint8_t boot[512];
     uint8_t prefix[8]             = { 'F', 'F', 'M', 'A', 'P', '1', 0, 0 };
     uint64_t bitmap_bytes         = ((uint64_t)v->cluster_count + 7u) / 8u;
     uint64_t fat_meaningful_bytes = ((uint64_t)v->cluster_count + 2u) * 4u;
@@ -1053,7 +1154,7 @@ static void ff_compute_component_hashes(fauxfat_view *v)
     for (i = 0; i < fat_blocks; ++i) {
         uint64_t left = fat_meaningful_bytes - (uint64_t)i * 512u;
         size_t n      = left > 512u ? 512u : (size_t)left;
-        ff_make_fat_block(v, i, block);
+        (void)ff_render_structural_block(v, FF_FAT_OFFSET_BLOCKS + i, block);
         crc = ff_crc32c_update(crc, block, n);
     }
     v->fat_crc32c = ~crc;
@@ -1062,38 +1163,50 @@ static void ff_compute_component_hashes(fauxfat_view *v)
     for (i = 0; (uint64_t)i * 512u < bitmap_bytes; ++i) {
         uint64_t left = bitmap_bytes - (uint64_t)i * 512u;
         size_t n      = left > 512u ? 512u : (size_t)left;
-        ff_make_bitmap_block(v, i, block);
+        (void)ff_render_structural_block(v,
+                                         (uint64_t)v->cluster_heap_block + i, block);
         crc = ff_crc32c_update(crc, block, n);
     }
     v->bitmap_crc32c = ~crc;
 
     crc = 0xffffffffu;
     for (i = 0; i < FAUXFAT_BLOCKS_PER_CLUSTER; ++i) {
-        ff_make_root_block(v, i, block);
+        uint64_t root_block = (uint64_t)v->cluster_heap_block +
+                              (uint64_t)(v->root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER + i;
+        (void)ff_render_structural_block(v, root_block, block);
         crc = ff_crc32c_update(crc, block, 512);
     }
     v->root_crc32c = ~crc;
 
     ff_sha256_init(&sha);
     ff_sha256_update(&sha, prefix, sizeof(prefix));
-    ff_make_boot_sector(v, boot);
-    ff_sha256_update(&sha, boot + 64, 42);
-    ff_sha256_update(&sha, boot + 108, 4);
+    (void)ff_render_structural_block(v, 0u, block);
+    ff_sha256_update(&sha, block + 64, 42);
+    ff_sha256_update(&sha, block + 108, 4);
 
     for (i = 0; i < fat_blocks; ++i) {
         uint64_t left = fat_meaningful_bytes - (uint64_t)i * 512u;
         size_t n      = left > 512u ? 512u : (size_t)left;
-        ff_make_fat_block(v, i, block);
+        (void)ff_render_structural_block(v, FF_FAT_OFFSET_BLOCKS + i, block);
         ff_sha256_update(&sha, block, n);
     }
     for (i = 0; (uint64_t)i * 512u < bitmap_bytes; ++i) {
         uint64_t left = bitmap_bytes - (uint64_t)i * 512u;
         size_t n      = left > 512u ? 512u : (size_t)left;
-        ff_make_bitmap_block(v, i, block);
+        (void)ff_render_structural_block(v,
+                                         (uint64_t)v->cluster_heap_block + i, block);
         ff_sha256_update(&sha, block, n);
     }
+    {
+        uint64_t upcase_block = (uint64_t)v->cluster_heap_block +
+                                (uint64_t)(v->upcase_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        (void)ff_render_structural_block(v, upcase_block, block);
+        ff_sha256_update(&sha, block, FF_UPCASE_BYTES);
+    }
     for (i = 0; i < FAUXFAT_BLOCKS_PER_CLUSTER; ++i) {
-        ff_make_root_block(v, i, block);
+        uint64_t root_block = (uint64_t)v->cluster_heap_block +
+                              (uint64_t)(v->root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER + i;
+        (void)ff_render_structural_block(v, root_block, block);
         ff_sha256_update(&sha, block, 512);
     }
     ff_sha256_final(&sha, v->map_sha256);
@@ -1107,14 +1220,7 @@ static uint32_t ff_compute_boot_checksum(const fauxfat_view *v)
     unsigned byte;
 
     for (sector = 0; sector <= 10; ++sector) {
-        if (sector == 0)
-            ff_make_boot_sector(v, block);
-        else if (sector <= 8)
-            ff_make_extended_boot(block);
-        else if (sector == 9)
-            ff_make_oem_sector(v, block);
-        else
-            memset(block, 0, 512);
+        (void)ff_render_structural_block(v, sector, block);
 
         for (byte = 0; byte < 512; ++byte) {
             if (sector == 0 && (byte == 106u || byte == 107u || byte == 112u))
@@ -1296,69 +1402,36 @@ int fauxfat_read_block(const fauxfat_view *v,
                        uint64_t block_address,
                        uint8_t out[FAUXFAT_BLOCK_SIZE])
 {
-    uint64_t heap_rel;
-    uint32_t cluster;
-    uint32_t block_in_cluster;
+    ff_block_mapping m;
+    int rc;
 
     if (!v || !v->config || !out)
         return FAUXFAT_EINVAL;
-    if (block_address >= v->volume_blocks)
-        return FAUXFAT_ERANGE;
+    rc = ff_classify_block(v, block_address, &m);
+    if (rc != FAUXFAT_OK)
+        return rc;
 
-    if (block_address == 0u || block_address == 12u) {
-        ff_make_boot_sector(v, out);
-        return FAUXFAT_OK;
-    }
-    if ((block_address >= 1u && block_address <= 8u) ||
-        (block_address >= 13u && block_address <= 20u)) {
-        ff_make_extended_boot(out);
-        return FAUXFAT_OK;
-    }
-    if (block_address == 9u || block_address == 21u) {
-        ff_make_oem_sector(v, out);
-        return FAUXFAT_OK;
-    }
-    if (block_address == 10u || block_address == 22u ||
-        (block_address >= 24u && block_address < FF_FAT_OFFSET_BLOCKS)) {
-        memset(out, 0, 512);
-        return FAUXFAT_OK;
-    }
-    if (block_address == 11u || block_address == 23u) {
-        ff_make_checksum_sector(v, out);
-        return FAUXFAT_OK;
+    if (m.kind == FF_RANGE_GENERATED ||
+        m.kind == FF_RANGE_REQUIRED_ZERO ||
+        m.kind == FF_RANGE_UNDEFINED)
+        return ff_render_classified_block(v, &m, out);
+
+    if (m.kind == FF_RANGE_PUBLIC_PAYLOAD) {
+        const fauxfat_file *f = &v->config->files[m.object_index];
+        memset(out, 0, FAUXFAT_BLOCK_SIZE);
+        rc = v->config->read(v->config->io_context, f->fd,
+                             m.object_offset, out, m.length);
+        return rc == 0 ? FAUXFAT_OK : rc;
     }
 
-    if (block_address >= FF_FAT_OFFSET_BLOCKS &&
-        block_address < FF_FAT_OFFSET_BLOCKS + v->fat_length_blocks) {
-        ff_make_fat_block(v, (uint32_t)(block_address - FF_FAT_OFFSET_BLOCKS), out);
-        return FAUXFAT_OK;
+    if (m.kind == FF_RANGE_OPAQUE_PRESERVE) {
+        const fauxfat_opaque_file *f = &v->config->opaque_files[m.object_index];
+        rc                           = v->config->read(v->config->io_context, f->fd,
+                                                       m.object_offset, out, FAUXFAT_BLOCK_SIZE);
+        return rc == 0 ? FAUXFAT_OK : rc;
     }
 
-    if (block_address < v->cluster_heap_block)
-        return FAUXFAT_EGEOMETRY;
-
-    heap_rel         = block_address - v->cluster_heap_block;
-    cluster          = 2u + (uint32_t)(heap_rel / FAUXFAT_BLOCKS_PER_CLUSTER);
-    block_in_cluster = (uint32_t)(heap_rel % FAUXFAT_BLOCKS_PER_CLUSTER);
-
-    if (cluster >= 2u && cluster < 2u + v->bitmap_clusters) {
-        uint32_t bitmap_block = (cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER +
-                                block_in_cluster;
-        ff_make_bitmap_block(v, bitmap_block, out);
-        return FAUXFAT_OK;
-    }
-
-    if (cluster == v->upcase_cluster) {
-        ff_make_upcase_block(block_in_cluster, out);
-        return FAUXFAT_OK;
-    }
-
-    if (cluster == v->root_cluster) {
-        ff_make_root_block(v, block_in_cluster, out);
-        return FAUXFAT_OK;
-    }
-
-    return ff_read_file_block(v, cluster, block_in_cluster, out);
+    return FAUXFAT_EGEOMETRY;
 }
 
 int fauxfat_read_blocks(const fauxfat_view *v,
@@ -1379,19 +1452,22 @@ int fauxfat_read_blocks(const fauxfat_view *v,
         return FAUXFAT_ERANGE;
 
     for (i = 0; i < block_count;) {
-        fauxfat_write_mapping mapping;
-        int rc = ff_translate_data_block(v, first_block + i, &mapping);
+        ff_block_mapping m;
+        int rc = ff_classify_block(v, first_block + i, &m);
 
-        if (rc == FAUXFAT_OK) {
-            const fauxfat_file *f = &v->config->files[mapping.file_index];
+        if (rc != FAUXFAT_OK)
+            return rc;
+
+        if (m.kind == FF_RANGE_PUBLIC_PAYLOAD) {
+            const fauxfat_file *f = &v->config->files[m.object_index];
             uint64_t requested    = (uint64_t)(block_count - i) * FAUXFAT_BLOCK_SIZE;
-            uint64_t available    = f->size - mapping.file_offset;
+            uint64_t available    = f->size - m.object_offset;
             size_t length         = (size_t)(requested < available ? requested : available);
             size_t blocks         = (length + FAUXFAT_BLOCK_SIZE - 1u) / FAUXFAT_BLOCK_SIZE;
             size_t rendered       = blocks * FAUXFAT_BLOCK_SIZE;
 
-            rc = v->config->read(v->config->io_context, mapping.fd,
-                                 mapping.file_offset,
+            rc = v->config->read(v->config->io_context, f->fd,
+                                 m.object_offset,
                                  out + i * FAUXFAT_BLOCK_SIZE,
                                  length);
             if (rc != 0)
@@ -1403,11 +1479,25 @@ int fauxfat_read_blocks(const fauxfat_view *v,
             continue;
         }
 
-        if (rc != FAUXFAT_EUNMAPPED)
-            return rc;
+        if (m.kind == FF_RANGE_OPAQUE_PRESERVE) {
+            const fauxfat_opaque_file *f = &v->config->opaque_files[m.object_index];
+            uint64_t requested           = (uint64_t)(block_count - i) * FAUXFAT_BLOCK_SIZE;
+            uint64_t available           = f->size - m.object_offset;
+            size_t length                = (size_t)(requested < available ? requested : available);
+            size_t blocks                = length / FAUXFAT_BLOCK_SIZE;
 
-        rc = fauxfat_read_block(v, first_block + i,
-                                out + i * FAUXFAT_BLOCK_SIZE);
+            rc = v->config->read(v->config->io_context, f->fd,
+                                 m.object_offset,
+                                 out + i * FAUXFAT_BLOCK_SIZE,
+                                 length);
+            if (rc != 0)
+                return rc;
+            i += blocks;
+            continue;
+        }
+
+        rc = ff_render_classified_block(v, &m,
+                                        out + i * FAUXFAT_BLOCK_SIZE);
         if (rc != FAUXFAT_OK)
             return rc;
         ++i;
@@ -1490,6 +1580,155 @@ int fauxfat_write_blocks(const fauxfat_view *v,
         if (rc != 0)
             return rc;
         i += blocks;
+    }
+
+    return FAUXFAT_OK;
+}
+
+static int ff_device_skip(const fauxfat_device *device,
+                          uint64_t first_block,
+                          uint64_t block_count,
+                          fauxfat_skip_kind kind)
+{
+    if (block_count == 0u || !device->skip)
+        return FAUXFAT_OK;
+    return device->skip(device->context, first_block, block_count, kind);
+}
+
+int fauxfat_format(const fauxfat_view *v,
+                   const fauxfat_device *device,
+                   fauxfat_preserve_fn preserve,
+                   void *preserve_context,
+                   unsigned flags)
+{
+    uint8_t block_data[FAUXFAT_BLOCK_SIZE];
+    uint64_t block = 0u;
+
+    if (!v || !v->config || !device || !device->write || !device->zero)
+        return FAUXFAT_EINVAL;
+    if (flags & ~FAUXFAT_FORMAT_ZERO_UNDEFINED)
+        return FAUXFAT_EINVAL;
+
+    while (block < v->volume_blocks) {
+        ff_block_mapping m;
+        int rc = ff_classify_block(v, block, &m);
+
+        if (rc != FAUXFAT_OK)
+            return rc;
+
+        if (m.kind == FF_RANGE_GENERATED) {
+            rc = ff_render_classified_block(v, &m, block_data);
+            if (rc != FAUXFAT_OK)
+                return rc;
+            rc = device->write(device->context, block, 1u, block_data);
+            if (rc != 0)
+                return rc;
+            ++block;
+            continue;
+        }
+
+        if (m.kind == FF_RANGE_REQUIRED_ZERO) {
+            rc = device->zero(device->context, block, 1u);
+            if (rc != 0)
+                return rc;
+            ++block;
+            continue;
+        }
+
+        if (m.kind == FF_RANGE_PUBLIC_PAYLOAD) {
+            fauxfat_disk_file d;
+            uint64_t data_blocks;
+            uint64_t slack_blocks;
+            int keep = 0;
+
+            if (m.object_offset != 0u)
+                return FAUXFAT_EGEOMETRY;
+            rc = fauxfat_describe_disk_file(v, m.object_index, &d);
+            if (rc != FAUXFAT_OK)
+                return rc;
+            if (d.first_block != block || d.kind != FAUXFAT_DISK_FILE_PUBLIC)
+                return FAUXFAT_EGEOMETRY;
+
+            if (preserve) {
+                keep = preserve(preserve_context, &d);
+                if (keep < 0)
+                    return keep;
+            }
+
+            if (keep > 0) {
+                rc = ff_device_skip(device, block, d.allocation_blocks,
+                                    FAUXFAT_SKIP_PRESERVE);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+                block += d.allocation_blocks;
+                continue;
+            }
+
+            data_blocks = (d.data_length + FAUXFAT_BLOCK_SIZE - 1u) /
+                          FAUXFAT_BLOCK_SIZE;
+            if (data_blocks > d.allocation_blocks)
+                return FAUXFAT_EGEOMETRY;
+            rc = device->zero(device->context, block, data_blocks);
+            if (rc != 0)
+                return rc;
+            block += data_blocks;
+
+            slack_blocks = d.allocation_blocks - data_blocks;
+            if (slack_blocks != 0u) {
+                if (flags & FAUXFAT_FORMAT_ZERO_UNDEFINED)
+                    rc = device->zero(device->context, block, slack_blocks);
+                else
+                    rc = ff_device_skip(device, block, slack_blocks,
+                                        FAUXFAT_SKIP_UNDEFINED);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+                block += slack_blocks;
+            }
+            continue;
+        }
+
+        if (m.kind == FF_RANGE_OPAQUE_PRESERVE) {
+            fauxfat_disk_file d;
+            size_t disk_index = v->config->file_count + m.object_index;
+
+            if (m.object_offset != 0u)
+                return FAUXFAT_EGEOMETRY;
+            rc = fauxfat_describe_disk_file(v, disk_index, &d);
+            if (rc != FAUXFAT_OK)
+                return rc;
+            if (d.first_block != block || d.kind != FAUXFAT_DISK_FILE_OPAQUE)
+                return FAUXFAT_EGEOMETRY;
+            rc = ff_device_skip(device, block, d.allocation_blocks,
+                                FAUXFAT_SKIP_PRESERVE);
+            if (rc != FAUXFAT_OK)
+                return rc;
+            block += d.allocation_blocks;
+            continue;
+        }
+
+        if (m.kind == FF_RANGE_UNDEFINED) {
+            uint64_t first = block;
+
+            do {
+                ++block;
+                if (block >= v->volume_blocks)
+                    break;
+                rc = ff_classify_block(v, block, &m);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+            } while (m.kind == FF_RANGE_UNDEFINED);
+
+            if (flags & FAUXFAT_FORMAT_ZERO_UNDEFINED)
+                rc = device->zero(device->context, first, block - first);
+            else
+                rc = ff_device_skip(device, first, block - first,
+                                    FAUXFAT_SKIP_UNDEFINED);
+            if (rc != FAUXFAT_OK)
+                return rc;
+            continue;
+        }
+
+        return FAUXFAT_EGEOMETRY;
     }
 
     return FAUXFAT_OK;
