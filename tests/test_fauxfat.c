@@ -29,6 +29,30 @@ static uint32_t ror32(uint32_t v)
     return (v >> 1) | (v << 31);
 }
 
+static void store16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static uint16_t ror16(uint16_t v)
+{
+    return (uint16_t)((v >> 1) | (v << 15));
+}
+
+static uint16_t entry_set_checksum(const uint8_t *p, size_t bytes)
+{
+    uint16_t sum = 0u;
+    size_t i;
+
+    for (i = 0; i < bytes; ++i) {
+        if (i == 2u || i == 3u)
+            continue;
+        sum = (uint16_t)(ror16(sum) + p[i]);
+    }
+    return sum;
+}
+
 static uint32_t boot_checksum(const fauxfat_view *v)
 {
     uint8_t b[512];
@@ -149,6 +173,27 @@ typedef struct test_device {
     uint64_t preserve_blocks;
 } test_device;
 
+static int view_dev_read(void *context, uint64_t first_block,
+                         size_t block_count, void *data)
+{
+    return fauxfat_read_blocks((const fauxfat_view *)context, first_block,
+                               block_count, (uint8_t *)data);
+}
+
+static int dev_read(void *context, uint64_t first_block,
+                    size_t block_count, void *data)
+{
+    test_device *d = (test_device *)context;
+    uint64_t bytes = (uint64_t)block_count * FAUXFAT_BLOCK_SIZE;
+
+    assert(first_block <= d->blocks);
+    assert((uint64_t)block_count <= d->blocks - first_block);
+    assert(bytes <= SIZE_MAX);
+    memcpy(data, d->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE),
+           (size_t)bytes);
+    return 0;
+}
+
 static int dev_write(void *context, uint64_t first_block,
                      size_t block_count, const void *data)
 {
@@ -201,6 +246,25 @@ typedef struct preserve_test {
     unsigned calls;
     fauxfat_disk_file last;
 } preserve_test;
+
+typedef struct emit_test {
+    fauxfat_disk_file file[8];
+    size_t count;
+    int fail_code;
+} emit_test;
+
+static int collect_file(void *context, unsigned index,
+                        const fauxfat_disk_file *file)
+{
+    emit_test *e = (emit_test *)context;
+
+    assert(index == e->count);
+    assert(index < sizeof(e->file) / sizeof(e->file[0]));
+    if (e->fail_code != 0)
+        return e->fail_code;
+    e->file[e->count++] = *file;
+    return 0;
+}
 
 static int preserve_named(void *context, const fauxfat_disk_file *wanted)
 {
@@ -765,6 +829,7 @@ int main(void)
         memset(media.data, 0xa9, (size_t)bytes);
 
         memset(&dev, 0, sizeof(dev));
+        dev.read    = dev_read;
         dev.write   = dev_write;
         dev.zero    = dev_zero;
         dev.skip    = dev_skip;
@@ -838,6 +903,74 @@ int main(void)
         assert(media.preserve_skips == 2u); /* public + opaque */
         assert(media.preserve_blocks == pubd.allocation_blocks + opqd.allocation_blocks);
 
+        /* Strict root parsing reconstructs direct physical descriptors without
+         * retaining a file table or touching FAT chains. */
+        {
+            emit_test got;
+            size_t count        = 999u;
+            uint64_t root_block = fv.cluster_heap_block +
+                                  (uint64_t)(fv.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+            uint8_t *root = media.data + root_block * FAUXFAT_BLOCK_SIZE;
+            uint8_t saved_public[96];
+
+            memset(&got, 0, sizeof(got));
+            assert(fauxfat_parse_root_strict(&fv, &dev, collect_file, &got,
+                                             &count) == FAUXFAT_OK);
+            assert(count == 2u && got.count == 2u);
+            assert(got.file[0].kind == FAUXFAT_DISK_FILE_PUBLIC);
+            assert(strcmp(got.file[0].name, "SHORT.BIN") == 0);
+            assert(got.file[0].first_block == pubd.first_block);
+            assert(got.file[0].data_length == pubd.data_length);
+            assert(got.file[0].allocation_blocks == pubd.allocation_blocks);
+            assert(got.file[0].mtime == short_file.mtime);
+            assert(got.file[1].kind == FAUXFAT_DISK_FILE_OPAQUE);
+            assert(strcmp(got.file[1].name, "SECRET.BIN") == 0);
+            assert(got.file[1].first_block == opqd.first_block);
+            assert(got.file[1].allocation_blocks == opqd.allocation_blocks);
+
+            /* The parser callback is a streaming sink, so caller errors pass through. */
+            memset(&got, 0, sizeof(got));
+            got.fail_code = -77;
+            assert(fauxfat_parse_root_strict(&fv, &dev, collect_file, &got,
+                                             NULL) == -77);
+
+            /* Archive plus modify/access time changes are host-volatile, but the
+             * entry-set checksum must still describe the bytes actually on disk. */
+            memcpy(saved_public, root + 4u * 32u, sizeof(saved_public));
+            store16(root + 4u * 32u + 4u, 0x0020u);
+            root[4u * 32u + 12u] ^= 0x01u;
+            root[4u * 32u + 21u] = 17u;
+            root[4u * 32u + 23u] = 0u;
+            root[4u * 32u + 24u] = 0x80u;
+            store16(root + 4u * 32u + 2u,
+                    entry_set_checksum(root + 4u * 32u, 96u));
+            memset(&got, 0, sizeof(got));
+            assert(fauxfat_parse_root_strict(&fv, &dev, collect_file, &got,
+                                             &count) == FAUXFAT_OK);
+            assert(got.file[0].mtime == short_file.mtime);
+
+            /* A structural field is not made acceptable by recomputing the native
+             * exFAT checksum. Moving SHORT into SECRET's cluster overlaps the map. */
+            memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+            root[5u * 32u + 20u] = (uint8_t)(fv.data_first_cluster + 1u);
+            root[5u * 32u + 21u] = 0u;
+            root[5u * 32u + 22u] = 0u;
+            root[5u * 32u + 23u] = 0u;
+            store16(root + 4u * 32u + 2u,
+                    entry_set_checksum(root + 4u * 32u, 96u));
+            assert(fauxfat_parse_root_strict(&fv, &dev, NULL, NULL, NULL) ==
+                   FAUXFAT_ESTRUCTURE);
+
+            /* Malformed SetChecksum also fails immediately. */
+            memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+            root[4u * 32u + 2u] ^= 0x80u;
+            assert(fauxfat_parse_root_strict(&fv, &dev, NULL, NULL, NULL) ==
+                   FAUXFAT_ESTRUCTURE);
+
+            /* Leave the test image canonical for any later checks. */
+            memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+        }
+
         assert(fauxfat_format(&fv, &dev, NULL, NULL, 2u) == FAUXFAT_EINVAL);
         free(media.data);
     }
@@ -868,6 +1001,22 @@ int main(void)
         assert(b[256u] == 0xe1u); /* entry 8: Vendor Allocation */
         assert(b[274u] == 'N');
         assert(b[275u] == 'O');
+
+        {
+            fauxfat_device parse_dev;
+            emit_test got;
+            size_t count = 0u;
+
+            memset(&parse_dev, 0, sizeof(parse_dev));
+            parse_dev.read    = view_dev_read;
+            parse_dev.context = &ov;
+            memset(&got, 0, sizeof(got));
+            assert(fauxfat_parse_root_strict(&ov, &parse_dev, collect_file,
+                                             &got, &count) == FAUXFAT_OK);
+            assert(count == 1u && got.count == 1u);
+            assert(got.file[0].kind == FAUXFAT_DISK_FILE_OPAQUE);
+            assert(strcmp(got.file[0].name, "ABCDEFGHIJKLMNO") == 0);
+        }
     }
 
     /* exFAT cannot encode dates before 1980 or after 2107. */

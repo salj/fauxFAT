@@ -160,6 +160,15 @@ typedef struct fauxfat_disk_file {
 } fauxfat_disk_file;
 
 /*
+ * Bounded descriptor sink used by the on-disk parser. index is the canonical
+ * root order: public descriptors first, then fauxFAT opaque descriptors.
+ * Return zero to continue; any non-zero return value aborts and is propagated.
+ */
+typedef int (*fauxfat_file_emit_fn)(void *context,
+                                    unsigned index,
+                                    const fauxfat_disk_file *file);
+
+/*
  * Raw block-device side of sparse formatting and (later) validation.
  * Addresses are volume-relative 512-byte blocks, matching fauxfat_read_block.
  */
@@ -218,7 +227,9 @@ enum {
     FAUXFAT_ERANGE    = -2,
     FAUXFAT_EGEOMETRY = -3,
     /* The disk block is valid fauxFAT, but is not writable file payload. */
-    FAUXFAT_EUNMAPPED = -4
+    FAUXFAT_EUNMAPPED = -4,
+    /* On-disk bytes are malformed or violate the bounded fauxFAT profile. */
+    FAUXFAT_ESTRUCTURE = -5
 };
 
 /* No allocation. The config and file table must outlive the view. */
@@ -296,6 +307,28 @@ int fauxfat_format(const fauxfat_view *view,
                    fauxfat_preserve_fn preserve,
                    void *preserve_context,
                    unsigned flags);
+
+/*
+ * Parse and validate only the fixed one-cluster fauxFAT root directory using
+ * geometry already present in view. This is intentionally not whole-volume
+ * validation: boot/upcase/bitmap/FAT/OEM verification is layered on top in
+ * later passes.
+ *
+ * The parser accepts only the strict fauxFAT root grammar: four fixed system
+ * entries, canonical public three-entry sets, canonical fauxFAT opaque
+ * five-entry sets, then 0xA1 padding through the end of the cluster. The host
+ * may have changed Archive, last-modified/access timestamps and their UTC
+ * offsets, provided the resulting entry-set checksum is valid. Everything
+ * else is structural.
+ *
+ * No allocation is performed. At most one 512-byte root block and one
+ * five-entry set are buffered. descriptor_count may be NULL.
+ */
+int fauxfat_parse_root_strict(const fauxfat_view *view,
+                              const fauxfat_device *device,
+                              fauxfat_file_emit_fn emit,
+                              void *emit_context,
+                              size_t *descriptor_count);
 
 #ifdef __cplusplus
 }
