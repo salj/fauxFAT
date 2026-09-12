@@ -259,6 +259,11 @@ typedef struct emit_test {
     int fail_code;
 } emit_test;
 
+typedef struct recovered_preserve_test {
+    const emit_test *recovered;
+    unsigned calls;
+} recovered_preserve_test;
+
 static int collect_file(void *context, unsigned index,
                         const fauxfat_disk_file *file)
 {
@@ -279,6 +284,29 @@ static int preserve_named(void *context, const fauxfat_disk_file *wanted)
     ++p->calls;
     p->last = *wanted;
     return strcmp(wanted->name, p->name) == 0;
+}
+
+static int preserve_recovered(void *context, const fauxfat_disk_file *wanted)
+{
+    recovered_preserve_test *p = (recovered_preserve_test *)context;
+    size_t i;
+
+    ++p->calls;
+    for (i = 0u; i < p->recovered->count; ++i) {
+        const fauxfat_disk_file *have = &p->recovered->file[i];
+
+        if (have->kind != FAUXFAT_DISK_FILE_PUBLIC ||
+            wanted->kind != FAUXFAT_DISK_FILE_PUBLIC)
+            continue;
+        if (strcmp(have->name, wanted->name) != 0)
+            continue;
+        if (have->first_block != wanted->first_block ||
+            have->data_length != wanted->data_length ||
+            have->allocation_blocks != wanted->allocation_blocks)
+            continue;
+        return 1;
+    }
+    return 0;
 }
 
 int main(void)
@@ -1196,6 +1224,105 @@ int main(void)
 
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+        }
+
+        /*
+         * A changed-but-understood façade can be discarded and regenerated
+         * without sacrificing payload ranges recovered by the loose scan.
+         * This is the actual repair path rather than merely testing the
+         * formatter and parser in isolation.
+         */
+        {
+            emit_test recovered;
+            recovered_preserve_test rp;
+            fauxfat_volume_class vc;
+            size_t count        = 0u;
+            uint64_t root_block = fv.cluster_heap_block +
+                                  (uint64_t)(fv.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+            uint8_t *root      = media.data + root_block * FAUXFAT_BLOCK_SIZE;
+            uint8_t *pub       = media.data + pubd.first_block * FAUXFAT_BLOCK_SIZE;
+            uint8_t *opq       = media.data + opqd.first_block * FAUXFAT_BLOCK_SIZE;
+            uint8_t *undefined = media.data + 24u * FAUXFAT_BLOCK_SIZE;
+            uint64_t pub_bytes = pubd.allocation_blocks * FAUXFAT_BLOCK_SIZE;
+            uint64_t opq_bytes = opqd.allocation_blocks * FAUXFAT_BLOCK_SIZE;
+            unsigned j;
+
+            assert(pub_bytes <= SIZE_MAX && opq_bytes <= SIZE_MAX);
+            memset(pub, 0x42, (size_t)pub_bytes);
+            memset(opq, 0x99, (size_t)opq_bytes);
+            memset(undefined, 0x5a, FAUXFAT_BLOCK_SIZE);
+
+            /* Case-only host rename: native exFAT remains coherent, fauxFAT
+             * identity is recovered from the vendor original-name records. */
+            for (j = 0u; j < 9u; ++j) {
+                uint8_t *lo = root + 6u * 32u + 2u + 2u * j;
+                if (*lo >= 'A' && *lo <= 'Z')
+                    *lo = (uint8_t)(*lo - 'A' + 'a');
+            }
+            store16(root + 4u * 32u + 2u,
+                    entry_set_checksum(root + 4u * 32u, 160u));
+
+            memset(&recovered, 0, sizeof(recovered));
+            assert(fauxfat_scan_loose(&fv, &dev, collect_file, &recovered,
+                                      &count, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            assert(count == 2u && recovered.count == 2u);
+            assert(strcmp(recovered.file[0].name, "SHORT.BIN") == 0);
+            assert((recovered.file[0].flags &
+                    FAUXFAT_DISK_FILE_NAME_CHANGED) != 0u);
+            assert(recovered.file[0].first_block == pubd.first_block);
+            assert(recovered.file[1].kind == FAUXFAT_DISK_FILE_OPAQUE);
+            assert(recovered.file[1].first_block == opqd.first_block);
+
+            memset(&rp, 0, sizeof(rp));
+            rp.recovered = &recovered;
+            assert(fauxfat_format(&fv, &dev, preserve_recovered, &rp,
+                                  FAUXFAT_FORMAT_ZERO_UNDEFINED) ==
+                   FAUXFAT_OK);
+            assert(rp.calls == 1u);
+
+            /* Both understood public bytes and opaque/private bytes survive;
+             * unrelated undefined dirt does not acquire preservation merely
+             * because it happened to be present on the old volume. */
+            for (j = 0u; j < (unsigned)pub_bytes; ++j)
+                assert(pub[j] == 0x42u);
+            for (j = 0u; j < (unsigned)opq_bytes; ++j)
+                assert(opq[j] == 0x99u);
+            for (j = 0u; j < FAUXFAT_BLOCK_SIZE; ++j)
+                assert(undefined[j] == 0u);
+
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+            memset(&recovered, 0, sizeof(recovered));
+            assert(fauxfat_parse_root_strict(&fv, &dev, collect_file,
+                                             &recovered, &count) ==
+                   FAUXFAT_OK);
+            assert(strcmp(recovered.file[0].name, "SHORT.BIN") == 0);
+            assert(recovered.file[0].flags == 0u);
+
+            /* Merely having bytes in a public extent is not sufficient to
+             * preserve them. With no matching recovered descriptor, a repair
+             * performs the normal required-zero initialization. */
+            memset(pub, 0x7bu, (size_t)pub_bytes);
+            memset(&recovered, 0, sizeof(recovered));
+            memset(&rp, 0, sizeof(rp));
+            rp.recovered = &recovered;
+            assert(fauxfat_format(&fv, &dev, preserve_recovered, &rp, 0u) ==
+                   FAUXFAT_OK);
+            assert(rp.calls == 1u);
+            for (j = 0u;
+                 j < (unsigned)((pubd.data_length + FAUXFAT_BLOCK_SIZE - 1u) /
+                                FAUXFAT_BLOCK_SIZE * FAUXFAT_BLOCK_SIZE);
+                 ++j)
+                assert(pub[j] == 0u);
+            /* Allocation slack remains undefined under the normal format. */
+            for (j = (unsigned)(((pubd.data_length + FAUXFAT_BLOCK_SIZE - 1u) /
+                                 FAUXFAT_BLOCK_SIZE) *
+                                FAUXFAT_BLOCK_SIZE);
+                 j < (unsigned)pub_bytes; ++j)
+                assert(pub[j] == 0x7bu);
+            for (j = 0u; j < (unsigned)opq_bytes; ++j)
+                assert(opq[j] == 0x99u);
         }
 
         assert(fauxfat_format(&fv, &dev, NULL, NULL, 2u) == FAUXFAT_EINVAL);
