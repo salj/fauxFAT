@@ -148,8 +148,8 @@ int main(void)
         0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
     };
     fauxfat_file files[] = {
-        { "SOLVER.DB", 10, sizeof(solver) },
-        { "CONFIG.BIN", 11, sizeof(config_data) }
+        { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045 },
+        { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798 }
     };
 
     test_io io;
@@ -295,6 +295,14 @@ int main(void)
     assert(b[128] == 0x85u);
     assert(b[160] == 0xc0u);
     assert(b[192] == 0xc1u);
+    assert(load32(b + 128u + 8u) == 0x5a221882u);
+    assert(load32(b + 128u + 12u) == 0x5a221882u);
+    assert(load32(b + 128u + 16u) == 0x5a221882u);
+    assert(b[128u + 20u] == 100u);
+    assert(b[128u + 21u] == 100u);
+    assert(b[128u + 22u] == 0x80u);
+    assert(b[128u + 23u] == 0x80u);
+    assert(b[128u + 24u] == 0x80u);
     assert(b[161] == 0x03u);
     assert(b[163] == 9u);
     assert(load32(b + 160 + 20) == 5u);
@@ -400,7 +408,10 @@ int main(void)
 
     /* File names are ISO-8859-1 bytes rendered directly as UTF-16 code units. */
     {
-        fauxfat_file latin      = { "caf\xe9.bin", 11, sizeof(config_data) };
+        fauxfat_file latin = {
+            "caf\xe9.bin", 11, sizeof(config_data), (time_t)1735787045
+        };
+
         fauxfat_config latincfg = cfg;
         fauxfat_view latinview;
         uint64_t latin_root;
@@ -415,8 +426,8 @@ int main(void)
     }
     {
         fauxfat_file collision[] = {
-            { "caf\xe9.bin", 10, sizeof(solver) },
-            { "CAF\xc9.BIN", 11, sizeof(config_data) }
+            { "caf\xe9.bin", 10, sizeof(solver), (time_t)1735787045 },
+            { "CAF\xc9.BIN", 11, sizeof(config_data), (time_t)1735787045 }
         };
 
         fauxfat_config badcfg = cfg;
@@ -425,7 +436,10 @@ int main(void)
         assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
     }
     {
-        fauxfat_file bad      = { "BAD/NAME", 11, sizeof(config_data) };
+        fauxfat_file bad = {
+            "BAD/NAME", 11, sizeof(config_data), (time_t)1735787045
+        };
+
         fauxfat_config badcfg = cfg;
         badcfg.files          = &bad;
         badcfg.file_count     = 1;
@@ -441,7 +455,10 @@ int main(void)
     }
     {
         uint8_t short_data[1234];
-        fauxfat_file short_file  = { "SHORT.BIN", 12, sizeof(short_data) };
+        fauxfat_file short_file = {
+            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045
+        };
+
         fauxfat_config short_cfg = cfg;
         fauxfat_view short_view;
         uint64_t data_block;
@@ -498,6 +515,21 @@ int main(void)
             }
             assert(memcmp(before, short_data + 1024u, sizeof(before)) == 0);
         }
+    }
+
+    /* exFAT cannot encode dates before 1980 or after 2107. */
+    {
+        fauxfat_file bad_time = {
+            "BADTIME.BIN", 11, sizeof(config_data), (time_t)315532799
+        };
+
+        fauxfat_config badcfg = cfg;
+        badcfg.files          = &bad_time;
+        badcfg.file_count     = 1u;
+        assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
+
+        bad_time.mtime = (time_t)4354819200LL;
+        assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
     }
 
     puts("fauxfat tests: ok");

@@ -372,7 +372,11 @@ There is deliberately no UTF-8 decoder, Unicode normalization, surrogate handlin
 
 Visible writable files have no ReadOnly, Hidden, System, or Directory bits. Archive may be set or cleared by the host and is treated as volatile.
 
-Create time is structural for fauxFAT and is initialized by the formatter. Last-modified and last-access metadata are host-volatile.
+The formatter takes one code-facing `time_t mtime` per file, interpreted as UTC Unix epoch seconds. The supplied RP2040 arm-none-eabi newlib-nano defines `time_t` as 64-bit, so this covers the entire exFAT timestamp range without a separate date type. fauxFAT accepts `1980-01-01T00:00:00Z` through `2107-12-31T23:59:59Z` and rejects values outside that interval.
+
+At manufacture time create, last-modified, and last-access timestamps all receive this value. UTC offset bytes are `0x80`, meaning a valid zero-minute UTC offset. exFAT's packed timestamp stores seconds in two-second units; for create and modify timestamps fauxFAT writes `10msIncrement = 100` for an odd Unix second and `0` for an even second, preserving whole-second precision. Last-access has no 10ms field and therefore has the normal exFAT two-second granularity.
+
+Create time is structural for fauxFAT. Last-modified and last-access metadata are host-volatile.
 
 ### 10.2 Stream Extension, type `0xC0`
 

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,13 @@ typedef struct fauxfat_file {
     const char *name;
     int fd;
     uint64_t size;
+
+    /*
+     * UTC Unix epoch seconds, using the target libc's native time_t.
+     * fauxFAT encodes this as the exFAT create/modify/access timestamp.
+     * Valid range is 1980-01-01 through 2107-12-31 inclusive.
+     */
+    time_t mtime;
 } fauxfat_file;
 
 /*

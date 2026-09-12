@@ -20,6 +20,9 @@
 #define FF_ENTRY_STREAM 0xc0u
 #define FF_ENTRY_NAME   0xc1u
 
+#define FF_UNIX_1980 315532800LL
+#define FF_UNIX_2108 4354819200LL
+
 static const uint8_t ff_oem_map_guid[16] = {
     0xe7, 0xe6, 0x5b, 0x99, 0x45, 0x34, 0xdc, 0x46,
     0xa2, 0x13, 0x74, 0xd9, 0x85, 0xb3, 0x01, 0x34
@@ -63,6 +66,94 @@ static uint32_t ff_ror32(uint32_t v)
 static uint32_t ff_align_up_u32(uint32_t v, uint32_t align)
 {
     return (v + align - 1u) & ~(align - 1u);
+}
+
+/*
+ * Convert UTC Unix seconds to exFAT's packed local date/time representation.
+ * We deliberately do not call gmtime()/gmtime_r(): the on-disk view is always
+ * UTC (UTC offset byte 0x80), so libc timezone/locale machinery buys us
+ * nothing except code and state.
+ *
+ * exFAT stores seconds in two-second units.  The separate 10 ms increment is
+ * therefore 100 for an odd Unix second and 0 for an even one.
+ */
+static int ff_exfat_timestamp(time_t value,
+                              uint32_t *timestamp,
+                              uint8_t *ten_ms)
+{
+    int64_t seconds                     = (int64_t)value;
+    static const uint8_t month_days[12] = {
+        31u, 28u, 31u, 30u, 31u, 30u,
+        31u, 31u, 30u, 31u, 30u, 31u
+    };
+
+    uint32_t elapsed;
+    uint32_t days;
+    uint32_t sod;
+    uint32_t year;
+    uint32_t doy;
+    uint32_t month;
+    uint32_t day;
+    uint32_t hour;
+    uint32_t minute;
+    uint32_t second;
+    uint32_t i;
+
+    if (seconds < FF_UNIX_1980 || seconds >= FF_UNIX_2108)
+        return 0;
+
+    /* The entire representable exFAT interval from 1980 fits in uint32_t. */
+    elapsed = (uint32_t)(seconds - FF_UNIX_1980);
+    days    = elapsed / 86400u;
+    sod     = elapsed % 86400u;
+
+    /* 1980..2099 is thirty regular four-year cycles beginning on leap years. */
+    if (days < 43830u) {
+        uint32_t cycle = days / 1461u;
+        doy            = days % 1461u;
+        year           = 1980u + cycle * 4u;
+        if (doy >= 366u) {
+            doy -= 366u;
+            year += 1u + doy / 365u;
+            doy %= 365u;
+        }
+    } else {
+        /* Only 2100..2107 remain; walking at most eight years is cheaper. */
+        doy  = days - 43830u;
+        year = 2100u;
+        for (;;) {
+            uint32_t year_days = (year == 2104u) ? 366u : 365u;
+            if (doy < year_days)
+                break;
+            doy -= year_days;
+            ++year;
+        }
+    }
+
+    month = 1u;
+    for (i = 0; i < 12u; ++i) {
+        uint32_t n = month_days[i];
+        if (i == 1u && (year % 4u) == 0u && year != 2100u)
+            ++n;
+        if (doy < n)
+            break;
+        doy -= n;
+        ++month;
+    }
+    day = doy + 1u;
+
+    hour   = sod / 3600u;
+    minute = (sod % 3600u) / 60u;
+    second = sod % 60u;
+
+    *timestamp = ((year - 1980u) << 25) |
+                 (month << 21) |
+                 (day << 16) |
+                 (hour << 11) |
+                 (minute << 5) |
+                 (second >> 1);
+    *ten_ms = (uint8_t)((second & 1u) ? 100u : 0u);
+    return 1;
 }
 
 /*
@@ -569,16 +660,20 @@ static void ff_make_root_entry(const fauxfat_view *v,
             uint8_t *stream_ent = set + 32;
             uint8_t *name_ent   = set + 64;
             size_t i;
-            const uint32_t timestamp_1980 = 0x00210000u;
+            uint32_t timestamp;
+            uint8_t ten_ms;
 
             (void)ff_name_valid(f->name, &name_len);
+            (void)ff_exfat_timestamp(f->mtime, &timestamp, &ten_ms);
             memset(set, 0, sizeof(set));
 
             file_ent[0] = FF_ENTRY_FILE;
             file_ent[1] = 2u;
-            ff_store32(file_ent + 8, timestamp_1980);
-            ff_store32(file_ent + 12, timestamp_1980);
-            ff_store32(file_ent + 16, timestamp_1980);
+            ff_store32(file_ent + 8, timestamp);
+            ff_store32(file_ent + 12, timestamp);
+            ff_store32(file_ent + 16, timestamp);
+            file_ent[20] = ten_ms;
+            file_ent[21] = ten_ms;
             file_ent[22] = 0x80u;
             file_ent[23] = 0x80u;
             file_ent[24] = 0x80u;
@@ -847,7 +942,11 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
 
     for (i = 0; i < cfg->file_count; ++i) {
         const fauxfat_file *f = &cfg->files[i];
-        if (!ff_name_valid(f->name, &dummy) || f->size == 0u)
+        uint32_t ignored_timestamp;
+        uint8_t ignored_ten_ms;
+
+        if (!ff_name_valid(f->name, &dummy) || f->size == 0u ||
+            !ff_exfat_timestamp(f->mtime, &ignored_timestamp, &ignored_ten_ms))
             return FAUXFAT_EINVAL;
         for (j = 0; j < i; ++j) {
             if (ff_name_equal_folded(f->name, cfg->files[j].name))
