@@ -75,6 +75,70 @@ static void fill_pattern(uint8_t *p, size_t n, uint8_t seed)
         p[i] = (uint8_t)(seed + (uint8_t)(i * 29u) + (uint8_t)(i >> 9));
 }
 
+typedef struct test_backing {
+    int fd;
+    uint8_t *data;
+    size_t size;
+} test_backing;
+
+typedef struct test_io {
+    test_backing backing[8];
+    size_t backing_count;
+    unsigned read_calls;
+    unsigned write_calls;
+    int last_fd;
+    uint64_t last_offset;
+    size_t last_length;
+    int fail_read_fd;
+    int fail_write_fd;
+} test_io;
+
+static test_backing *find_backing(test_io *io, int fd)
+{
+    size_t i;
+    for (i = 0; i < io->backing_count; ++i) {
+        if (io->backing[i].fd == fd)
+            return &io->backing[i];
+    }
+    return NULL;
+}
+
+static int test_read(void *context, int fd, uint64_t offset,
+                     void *data, size_t length)
+{
+    test_io *io     = (test_io *)context;
+    test_backing *b = find_backing(io, fd);
+
+    ++io->read_calls;
+    io->last_fd     = fd;
+    io->last_offset = offset;
+    io->last_length = length;
+    if (fd == io->fail_read_fd)
+        return -101;
+    if (!b || offset > b->size || length > b->size - (size_t)offset)
+        return -103;
+    memcpy(data, b->data + (size_t)offset, length);
+    return 0;
+}
+
+static int test_write(void *context, int fd, uint64_t offset,
+                      const void *data, size_t length)
+{
+    test_io *io     = (test_io *)context;
+    test_backing *b = find_backing(io, fd);
+
+    ++io->write_calls;
+    io->last_fd     = fd;
+    io->last_offset = offset;
+    io->last_length = length;
+    if (fd == io->fail_write_fd)
+        return -102;
+    if (!b || offset > b->size || length > b->size - (size_t)offset)
+        return -104;
+    memcpy(b->data + (size_t)offset, data, length);
+    return 0;
+}
+
 int main(void)
 {
     static uint8_t solver[2u * FAUXFAT_CLUSTER_SIZE];
@@ -84,10 +148,11 @@ int main(void)
         0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
     };
     fauxfat_file files[] = {
-        { "SOLVER.DB", solver, sizeof(solver) },
-        { "CONFIG.BIN", config_data, sizeof(config_data) }
+        { "SOLVER.DB", 10, sizeof(solver) },
+        { "CONFIG.BIN", 11, sizeof(config_data) }
     };
 
+    test_io io;
     fauxfat_config cfg;
     fauxfat_view view;
     uint8_t b[512];
@@ -99,9 +164,23 @@ int main(void)
     fill_pattern(solver, sizeof(solver), 0x31u);
     fill_pattern(config_data, sizeof(config_data), 0xa7u);
 
+    memset(&io, 0, sizeof(io));
+    io.backing[0].fd   = 10;
+    io.backing[0].data = solver;
+    io.backing[0].size = sizeof(solver);
+    io.backing[1].fd   = 11;
+    io.backing[1].data = config_data;
+    io.backing[1].size = sizeof(config_data);
+    io.backing_count   = 2u;
+    io.fail_read_fd    = -1;
+    io.fail_write_fd   = -1;
+
     memset(&cfg, 0, sizeof(cfg));
     cfg.files            = files;
     cfg.file_count       = sizeof(files) / sizeof(files[0]);
+    cfg.read             = test_read;
+    cfg.write            = test_write;
+    cfg.io_context       = &io;
     cfg.partition_lba    = 2048u;
     cfg.volume_serial    = 0x13579bdfu;
     cfg.structural_epoch = 0x1122334455667788ull;
@@ -238,8 +317,13 @@ int main(void)
     assert(memcmp(b, solver, sizeof(b)) == 0);
     {
         uint8_t pair[1024];
+        unsigned reads_before = io.read_calls;
         assert(fauxfat_read_blocks(&view, solver_block, 2u, pair) == FAUXFAT_OK);
         assert(memcmp(pair, solver, sizeof(pair)) == 0);
+        assert(io.read_calls == reads_before + 1u);
+        assert(io.last_fd == 10);
+        assert(io.last_offset == 0u);
+        assert(io.last_length == sizeof(pair));
     }
     assert(fauxfat_read_block(&view, solver_block + 128u, b) == FAUXFAT_OK);
     assert(memcmp(b, solver + FAUXFAT_CLUSTER_SIZE, sizeof(b)) == 0);
@@ -254,8 +338,8 @@ int main(void)
         memset(in, 0x5au, sizeof(in));
         assert(fauxfat_translate_write(&view, solver_block + 17u, &m) == FAUXFAT_OK);
         assert(m.file_index == 0u);
+        assert(m.fd == 10);
         assert(m.file_offset == 17u * 512u);
-        assert(m.data == solver + 17u * 512u);
         assert(m.length == 512u);
 
         assert(fauxfat_write_block(&view, solver_block + 17u, in) == FAUXFAT_OK);
@@ -273,6 +357,7 @@ int main(void)
         uint8_t in[1024];
         uint64_t last_solver_block = solver_block +
                                      (sizeof(solver) / FAUXFAT_BLOCK_SIZE) - 1u;
+        unsigned writes_before = io.write_calls;
 
         memset(in, 0x61u, 512u);
         memset(in + 512u, 0x7cu, 512u);
@@ -280,13 +365,42 @@ int main(void)
         assert(fauxfat_write_blocks(&view, last_solver_block, 2u, in) == FAUXFAT_OK);
         assert(memcmp(solver + sizeof(solver) - 512u, in, 512u) == 0);
         assert(memcmp(config_data, in + 512u, 512u) == 0);
+        assert(io.write_calls == writes_before + 2u);
     }
+
+    /* Multi-block accesses within one file collapse to one backend range. */
+    {
+        uint8_t in[1024];
+        uint8_t out[1024];
+        unsigned writes_before = io.write_calls;
+        unsigned reads_before;
+
+        memset(in, 0x93u, sizeof(in));
+        assert(fauxfat_write_blocks(&view, solver_block + 8u, 2u, in) == FAUXFAT_OK);
+        assert(io.write_calls == writes_before + 1u);
+        assert(io.last_fd == 10);
+        assert(io.last_offset == 8u * 512u);
+        assert(io.last_length == sizeof(in));
+
+        reads_before = io.read_calls;
+        assert(fauxfat_read_blocks(&view, solver_block + 8u, 2u, out) == FAUXFAT_OK);
+        assert(io.read_calls == reads_before + 1u);
+        assert(memcmp(out, in, sizeof(out)) == 0);
+    }
+
+    /* Backend errors are returned unchanged. */
+    io.fail_read_fd = 10;
+    assert(fauxfat_read_block(&view, solver_block, b) == -101);
+    io.fail_read_fd  = -1;
+    io.fail_write_fd = 10;
+    assert(fauxfat_write_block(&view, solver_block, b) == -102);
+    io.fail_write_fd = -1;
 
     assert(fauxfat_read_block(&view, view.volume_blocks, b) == FAUXFAT_ERANGE);
 
     /* File names are ISO-8859-1 bytes rendered directly as UTF-16 code units. */
     {
-        fauxfat_file latin      = { "caf\xe9.bin", config_data, sizeof(config_data) };
+        fauxfat_file latin      = { "caf\xe9.bin", 11, sizeof(config_data) };
         fauxfat_config latincfg = cfg;
         fauxfat_view latinview;
         uint64_t latin_root;
@@ -301,8 +415,8 @@ int main(void)
     }
     {
         fauxfat_file collision[] = {
-            { "caf\xe9.bin", solver, sizeof(solver) },
-            { "CAF\xc9.BIN", config_data, sizeof(config_data) }
+            { "caf\xe9.bin", 10, sizeof(solver) },
+            { "CAF\xc9.BIN", 11, sizeof(config_data) }
         };
 
         fauxfat_config badcfg = cfg;
@@ -311,20 +425,32 @@ int main(void)
         assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
     }
     {
-        fauxfat_file bad      = { "BAD/NAME", config_data, sizeof(config_data) };
+        fauxfat_file bad      = { "BAD/NAME", 11, sizeof(config_data) };
         fauxfat_config badcfg = cfg;
         badcfg.files          = &bad;
         badcfg.file_count     = 1;
         assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
     }
     {
+        fauxfat_config badcfg = cfg;
+        badcfg.read           = NULL;
+        assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
+        badcfg       = cfg;
+        badcfg.write = NULL;
+        assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
+    }
+    {
         uint8_t short_data[1234];
-        fauxfat_file short_file  = { "SHORT.BIN", short_data, sizeof(short_data) };
+        fauxfat_file short_file  = { "SHORT.BIN", 12, sizeof(short_data) };
         fauxfat_config short_cfg = cfg;
         fauxfat_view short_view;
         uint64_t data_block;
 
         fill_pattern(short_data, sizeof(short_data), 0x42u);
+        io.backing[2].fd     = 12;
+        io.backing[2].data   = short_data;
+        io.backing[2].size   = sizeof(short_data);
+        io.backing_count     = 3u;
         short_cfg.files      = &short_file;
         short_cfg.file_count = 1;
         assert(fauxfat_init(&short_view, &short_cfg) == FAUXFAT_OK);
@@ -347,8 +473,8 @@ int main(void)
             memset(in, 0xa5u, sizeof(in));
             assert(fauxfat_translate_write(&short_view, data_block + 2u, &m) == FAUXFAT_OK);
             assert(m.file_index == 0u);
+            assert(m.fd == 12);
             assert(m.file_offset == 1024u);
-            assert(m.data == short_data + 1024u);
             assert(m.length == 210u);
             assert(fauxfat_write_block(&short_view, data_block + 2u, in) == FAUXFAT_OK);
             for (i = 1024u; i < sizeof(short_data); ++i)

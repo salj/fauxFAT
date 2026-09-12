@@ -14,22 +14,44 @@ extern "C" {
 #define FAUXFAT_MAX_FILES          681u
 #define FAUXFAT_NAME_MAX           15u
 
-/*
- * One host-visible file. v1 deliberately requires the backing range to be a
- * contiguous writable memory range. The disk extent is ceil(size / 64 KiB)
- * clusters; bytes in the final cluster beyond EOF are rendered as zero.
- */
+/* One host-visible file. File data itself is owned by the callback backend. */
 typedef struct fauxfat_file {
     /* 1..15 ISO-8859-1 bytes, excluding exFAT-forbidden characters. */
     const char *name;
-    uint8_t *data;
+    int fd;
     uint64_t size;
 } fauxfat_file;
+
+/*
+ * File payload I/O. offset and length are always bounded by the corresponding
+ * fauxfat_file.size. A callback receives the descriptor from fauxfat_file.fd.
+ *
+ * Return 0 on success. Any non-zero callback return value is propagated by
+ * fauxfat_read_* / fauxfat_write_* unchanged. Callbacks should therefore use
+ * their own negative error range if the caller needs to distinguish backend
+ * failures from FAUXFAT_E* errors.
+ */
+typedef int (*fauxfat_read_fn)(void *context,
+                               int fd,
+                               uint64_t offset,
+                               void *data,
+                               size_t length);
+
+typedef int (*fauxfat_write_fn)(void *context,
+                                int fd,
+                                uint64_t offset,
+                                const void *data,
+                                size_t length);
 
 typedef struct fauxfat_config {
     /* Files are packed contiguously in this exact array order. */
     const fauxfat_file *files;
     size_t file_count;
+
+    /* Payload storage backend. Required when file_count != 0. */
+    fauxfat_read_fn read;
+    fauxfat_write_fn write;
+    void *io_context;
 
     /* Media LBA of this exFAT partition, written to PartitionOffset. */
     uint64_t partition_lba;
@@ -66,15 +88,15 @@ typedef struct fauxfat_view {
 } fauxfat_view;
 
 /*
- * Translation of one volume-relative disk block into caller-owned file data.
+ * Translation of one volume-relative disk block into a file access range.
  * length is in 1..512. It can be shorter than a disk block only for the final
  * sector of a file whose DataLength is not sector aligned. Bytes after length
- * are outside the file and must not be written to the backing range.
+ * are outside the file and must not be passed to the backend.
  */
 typedef struct fauxfat_write_mapping {
     size_t file_index;
+    int fd;
     uint64_t file_offset;
-    uint8_t *data;
     size_t length;
 } fauxfat_write_mapping;
 
@@ -87,7 +109,7 @@ enum {
     FAUXFAT_EUNMAPPED = -4
 };
 
-/* No allocation. The config and file backing ranges must outlive the view. */
+/* No allocation. The config and file table must outlive the view. */
 int fauxfat_init(fauxfat_view *view, const fauxfat_config *config);
 
 /* Number of 512-byte blocks in the manufactured exFAT volume. */
@@ -96,8 +118,8 @@ uint64_t fauxfat_block_count(const fauxfat_view *view);
 /*
  * Render one volume-relative 512-byte block. partition_lba is metadata only;
  * callers presenting a whole disk subtract the partition start before calling.
- * The function is deterministic:
- * the same initialized view and backing bytes always produce the same block.
+ * File payload sectors are fetched through config.read(). Metadata sectors are
+ * synthesized internally and never touch the backend.
  */
 int fauxfat_read_block(const fauxfat_view *view,
                        uint64_t block_address,
@@ -110,26 +132,29 @@ int fauxfat_read_blocks(const fauxfat_view *view,
                         uint8_t *out);
 
 /*
- * Translate one volume-relative block write into a bounded write to a public
- * file backing range. Metadata blocks and cluster slack beyond a file's
- * DataLength return FAUXFAT_EUNMAPPED. No backing data is modified.
+ * Translate one volume-relative block write into a bounded public-file range.
+ * Metadata blocks and cluster slack beyond a file's DataLength return
+ * FAUXFAT_EUNMAPPED. No backend callback is made.
  */
 int fauxfat_translate_write(const fauxfat_view *view,
                             uint64_t block_address,
                             fauxfat_write_mapping *mapping);
 
 /*
- * Apply one translated block write. For a partial final sector only the bytes
- * inside DataLength are copied; the sector tail remains synthetic zero data.
+ * Apply one translated block write through config.write(). For a partial final
+ * sector only the bytes inside DataLength are passed to the backend; the
+ * sector tail remains synthetic zero data.
  */
 int fauxfat_write_block(const fauxfat_view *view,
                         uint64_t block_address,
                         const uint8_t in[FAUXFAT_BLOCK_SIZE]);
 
 /*
- * Apply adjacent block writes. The complete range is preflighted before any
- * backing bytes are changed, so an unmapped block cannot cause a partial
- * in-memory update. This is validation atomicity, not durable transactionality.
+ * Apply adjacent block writes. The complete disk mapping is preflighted before
+ * the first callback, so an unmapped block causes no backend I/O. Adjacent
+ * blocks within one file are coalesced into one callback range. A backend
+ * failure after an earlier callback can of course leave earlier writes applied;
+ * this is mapping-validation atomicity, not durable transactionality.
  */
 int fauxfat_write_blocks(const fauxfat_view *view,
                          uint64_t first_block,

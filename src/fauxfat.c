@@ -652,13 +652,15 @@ static int ff_read_file_block(const fauxfat_view *v,
 
     if (rc != FAUXFAT_OK)
         return rc;
-    if (file_offset > (uint64_t)SIZE_MAX)
-        return FAUXFAT_EGEOMETRY;
 
     memset(out, 0, 512);
-    if (length)
-        memcpy(out, v->config->files[file_index].data + (size_t)file_offset,
-               length);
+    if (length) {
+        const fauxfat_file *f = &v->config->files[file_index];
+        rc                    = v->config->read(v->config->io_context, f->fd,
+                                                file_offset, out, length);
+        if (rc != 0)
+            return rc;
+    }
     return FAUXFAT_OK;
 }
 
@@ -698,6 +700,44 @@ static int ff_locate_file_block(const fauxfat_view *v,
     }
 
     return FAUXFAT_EGEOMETRY;
+}
+
+static int ff_translate_data_block(const fauxfat_view *v,
+                                   uint64_t block_address,
+                                   fauxfat_write_mapping *mapping)
+{
+    uint64_t heap_rel;
+    uint32_t cluster;
+    uint32_t block_in_cluster;
+    size_t file_index;
+    uint64_t file_offset;
+    size_t length;
+    int rc;
+
+    if (block_address >= v->volume_blocks)
+        return FAUXFAT_ERANGE;
+    if (block_address < v->cluster_heap_block)
+        return FAUXFAT_EUNMAPPED;
+
+    heap_rel         = block_address - v->cluster_heap_block;
+    cluster          = 2u + (uint32_t)(heap_rel / FAUXFAT_BLOCKS_PER_CLUSTER);
+    block_in_cluster = (uint32_t)(heap_rel % FAUXFAT_BLOCKS_PER_CLUSTER);
+
+    if (cluster < v->data_first_cluster)
+        return FAUXFAT_EUNMAPPED;
+
+    rc = ff_locate_file_block(v, cluster, block_in_cluster,
+                              &file_index, &file_offset, &length);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    if (length == 0u)
+        return FAUXFAT_EUNMAPPED;
+
+    mapping->file_index  = file_index;
+    mapping->fd          = v->config->files[file_index].fd;
+    mapping->file_offset = file_offset;
+    mapping->length      = length;
+    return FAUXFAT_OK;
 }
 
 static void ff_compute_component_hashes(fauxfat_view *v)
@@ -797,7 +837,7 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
     size_t i, j;
     size_t dummy;
 
-    if (!v || !cfg || (cfg->file_count && !cfg->files) ||
+    if (!v || !cfg || (cfg->file_count && (!cfg->files || !cfg->read || !cfg->write)) ||
         cfg->file_count > FAUXFAT_MAX_FILES || ff_guid_is_zero(cfg->volume_guid) ||
         !ff_label_valid(cfg->volume_label, &dummy))
         return FAUXFAT_EINVAL;
@@ -807,8 +847,7 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
 
     for (i = 0; i < cfg->file_count; ++i) {
         const fauxfat_file *f = &cfg->files[i];
-        if (!f->data || !ff_name_valid(f->name, &dummy) || f->size == 0u ||
-            f->size > (uint64_t)SIZE_MAX)
+        if (!ff_name_valid(f->name, &dummy) || f->size == 0u)
             return FAUXFAT_EINVAL;
         for (j = 0; j < i; ++j) {
             if (ff_name_equal_folded(f->name, cfg->files[j].name))
@@ -947,11 +986,39 @@ int fauxfat_read_blocks(const fauxfat_view *v,
         first_block + (uint64_t)block_count > v->volume_blocks)
         return FAUXFAT_ERANGE;
 
-    for (i = 0; i < block_count; ++i) {
-        int rc = fauxfat_read_block(v, first_block + i,
-                                    out + i * FAUXFAT_BLOCK_SIZE);
+    for (i = 0; i < block_count;) {
+        fauxfat_write_mapping mapping;
+        int rc = ff_translate_data_block(v, first_block + i, &mapping);
+
+        if (rc == FAUXFAT_OK) {
+            const fauxfat_file *f = &v->config->files[mapping.file_index];
+            uint64_t requested    = (uint64_t)(block_count - i) * FAUXFAT_BLOCK_SIZE;
+            uint64_t available    = f->size - mapping.file_offset;
+            size_t length         = (size_t)(requested < available ? requested : available);
+            size_t blocks         = (length + FAUXFAT_BLOCK_SIZE - 1u) / FAUXFAT_BLOCK_SIZE;
+            size_t rendered       = blocks * FAUXFAT_BLOCK_SIZE;
+
+            rc = v->config->read(v->config->io_context, mapping.fd,
+                                 mapping.file_offset,
+                                 out + i * FAUXFAT_BLOCK_SIZE,
+                                 length);
+            if (rc != 0)
+                return rc;
+            if (rendered > length)
+                memset(out + i * FAUXFAT_BLOCK_SIZE + length, 0,
+                       rendered - length);
+            i += blocks;
+            continue;
+        }
+
+        if (rc != FAUXFAT_EUNMAPPED)
+            return rc;
+
+        rc = fauxfat_read_block(v, first_block + i,
+                                out + i * FAUXFAT_BLOCK_SIZE);
         if (rc != FAUXFAT_OK)
             return rc;
+        ++i;
     }
     return FAUXFAT_OK;
 }
@@ -960,42 +1027,9 @@ int fauxfat_translate_write(const fauxfat_view *v,
                             uint64_t block_address,
                             fauxfat_write_mapping *mapping)
 {
-    uint64_t heap_rel;
-    uint32_t cluster;
-    uint32_t block_in_cluster;
-    size_t file_index;
-    uint64_t file_offset;
-    size_t length;
-    int rc;
-
     if (!v || !v->config || !mapping)
         return FAUXFAT_EINVAL;
-    if (block_address >= v->volume_blocks)
-        return FAUXFAT_ERANGE;
-    if (block_address < v->cluster_heap_block)
-        return FAUXFAT_EUNMAPPED;
-
-    heap_rel         = block_address - v->cluster_heap_block;
-    cluster          = 2u + (uint32_t)(heap_rel / FAUXFAT_BLOCKS_PER_CLUSTER);
-    block_in_cluster = (uint32_t)(heap_rel % FAUXFAT_BLOCKS_PER_CLUSTER);
-
-    if (cluster < v->data_first_cluster)
-        return FAUXFAT_EUNMAPPED;
-
-    rc = ff_locate_file_block(v, cluster, block_in_cluster,
-                              &file_index, &file_offset, &length);
-    if (rc != FAUXFAT_OK)
-        return rc;
-    if (length == 0u)
-        return FAUXFAT_EUNMAPPED;
-    if (file_offset > (uint64_t)SIZE_MAX)
-        return FAUXFAT_EGEOMETRY;
-
-    mapping->file_index  = file_index;
-    mapping->file_offset = file_offset;
-    mapping->data        = v->config->files[file_index].data + (size_t)file_offset;
-    mapping->length      = length;
-    return FAUXFAT_OK;
+    return ff_translate_data_block(v, block_address, mapping);
 }
 
 int fauxfat_write_block(const fauxfat_view *v,
@@ -1012,8 +1046,8 @@ int fauxfat_write_block(const fauxfat_view *v,
     if (rc != FAUXFAT_OK)
         return rc;
 
-    memmove(mapping.data, in, mapping.length);
-    return FAUXFAT_OK;
+    return v->config->write(v->config->io_context, mapping.fd,
+                            mapping.file_offset, in, mapping.length);
 }
 
 int fauxfat_write_blocks(const fauxfat_view *v,
@@ -1039,12 +1073,31 @@ int fauxfat_write_blocks(const fauxfat_view *v,
             return rc;
     }
 
-    for (i = 0; i < block_count; ++i) {
+    for (i = 0; i < block_count;) {
         fauxfat_write_mapping mapping;
+        const fauxfat_file *f;
+        uint64_t requested;
+        uint64_t available;
+        size_t length;
+        size_t blocks;
         int rc = fauxfat_translate_write(v, first_block + i, &mapping);
+
         if (rc != FAUXFAT_OK)
+            return rc; /* preflight above means this indicates internal drift */
+
+        f         = &v->config->files[mapping.file_index];
+        requested = (uint64_t)(block_count - i) * FAUXFAT_BLOCK_SIZE;
+        available = f->size - mapping.file_offset;
+        length    = (size_t)(requested < available ? requested : available);
+        blocks    = (length + FAUXFAT_BLOCK_SIZE - 1u) / FAUXFAT_BLOCK_SIZE;
+
+        rc = v->config->write(v->config->io_context, mapping.fd,
+                              mapping.file_offset,
+                              in + i * FAUXFAT_BLOCK_SIZE,
+                              length);
+        if (rc != 0)
             return rc;
-        memmove(mapping.data, in + i * FAUXFAT_BLOCK_SIZE, mapping.length);
+        i += blocks;
     }
 
     return FAUXFAT_OK;
