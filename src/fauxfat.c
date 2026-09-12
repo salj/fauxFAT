@@ -2958,27 +2958,21 @@ static int ff_emit_loose_descriptor(fauxfat_file_emit_fn emit,
     return FAUXFAT_OK;
 }
 
-int fauxfat_scan_loose(const fauxfat_view *v,
-                       const fauxfat_device *device,
-                       fauxfat_file_emit_fn emit,
-                       void *emit_context,
-                       size_t *descriptor_count,
-                       fauxfat_volume_class *classification)
+static int ff_scan_loose_geometry(const fauxfat_view *v,
+                                  const fauxfat_device *device,
+                                  fauxfat_file_emit_fn emit,
+                                  void *emit_context,
+                                  size_t *descriptor_count)
 {
     ff_root_reader r;
-    fauxfat_volume_class strict_class;
     uint64_t root_first_block;
     uint64_t previous_end_cluster;
     uint32_t entry            = 0u;
     unsigned descriptor_index = 0u;
     int rc;
 
-    if (!v || !device || !device->read || !classification)
+    if (!v || !device || !device->read)
         return FAUXFAT_EINVAL;
-
-    rc = fauxfat_validate_strict(v, device, &strict_class);
-    if (rc != FAUXFAT_OK)
-        return rc;
 
     if (v->root_cluster < 2u || v->root_cluster > v->cluster_count + 1u)
         return FAUXFAT_EGEOMETRY;
@@ -3130,11 +3124,517 @@ int fauxfat_scan_loose(const fauxfat_view *v,
 
     if (descriptor_count)
         *descriptor_count = descriptor_index;
+    return FAUXFAT_OK;
+}
+
+int fauxfat_scan_loose(const fauxfat_view *v,
+                       const fauxfat_device *device,
+                       fauxfat_file_emit_fn emit,
+                       void *emit_context,
+                       size_t *descriptor_count,
+                       fauxfat_volume_class *classification)
+{
+    fauxfat_volume_class strict_class;
+    int rc;
+
+    if (!v || !device || !device->read || !classification)
+        return FAUXFAT_EINVAL;
+
+    rc = fauxfat_validate_strict(v, device, &strict_class);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    rc = ff_scan_loose_geometry(v, device, emit, emit_context,
+                                descriptor_count);
+    if (rc != FAUXFAT_OK)
+        return rc;
+
     if (strict_class == FAUXFAT_VOLUME_FAUXFAT_VALID)
         *classification = FAUXFAT_VOLUME_FAUXFAT_VALID;
     else if (strict_class == FAUXFAT_VOLUME_FAUXFAT_CHANGED)
         *classification = FAUXFAT_VOLUME_FAUXFAT_CHANGED;
     else
         *classification = FAUXFAT_VOLUME_EXFAT_BEST_EFFORT;
+    return FAUXFAT_OK;
+}
+
+typedef struct ff_reopen_layout_summary {
+    const fauxfat_view *view;
+    uint64_t next_cluster;
+    uint32_t opaque_first_cluster;
+    int seen_opaque;
+    int name_changed;
+} ff_reopen_layout_summary;
+
+static int ff_reopen_layout_emit(void *context, unsigned index,
+                                 const fauxfat_disk_file *file)
+{
+    ff_reopen_layout_summary *s = (ff_reopen_layout_summary *)context;
+    uint64_t heap               = s->view->cluster_heap_block;
+    uint64_t first_cluster;
+    uint64_t clusters;
+    uint64_t limit = (uint64_t)s->view->cluster_count + 2u;
+
+    (void)index;
+    if (file->first_block < heap ||
+        ((file->first_block - heap) % FAUXFAT_BLOCKS_PER_CLUSTER) != 0u ||
+        file->allocation_blocks == 0u ||
+        (file->allocation_blocks % FAUXFAT_BLOCKS_PER_CLUSTER) != 0u)
+        return FAUXFAT_ESTRUCTURE;
+
+    first_cluster = 2u +
+                    (file->first_block - heap) / FAUXFAT_BLOCKS_PER_CLUSTER;
+    clusters = file->allocation_blocks / FAUXFAT_BLOCKS_PER_CLUSTER;
+    if (first_cluster != s->next_cluster || clusters > limit - first_cluster)
+        return FAUXFAT_ESTRUCTURE;
+
+    if (file->kind == FAUXFAT_DISK_FILE_OPAQUE) {
+        if (!s->seen_opaque) {
+            s->seen_opaque          = 1;
+            s->opaque_first_cluster = (uint32_t)first_cluster;
+        }
+    } else if (s->seen_opaque) {
+        return FAUXFAT_ESTRUCTURE;
+    }
+
+    if ((file->flags & FAUXFAT_DISK_FILE_NAME_CHANGED) != 0u)
+        s->name_changed = 1;
+    s->next_cluster = first_cluster + clusters;
+    return FAUXFAT_OK;
+}
+
+static int ff_reopen_geometry(const fauxfat_device *device,
+                              fauxfat_view *v,
+                              fauxfat_config *cfg,
+                              uint8_t main_boot[FAUXFAT_BLOCK_SIZE],
+                              int *boot_strict)
+{
+    uint64_t volume_blocks;
+    uint64_t expected_volume_blocks;
+    uint64_t fat_bytes;
+    uint64_t bitmap_bytes;
+    uint64_t bitmap_clusters;
+    uint32_t fat_length;
+    uint32_t cluster_count;
+    uint32_t expected_fat_length;
+    int rc;
+
+    rc = ff_dev_read_block(device, 0u, main_boot);
+    if (rc != 0)
+        return rc;
+
+    if (main_boot[0] != 0xebu || main_boot[1] != 0x76u ||
+        main_boot[2] != 0x90u ||
+        memcmp(main_boot + 3u, "EXFAT   ", 8u) != 0 ||
+        ff_load16(main_boot + 104u) != 0x0100u ||
+        main_boot[108u] != 9u || main_boot[109u] != 7u ||
+        main_boot[110u] != 1u ||
+        ff_load32(main_boot + 80u) != FF_FAT_OFFSET_BLOCKS)
+        return 0;
+
+    volume_blocks = ff_load64(main_boot + 72u);
+    fat_length    = ff_load32(main_boot + 84u);
+    cluster_count = ff_load32(main_boot + 92u);
+    if (cluster_count == 0u || cluster_count > FF_MAX_CLUSTER_COUNT ||
+        fat_length == 0u ||
+        (fat_length % FAUXFAT_BLOCKS_PER_CLUSTER) != 0u)
+        return 0;
+
+    fat_bytes = ((uint64_t)cluster_count + 2u) * 4u;
+    if (fat_bytes > UINT32_MAX * (uint64_t)FAUXFAT_BLOCK_SIZE)
+        return 0;
+    expected_fat_length = ff_align_up_u32(
+        (uint32_t)((fat_bytes + FAUXFAT_BLOCK_SIZE - 1u) /
+                   FAUXFAT_BLOCK_SIZE),
+        FAUXFAT_BLOCKS_PER_CLUSTER);
+    if (fat_length != expected_fat_length ||
+        ff_load32(main_boot + 88u) != FF_FAT_OFFSET_BLOCKS + fat_length)
+        return 0;
+
+    expected_volume_blocks = (uint64_t)(FF_FAT_OFFSET_BLOCKS + fat_length) +
+                             (uint64_t)cluster_count * FAUXFAT_BLOCKS_PER_CLUSTER;
+    if (volume_blocks != expected_volume_blocks)
+        return 0;
+
+    bitmap_bytes    = ((uint64_t)cluster_count + 7u) / 8u;
+    bitmap_clusters = (bitmap_bytes + FAUXFAT_CLUSTER_SIZE - 1u) /
+                      FAUXFAT_CLUSTER_SIZE;
+    if (bitmap_clusters == 0u || bitmap_clusters > UINT32_MAX)
+        return 0;
+
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->partition_lba = ff_load64(main_boot + 64u);
+    cfg->volume_serial = ff_load32(main_boot + 100u);
+
+    memset(v, 0, sizeof(*v));
+    v->config             = cfg;
+    v->bitmap_clusters    = (uint32_t)bitmap_clusters;
+    v->upcase_cluster     = 2u + v->bitmap_clusters;
+    v->root_cluster       = ff_load32(main_boot + 96u);
+    v->data_first_cluster = v->root_cluster + 1u;
+    v->cluster_count      = cluster_count;
+    v->fat_length_blocks  = fat_length;
+    v->cluster_heap_block = ff_load32(main_boot + 88u);
+    v->volume_blocks      = volume_blocks;
+
+    if (v->root_cluster != v->upcase_cluster + 1u ||
+        v->data_first_cluster > v->cluster_count + 2u)
+        return 0;
+
+    rc = ff_verify_boot_region(v, device, 0u, 0, NULL);
+    if (rc < 0)
+        return rc;
+    *boot_strict = (rc == 1);
+    rc           = ff_verify_boot_region(v, device, 12u, 1, NULL);
+    if (rc < 0)
+        return rc;
+    if (rc != 1)
+        *boot_strict = 0;
+    return 1;
+}
+
+static int ff_reopen_root_identity(const fauxfat_view *v,
+                                   const fauxfat_device *device,
+                                   fauxfat_reopen_info *info)
+{
+    ff_root_reader r;
+    uint8_t e[32];
+    uint64_t root_first;
+    size_t i;
+    int rc;
+
+    root_first = (uint64_t)v->cluster_heap_block +
+                 (uint64_t)(v->root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+    memset(&r, 0, sizeof(r));
+    r.device      = device;
+    r.first_block = root_first;
+
+    rc = ff_validate_root_system_entries(v, &r);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    if (!info)
+        return FAUXFAT_OK;
+
+    rc = ff_root_entry(&r, 2u, e);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    memset(info->volume_label, 0, sizeof(info->volume_label));
+    for (i = 0u; i < e[1]; ++i)
+        info->volume_label[i] = (char)(uint8_t)ff_load16(e + 2u + 2u * i);
+
+    rc = ff_root_entry(&r, 3u, e);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    memcpy(info->volume_guid, e + 6u, sizeof(info->volume_guid));
+    return FAUXFAT_OK;
+}
+
+static void ff_reopen_canonicalize_file_set(uint8_t set[160])
+{
+    uint8_t *file_ent = set;
+    uint16_t attrs    = ff_load16(file_ent + 4u);
+
+    attrs &= (uint16_t)~FF_ATTR_ARCHIVE;
+    ff_store16(file_ent + 4u, attrs);
+    memcpy(file_ent + 12u, file_ent + 8u, 4u);
+    memcpy(file_ent + 16u, file_ent + 8u, 4u);
+    file_ent[21u] = file_ent[20u];
+    file_ent[23u] = file_ent[22u];
+    file_ent[24u] = file_ent[22u];
+    ff_store16(file_ent + 2u, ff_entry_set_checksum(set, 160u));
+}
+
+static int ff_reopen_hash_root(const fauxfat_view *v,
+                               const fauxfat_device *device,
+                               ff_xxh32 *component,
+                               ff_xxh32 *map)
+{
+    ff_root_reader r;
+    uint64_t root_first = (uint64_t)v->cluster_heap_block +
+                          (uint64_t)(v->root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+    uint32_t entry = 0u;
+    int rc;
+
+    memset(&r, 0, sizeof(r));
+    r.device      = device;
+    r.first_block = root_first;
+
+    while (entry < FF_ROOT_ENTRIES) {
+        uint8_t first[32];
+
+        rc = ff_root_entry(&r, entry, first);
+        if (rc != FAUXFAT_OK)
+            return rc;
+        if (first[0] == FF_ENTRY_FILE) {
+            uint8_t set[160];
+            if (first[1] != 4u || entry > FF_ROOT_ENTRIES - 5u)
+                return 0;
+            rc = ff_root_set(&r, entry, 5u, set);
+            if (rc != FAUXFAT_OK)
+                return rc;
+            if (ff_load16(set + 2u) != ff_entry_set_checksum(set, 160u))
+                return 0;
+            ff_reopen_canonicalize_file_set(set);
+            ff_xxh32_update(component, set, sizeof(set));
+            ff_xxh32_update(map, set, sizeof(set));
+            entry += 5u;
+        } else {
+            ff_xxh32_update(component, first, sizeof(first));
+            ff_xxh32_update(map, first, sizeof(first));
+            ++entry;
+        }
+    }
+    return 1;
+}
+
+static uint32_t ff_reopen_fat_entry(const fauxfat_view *v,
+                                    uint32_t entry,
+                                    uint32_t opaque_first_cluster)
+{
+    uint32_t bitmap_last = 2u + v->bitmap_clusters - 1u;
+
+    if (entry == 0u)
+        return 0xfffffff8u;
+    if (entry == 1u)
+        return FF_FAT_EOC;
+    if (entry >= 2u && entry <= bitmap_last)
+        return entry == bitmap_last ? FF_FAT_EOC : entry + 1u;
+    if (entry == v->upcase_cluster || entry == v->root_cluster)
+        return FF_FAT_EOC;
+    if (entry < v->data_first_cluster || entry > v->cluster_count + 1u)
+        return 0u;
+    return entry >= opaque_first_cluster ? 0xfffffff7u : 0u;
+}
+
+static int ff_reopen_verify_fat(const fauxfat_view *v,
+                                const fauxfat_device *device,
+                                uint32_t opaque_first_cluster,
+                                ff_xxh32 *component,
+                                ff_xxh32 *map)
+{
+    uint8_t actual[FAUXFAT_BLOCK_SIZE];
+    uint8_t expected[FAUXFAT_BLOCK_SIZE];
+    uint64_t bytes       = ((uint64_t)v->cluster_count + 2u) * 4u;
+    uint32_t block_index = 0u;
+
+    while (bytes != 0u) {
+        uint64_t first_entry = (uint64_t)block_index * 128u;
+        size_t n             = bytes > FAUXFAT_BLOCK_SIZE ? FAUXFAT_BLOCK_SIZE : (size_t)bytes;
+        unsigned i;
+        int rc = ff_dev_read_block(device,
+                                   (uint64_t)FF_FAT_OFFSET_BLOCKS + block_index,
+                                   actual);
+        if (rc != 0)
+            return rc;
+        memset(expected, 0, sizeof(expected));
+        for (i = 0u; i < 128u; ++i) {
+            uint64_t e = first_entry + i;
+            if (e > (uint64_t)v->cluster_count + 1u)
+                break;
+            ff_store32(expected + 4u * i,
+                       ff_reopen_fat_entry(v, (uint32_t)e,
+                                           opaque_first_cluster));
+        }
+        if (memcmp(actual, expected, n) != 0)
+            return 0;
+        ff_xxh32_update(component, actual, n);
+        ff_xxh32_update(map, actual, n);
+        bytes -= n;
+        ++block_index;
+    }
+    return 1;
+}
+
+static int ff_reopen_oem_valid(const uint8_t sector[FAUXFAT_BLOCK_SIZE],
+                               uint32_t map_hash,
+                               uint32_t fat_hash,
+                               uint32_t bitmap_hash,
+                               uint32_t root_hash,
+                               uint32_t upcase_hash)
+{
+    return ff_oem_recognizable(sector) &&
+           ff_load32(sector + 16u) == map_hash &&
+           ff_all_zero(sector + 20u, 28u) &&
+           ff_load16(sector + 70u) == 0u &&
+           ff_load32(sector + 80u) == fat_hash &&
+           ff_load32(sector + 84u) == bitmap_hash &&
+           ff_load32(sector + 88u) == root_hash &&
+           ff_load32(sector + 92u) == upcase_hash &&
+           ff_all_zero(sector + 96u, FAUXFAT_BLOCK_SIZE - 96u);
+}
+
+static int ff_reopen_validate_self(const fauxfat_view *v,
+                                   const fauxfat_device *device,
+                                   const uint8_t main_boot[FAUXFAT_BLOCK_SIZE],
+                                   const uint8_t main_oem[FAUXFAT_BLOCK_SIZE],
+                                   int boot_strict,
+                                   int *valid)
+{
+    ff_reopen_layout_summary summary;
+    uint8_t backup_oem[FAUXFAT_BLOCK_SIZE];
+    ff_xxh32 fat;
+    ff_xxh32 bitmap;
+    ff_xxh32 root;
+    ff_xxh32 upcase;
+    ff_xxh32 map;
+    static const uint8_t prefix[8] = { 'F', 'F', 'M', 'A', 'P', '1', 0, 0 };
+    uint32_t fat_hash;
+    uint32_t bitmap_hash;
+    uint32_t root_hash;
+    uint32_t upcase_hash;
+    uint32_t map_hash;
+    size_t count = 0u;
+    int rc;
+
+    *valid = 0;
+    if (!boot_strict || !ff_oem_recognizable(main_oem))
+        return FAUXFAT_OK;
+
+    rc = ff_dev_read_block(device, 21u, backup_oem);
+    if (rc != 0)
+        return rc;
+    if (memcmp(main_oem, backup_oem, sizeof(backup_oem)) != 0)
+        return FAUXFAT_OK;
+
+    memset(&summary, 0, sizeof(summary));
+    summary.view                 = v;
+    summary.next_cluster         = v->data_first_cluster;
+    summary.opaque_first_cluster = v->cluster_count + 2u;
+    rc                           = fauxfat_parse_root_strict(v, device, ff_reopen_layout_emit,
+                                                             &summary, &count);
+    if (rc != FAUXFAT_OK) {
+        if (rc == FAUXFAT_ESTRUCTURE || rc == FAUXFAT_EGEOMETRY)
+            return FAUXFAT_OK;
+        return rc;
+    }
+    if (summary.next_cluster != (uint64_t)v->cluster_count + 2u ||
+        summary.name_changed)
+        return FAUXFAT_OK;
+
+    ff_xxh32_init(&fat, FF_XXH32_FAT_SEED);
+    ff_xxh32_init(&bitmap, FF_XXH32_BITMAP_SEED);
+    ff_xxh32_init(&root, FF_XXH32_ROOT_SEED);
+    ff_xxh32_init(&upcase, FF_XXH32_UPCASE_SEED);
+    ff_xxh32_init(&map, FF_XXH32_MAP_SEED);
+    ff_xxh32_update(&map, prefix, sizeof(prefix));
+    ff_xxh32_update(&map, main_boot + 64u, 42u);
+    ff_xxh32_update(&map, main_boot + 108u, 4u);
+
+    rc = ff_reopen_verify_fat(v, device, summary.opaque_first_cluster,
+                              &fat, &map);
+    if (rc < 0)
+        return rc;
+    if (rc == 0)
+        return FAUXFAT_OK;
+    rc = ff_verify_bitmap_and_hash(v, device, &bitmap, &map);
+    if (rc < 0)
+        return rc;
+    if (rc == 0)
+        return FAUXFAT_OK;
+    rc = ff_verify_upcase_and_hash(v, device, &upcase, &map);
+    if (rc < 0)
+        return rc;
+    if (rc == 0)
+        return FAUXFAT_OK;
+    rc = ff_reopen_hash_root(v, device, &root, &map);
+    if (rc < 0)
+        return rc;
+    if (rc == 0)
+        return FAUXFAT_OK;
+
+    fat_hash    = ff_xxh32_digest(&fat);
+    bitmap_hash = ff_xxh32_digest(&bitmap);
+    root_hash   = ff_xxh32_digest(&root);
+    upcase_hash = ff_xxh32_digest(&upcase);
+    map_hash    = ff_xxh32_digest(&map);
+    if (!ff_reopen_oem_valid(main_oem, map_hash, fat_hash, bitmap_hash,
+                             root_hash, upcase_hash))
+        return FAUXFAT_OK;
+
+    *valid = 1;
+    return FAUXFAT_OK;
+}
+
+int fauxfat_reopen(const fauxfat_device *device,
+                   fauxfat_file_emit_fn emit,
+                   void *emit_context,
+                   size_t *descriptor_count,
+                   fauxfat_volume_class *classification,
+                   fauxfat_reopen_info *info)
+{
+    fauxfat_config cfg;
+    fauxfat_view v;
+    uint8_t main_boot[FAUXFAT_BLOCK_SIZE];
+    uint8_t main_oem[FAUXFAT_BLOCK_SIZE];
+    uint8_t backup_oem[FAUXFAT_BLOCK_SIZE];
+    const uint8_t *identity_oem = NULL;
+    int recognized;
+    int boot_strict = 0;
+    int self_valid  = 0;
+    int geometry;
+    int rc;
+
+    if (!device || !device->read || !classification)
+        return FAUXFAT_EINVAL;
+    if (descriptor_count)
+        *descriptor_count = 0u;
+    if (info)
+        memset(info, 0, sizeof(*info));
+    *classification = FAUXFAT_VOLUME_INVALID;
+
+    rc = ff_dev_read_block(device, 9u, main_oem);
+    if (rc != 0)
+        return rc;
+
+    geometry = ff_reopen_geometry(device, &v, &cfg, main_boot, &boot_strict);
+    if (geometry < 0)
+        return geometry;
+    if (geometry == 0)
+        return FAUXFAT_OK;
+
+    rc = ff_dev_read_block(device, 21u, backup_oem);
+    if (rc != 0)
+        return rc;
+    if (ff_oem_recognizable(main_oem))
+        identity_oem = main_oem;
+    else if (ff_oem_recognizable(backup_oem))
+        identity_oem = backup_oem;
+    recognized = identity_oem != NULL;
+    if (recognized)
+        *classification = FAUXFAT_VOLUME_FAUXFAT_CHANGED;
+
+    if (info) {
+        info->partition_lba      = cfg.partition_lba;
+        info->volume_blocks      = v.volume_blocks;
+        info->volume_serial      = cfg.volume_serial;
+        info->fat_length_blocks  = v.fat_length_blocks;
+        info->cluster_heap_block = v.cluster_heap_block;
+        info->cluster_count      = v.cluster_count;
+        info->root_cluster       = v.root_cluster;
+        if (recognized)
+            info->structural_epoch = ff_load64(identity_oem + 72u);
+    }
+
+    rc = ff_reopen_root_identity(&v, device, info);
+    if (rc != FAUXFAT_OK) {
+        if (rc == FAUXFAT_ESTRUCTURE || rc == FAUXFAT_EGEOMETRY)
+            return FAUXFAT_OK;
+        return rc;
+    }
+
+    rc = ff_reopen_validate_self(&v, device, main_boot, main_oem,
+                                 boot_strict, &self_valid);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    if (self_valid)
+        *classification = FAUXFAT_VOLUME_FAUXFAT_VALID;
+    else if (recognized)
+        *classification = FAUXFAT_VOLUME_FAUXFAT_CHANGED;
+    else
+        *classification = FAUXFAT_VOLUME_EXFAT_BEST_EFFORT;
+
+    rc = ff_scan_loose_geometry(&v, device, emit, emit_context,
+                                descriptor_count);
+    if (rc != FAUXFAT_OK)
+        return rc;
     return FAUXFAT_OK;
 }

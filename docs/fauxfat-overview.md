@@ -1,12 +1,12 @@
 # fauxFAT overview and programmer's guide
 
-Status: current design and implemented API, with planned verifier/reopen behavior called out explicitly.
+Status: current design and implemented API; explicit physical placement and recovered-fd binding remain planned.
 
 `fauxFAT` is a deliberately restricted exFAT 1.00 volume generator and block translator. It presents a normal-looking removable filesystem to a consumer OS, but the storage layout is fixed in advance. The host is allowed to overwrite the contents of predefined files. It is not allowed to allocate files, resize them, move them, extend the root directory, or otherwise redesign the volume behind our back.
 
 The point is to use exFAT as a transport-shaped view over storage we control, not to implement a general exFAT filesystem.
 
-The normative byte-level format is in `fauxfat-disk-format.md`. The remaining whole-volume verification/reopen work is tracked in `fauxfat-format-verify-plan.md`.
+The normative byte-level format is in `fauxfat-disk-format.md`. Remaining placement/fd-binding work and qualification tasks are tracked in `fauxfat-format-verify-plan.md`.
 
 ## 1. Mental model
 
@@ -273,7 +273,7 @@ The bounded root parser emits this exact type rather than inventing a second par
 The destination callback set is:
 
 ```c
-read(first_block, block_count, dst)   /* reserved for verifier/reopen */
+read(first_block, block_count, dst)   /* verifier/reopen */
 write(first_block, block_count, src)
 zero(first_block, block_count)
 skip(first_block, block_count, kind)
@@ -300,7 +300,7 @@ int preserve(void *ctx, const fauxfat_disk_file *wanted);
 
 Return greater than zero to preserve the complete allocation, zero to initialize it normally, or a negative value to abort formatting.
 
-This is the intended repair path; strict whole-volume verification and bounded loose salvage are implemented, while schema-free reopen is still being filled in:
+This is the intended repair path; strict verification, bounded loose salvage, and schema-free reopen are implemented:
 
 ```text
 parse / validate existing volume
@@ -314,7 +314,7 @@ No payload relocation is implied by reformatting. If a desired object moved or c
 
 ## 9. Validation and reopen model
 
-Strict whole-volume validation against a trusted `fauxfat_view` and a bounded loose scanner are implemented. Schema-free reopen is still pending.
+Strict whole-volume validation against a trusted `fauxfat_view`, the bounded loose scanner, and schema-free block-device reopen are implemented.
 
 With trusted geometry already in a `fauxfat_view`, the implemented bounded pass is:
 
@@ -339,13 +339,21 @@ Strict validation asks whether the volume is still the fauxFAT structure we manu
 
 Loose validation is a bounded salvage mode. It may return simple root files whose Stream Extension proves they are contiguous `NoFatChain` files, and exact fauxFAT opaque descriptors. It may skip valid objects it does not support. It aborts rather than guessing when the structure is malformed or ambiguous.
 
-The implemented entry point is:
+The trusted-view entry point is:
 
 ```c
 fauxfat_scan_loose(&view, &device, emit_file, ctx, &count, &cls);
 ```
 
-It currently uses the trusted view for geometry, then performs the bounded root scan. Exact fauxFAT public files recover their persisted manufactured name from the two benign vendor records; a live namespace rename sets `FAUXFAT_DISK_FILE_NAME_CHANGED` while leaving `desc.name` stable. Ordinary three-entry contiguous root files are also emitted. Directories, fragmented files, and otherwise well-bounded unsupported File sets are skipped. Bad set checksums, orphan secondaries, impossible counts, overlap/order ambiguity, or unknown critical primaries abort the scan.
+When no schema/view is available, use:
+
+```c
+fauxfat_reopen(&device, emit_file, ctx, &count, &cls, &info);
+```
+
+`fauxfat_reopen()` derives the supported fixed fauxFAT geometry from the boot sector, validates native boot envelopes/checksums, reads identity from either OEM copy, reconstructs label/GUID/epoch information, recomputes the structural XXH32 seals directly from disk, and emits the same `fauxfat_disk_file` physical descriptors. No file table or manufactured view is needed. One damaged OEM copy remains recognizable `FAUXFAT_CHANGED`; with both identities gone, a sane bounded root can still be returned as `EXFAT_BEST_EFFORT`.
+
+`fauxfat_scan_loose()` uses the trusted view for geometry, then performs the same bounded root scan. Exact fauxFAT public files recover their persisted manufactured name from the two benign vendor records; a live namespace rename sets `FAUXFAT_DISK_FILE_NAME_CHANGED` while leaving `desc.name` stable. Ordinary three-entry contiguous root files are also emitted. Directories, fragmented files, and otherwise well-bounded unsupported File sets are skipped. Bad set checksums, orphan secondaries, impossible counts, overlap/order ambiguity, or unknown critical primaries abort the scan.
 
 The intended classifications are:
 
@@ -415,11 +423,11 @@ Implemented now:
 
 Planned, not implemented yet:
 
-- reopening recovered descriptors as caller-backed file descriptors;
+- binding recovered descriptors to caller-backed bounded block/range fds;
 - explicit physical placement instead of the current packed layout;
 - optional dual-view A/B presentation optimization.
 
-That boundary is important. The current library can manufacture and serve fauxFAT and can prove that an on-disk volume still matches a trusted manufactured view. It cannot yet take an arbitrary card with no schema/view in hand, derive a reusable view from disk, salvage bounded foreign/simple exFAT objects, or bind recovered descriptors directly to application fds.
+That boundary is important. The library can now manufacture and serve fauxFAT, prove that a volume matches a trusted manufactured view, or reopen the supported fauxFAT geometry directly from a block device with no schema in hand. It still does not grow arbitrary exFAT geometry/traversal, and it does not yet bind recovered descriptors to application fds or let the caller place extents explicitly.
 
 ## 12. Design rules worth preserving
 

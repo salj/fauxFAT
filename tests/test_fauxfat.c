@@ -905,6 +905,37 @@ int main(void)
         assert(media.preserve_skips == 1u);
         assert(media.preserve_blocks == opqd.allocation_blocks);
 
+        /* Schema-free reopen reconstructs geometry, identity and physical
+         * descriptors using only the block accessor. */
+        {
+            fauxfat_reopen_info ri;
+            fauxfat_volume_class vc;
+            emit_test got;
+            size_t count = 999u;
+
+            memset(&ri, 0xcc, sizeof(ri));
+            memset(&got, 0, sizeof(got));
+            assert(fauxfat_reopen(&dev, collect_file, &got, &count, &vc,
+                                  &ri) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+            assert(count == 2u && got.count == 2u);
+            assert(strcmp(got.file[0].name, "SHORT.BIN") == 0);
+            assert(got.file[0].first_block == pubd.first_block);
+            assert(got.file[1].kind == FAUXFAT_DISK_FILE_OPAQUE);
+            assert(strcmp(got.file[1].name, "SECRET.BIN") == 0);
+            assert(got.file[1].first_block == opqd.first_block);
+            assert(ri.partition_lba == fcfg.partition_lba);
+            assert(ri.volume_blocks == fv.volume_blocks);
+            assert(ri.structural_epoch == fcfg.structural_epoch);
+            assert(ri.volume_serial == fcfg.volume_serial);
+            assert(ri.fat_length_blocks == fv.fat_length_blocks);
+            assert(ri.cluster_heap_block == fv.cluster_heap_block);
+            assert(ri.cluster_count == fv.cluster_count);
+            assert(ri.root_cluster == fv.root_cluster);
+            assert(memcmp(ri.volume_guid, fcfg.volume_guid, 16u) == 0);
+            assert(strcmp(ri.volume_label, fcfg.volume_label) == 0);
+        }
+
         /* Structural bytes are rendered exactly. */
         assert(fauxfat_read_block(&fv, 0u, expected) == FAUXFAT_OK);
         assert(memcmp(media.data, expected, sizeof(expected)) == 0);
@@ -1172,6 +1203,9 @@ int main(void)
                     entry_set_checksum(root + 4u * 32u, 160u));
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+            assert(fauxfat_reopen(&dev, NULL, NULL, NULL, &vc, NULL) ==
+                   FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
             memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
 
             /* A structurally valid but unauthorized creation-time change is
@@ -1181,12 +1215,18 @@ int main(void)
                     entry_set_checksum(root + 4u * 32u, 160u));
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            assert(fauxfat_reopen(&dev, NULL, NULL, NULL, &vc, NULL) ==
+                   FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
             memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
 
             /* Each separately sealed structural component is checked directly. */
             saved = media.data[fat_block * FAUXFAT_BLOCK_SIZE + fat_off];
             media.data[fat_block * FAUXFAT_BLOCK_SIZE + fat_off] ^= 0x01u;
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            assert(fauxfat_reopen(&dev, NULL, NULL, NULL, &vc, NULL) ==
+                   FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
             media.data[fat_block * FAUXFAT_BLOCK_SIZE + fat_off] = saved;
 
@@ -1209,11 +1249,36 @@ int main(void)
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
             media.data[112u] = saved;
 
-            /* Destroying the fauxFAT OEM identity downgrades to INVALID. */
+            /* Losing one OEM identity copy is still recognizable fauxFAT via
+             * the other boot region, so schema-free reopen reports CHANGED.
+             * Losing both identities falls back to bounded exFAT salvage. */
             saved = media.data[9u * FAUXFAT_BLOCK_SIZE];
             media.data[9u * FAUXFAT_BLOCK_SIZE] ^= 0x80u;
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_INVALID);
+            {
+                emit_test got;
+                size_t reopen_count = 0u;
+                uint8_t saved_backup =
+                    media.data[21u * FAUXFAT_BLOCK_SIZE];
+
+                memset(&got, 0, sizeof(got));
+                assert(fauxfat_reopen(&dev, collect_file, &got,
+                                      &reopen_count, &vc, NULL) ==
+                       FAUXFAT_OK);
+                assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+                assert(reopen_count == 2u && got.count == 2u);
+
+                media.data[21u * FAUXFAT_BLOCK_SIZE] ^= 0x80u;
+                memset(&got, 0, sizeof(got));
+                reopen_count = 0u;
+                assert(fauxfat_reopen(&dev, collect_file, &got,
+                                      &reopen_count, &vc, NULL) ==
+                       FAUXFAT_OK);
+                assert(vc == FAUXFAT_VOLUME_EXFAT_BEST_EFFORT);
+                assert(reopen_count == 2u && got.count == 2u);
+                media.data[21u * FAUXFAT_BLOCK_SIZE] = saved_backup;
+            }
             media.data[9u * FAUXFAT_BLOCK_SIZE] = saved;
 
             /* Storage errors remain storage errors, not structural classifications. */
@@ -1263,8 +1328,8 @@ int main(void)
                     entry_set_checksum(root + 4u * 32u, 160u));
 
             memset(&recovered, 0, sizeof(recovered));
-            assert(fauxfat_scan_loose(&fv, &dev, collect_file, &recovered,
-                                      &count, &vc) == FAUXFAT_OK);
+            assert(fauxfat_reopen(&dev, collect_file, &recovered, &count,
+                                  &vc, NULL) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
             assert(count == 2u && recovered.count == 2u);
             assert(strcmp(recovered.file[0].name, "SHORT.BIN") == 0);

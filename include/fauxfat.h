@@ -188,6 +188,25 @@ typedef enum fauxfat_volume_class {
 } fauxfat_volume_class;
 
 /*
+ * Geometry and stable identity recovered directly from an on-disk fauxFAT
+ * presentation.  This is not a second filesystem object model: it is the
+ * handful of fixed exFAT fields needed to locate the bounded root and report
+ * which manufactured presentation was found.
+ */
+typedef struct fauxfat_reopen_info {
+    uint64_t partition_lba;
+    uint64_t volume_blocks;
+    uint64_t structural_epoch;
+    uint32_t volume_serial;
+    uint32_t fat_length_blocks;
+    uint32_t cluster_heap_block;
+    uint32_t cluster_count;
+    uint32_t root_cluster;
+    uint8_t volume_guid[16];
+    char volume_label[12];
+} fauxfat_reopen_info;
+
+/*
  * Raw block-device side of sparse formatting and (later) validation.
  * Addresses are volume-relative 512-byte blocks, matching fauxfat_read_block.
  */
@@ -391,6 +410,28 @@ int fauxfat_scan_loose(const fauxfat_view *view,
                        void *emit_context,
                        size_t *descriptor_count,
                        fauxfat_volume_class *classification);
+
+/*
+ * Reopen a fauxFAT-like volume using only the block-device accessor. The
+ * caller need not provide a schema or view. Exact fauxFAT geometry is derived
+ * from the boot sector, the fixed one-cluster root is scanned in constant
+ * memory, and descriptors are emitted as direct physical ranges.
+ *
+ * If the OEM fauxFAT identity and self-seal are intact, classification is
+ * FAUXFAT_VALID.  Recognizable fauxFAT with a structural mismatch is
+ * FAUXFAT_CHANGED, while a structurally sane bounded exFAT root without the
+ * fauxFAT OEM identity is EXFAT_BEST_EFFORT.  Geometry too different to be
+ * handled without general exFAT traversal is INVALID.
+ *
+ * info and descriptor_count may be NULL.  Device callback errors are
+ * propagated unchanged.
+ */
+int fauxfat_reopen(const fauxfat_device *device,
+                   fauxfat_file_emit_fn emit,
+                   void *emit_context,
+                   size_t *descriptor_count,
+                   fauxfat_volume_class *classification,
+                   fauxfat_reopen_info *info);
 
 #ifdef __cplusplus
 }
