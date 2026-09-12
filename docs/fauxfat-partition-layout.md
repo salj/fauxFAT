@@ -99,6 +99,14 @@ Prefer to make the fauxFAT volume itself an aligned size rather than placing dea
 
 This reserve is not wasted: the application can later carve it into named opaque objects without changing the partition table.
 
+The implementation exposes this placement policy as
+`fauxfat_block_plan_gpt()`. It returns plain geometry only: selected alignment,
+partition count, fauxFAT LBA/length, and optional user-partition LBA/length.
+GUID generation, names, partition types, and fauxFAT tail sizing remain outside
+the planner. A zero reported AU falls back to the 1 MiB minimum. The low-level
+`fauxgpt` module remains a general bounded renderer/parser and does not acquire
+this product-specific placement policy.
+
 ## 6. Host compatibility
 
 The target is current consumer operating systems, not arbitrary cameras, game consoles, printers, or other appliances that happen to have an SD slot.

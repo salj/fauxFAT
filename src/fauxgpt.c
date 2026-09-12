@@ -552,12 +552,6 @@ int fauxgpt_identity_matches(const fauxgpt_info *info,
     return 1;
 }
 
-int fauxgpt_partitioning_matches(const fauxgpt_info *info,
-                                 const fauxgpt_layout *expected)
-{
-    return fauxgpt_geometry_matches(info, expected);
-}
-
 int fauxgpt_render_block(const fauxgpt_view *view,
                          uint64_t block_address,
                          uint8_t out[FAUXGPT_BLOCK_SIZE])

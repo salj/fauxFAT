@@ -26,12 +26,45 @@ typedef struct fauxfat_block_device {
     fauxfat_block_generation_fn generation;
 } fauxfat_block_device;
 
-typedef enum fauxfat_block_layout {
+typedef enum fauxfat_block_wrapper {
     /* Open only: detect bare fauxFAT versus our bounded GPT profile. */
-    FAUXFAT_BLOCK_AUTO = 0,
-    FAUXFAT_BLOCK_BARE = 1,
-    FAUXFAT_BLOCK_GPT  = 2
-} fauxfat_block_layout;
+    FAUXFAT_BLOCK_WRAPPER_AUTO = 0,
+    FAUXFAT_BLOCK_WRAPPER_BARE = 1,
+    FAUXFAT_BLOCK_WRAPPER_GPT  = 2
+} fauxfat_block_wrapper;
+
+#define FAUXFAT_BLOCK_MIN_ALIGNMENT_BLOCKS 2048u
+
+/*
+ * Canonical whole-disk GPT geometry for fauxFAT media. GUIDs, names, and
+ * filesystem construction remain separate concerns; this is only placement.
+ * A zero card_au_blocks input means the SD allocation unit is unavailable.
+ */
+typedef struct fauxfat_block_gpt_plan {
+    unsigned partition_count;
+    uint64_t alignment_blocks;
+    uint64_t fauxfat_first_lba;
+    uint64_t fauxfat_block_count;
+    uint64_t user_first_lba;
+    uint64_t user_block_count;
+} fauxfat_block_gpt_plan;
+
+/*
+ * Plan canonical GPT partition placement for a fixed-size fauxFAT partition.
+ * Alignment is max(1 MiB, card_au_blocks). Partition 1 starts at the first
+ * aligned LBA at or after GPT's first usable LBA. When include_user_partition
+ * is non-zero, partition 2 starts at the next aligned LBA after partition 1
+ * and consumes the remainder through GPT's last usable LBA.
+ *
+ * The planner does not grow fauxFAT to consume an alignment gap. Callers that
+ * want zero gap should size the fauxFAT anonymous tail before calling this
+ * function, then pass the final fauxfat_block_count here.
+ */
+int fauxfat_block_plan_gpt(fauxfat_block_gpt_plan *plan,
+                           uint64_t disk_blocks,
+                           uint64_t fauxfat_block_count,
+                           uint64_t card_au_blocks,
+                           int include_user_partition);
 
 typedef enum fauxfat_block_media_kind {
     FAUXFAT_BLOCK_MEDIA_UNKNOWN = 0,
@@ -67,7 +100,7 @@ typedef struct fauxfat_block_probe_info {
 typedef struct fauxfat_block_opened {
     fauxfat_block_device raw;
     fauxfat_device volume_device;
-    fauxfat_block_layout layout;
+    fauxfat_block_wrapper wrapper;
     uint64_t volume_first_block;
     uint64_t volume_blocks;
     fauxfat_volume_class classification;
@@ -147,7 +180,7 @@ int fauxfat_block_probe(fauxfat_block_probe_info *probe,
  */
 int fauxfat_block_open(fauxfat_block_opened *opened,
                        const fauxfat_block_device *device,
-                       fauxfat_block_layout expectation,
+                       fauxfat_block_wrapper expectation,
                        const fauxgpt_layout *expected_gpt,
                        fauxfat_file_emit_fn emit,
                        void *emit_context,
@@ -173,7 +206,7 @@ int fauxfat_block_open(fauxfat_block_opened *opened,
  */
 int fauxfat_block_format(const fauxfat_view *view,
                          const fauxfat_block_device *device,
-                         fauxfat_block_layout layout,
+                         fauxfat_block_wrapper wrapper,
                          const fauxgpt_view *gpt,
                          fauxfat_preserve_fn preserve,
                          void *preserve_context,

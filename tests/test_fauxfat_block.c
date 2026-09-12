@@ -150,6 +150,75 @@ static void setup_gpt(fauxgpt_partition parts[2], fauxgpt_layout *layout,
     assert(fauxgpt_init(gpt, layout) == FAUXGPT_OK);
 }
 
+static void test_gpt_geometry_planner(void)
+{
+    fauxfat_block_gpt_plan plan;
+    uint64_t disk_blocks = 100000u;
+
+    assert(fauxfat_block_plan_gpt(&plan, disk_blocks, 10000u, 0u, 1) ==
+           FAUXFAT_BLOCK_OK);
+    assert(plan.partition_count == 2u);
+    assert(plan.alignment_blocks == 2048u);
+    assert(plan.fauxfat_first_lba == 2048u);
+    assert(plan.fauxfat_block_count == 10000u);
+    assert(plan.user_first_lba == 12288u);
+    assert(plan.user_block_count == (disk_blocks - 34u) - 12288u + 1u);
+    {
+        fauxgpt_partition parts[2];
+        fauxgpt_layout layout;
+        fauxgpt_view gpt;
+
+        memset(parts, 0, sizeof(parts));
+        memcpy(parts[0].type_guid, fauxgpt_type_microsoft_basic_data, 16u);
+        memcpy(parts[1].type_guid, fauxgpt_type_microsoft_basic_data, 16u);
+        fill_guid(parts[0].unique_guid, 0x11u);
+        fill_guid(parts[1].unique_guid, 0x31u);
+        parts[0].first_lba   = plan.fauxfat_first_lba;
+        parts[0].block_count = plan.fauxfat_block_count;
+        parts[1].first_lba   = plan.user_first_lba;
+        parts[1].block_count = plan.user_block_count;
+
+        memset(&layout, 0, sizeof(layout));
+        layout.disk_blocks = disk_blocks;
+        fill_guid(layout.disk_guid, 0x51u);
+        layout.partitions      = parts;
+        layout.partition_count = plan.partition_count;
+        assert(fauxgpt_init(&gpt, &layout) == FAUXGPT_OK);
+        assert(gpt.last_usable_lba == disk_blocks - 34u);
+    }
+
+    assert(fauxfat_block_plan_gpt(&plan, disk_blocks, 8192u, 8192u, 1) ==
+           FAUXFAT_BLOCK_OK);
+    assert(plan.partition_count == 2u);
+    assert(plan.alignment_blocks == 8192u);
+    assert(plan.fauxfat_first_lba == 8192u);
+    assert(plan.fauxfat_block_count == 8192u);
+    assert(plan.user_first_lba == 16384u);
+    assert(plan.user_block_count == (disk_blocks - 34u) - 16384u + 1u);
+
+    /* SD AUs below 1 MiB do not weaken the ordinary partition alignment. */
+    assert(fauxfat_block_plan_gpt(&plan, disk_blocks, 2048u, 1024u, 0) ==
+           FAUXFAT_BLOCK_OK);
+    assert(plan.partition_count == 1u);
+    assert(plan.alignment_blocks == 2048u);
+    assert(plan.fauxfat_first_lba == 2048u);
+    assert(plan.user_first_lba == 0u);
+    assert(plan.user_block_count == 0u);
+
+    assert(fauxfat_block_plan_gpt(NULL, disk_blocks, 1u, 0u, 0) ==
+           FAUXFAT_BLOCK_EINVAL);
+    assert(fauxfat_block_plan_gpt(&plan, disk_blocks, 0u, 0u, 0) ==
+           FAUXFAT_BLOCK_EINVAL);
+    assert(fauxfat_block_plan_gpt(&plan, 67u, 1u, 0u, 0) ==
+           FAUXFAT_BLOCK_ERANGE);
+    assert(fauxfat_block_plan_gpt(&plan, 4096u, 4096u, 0u, 0) ==
+           FAUXFAT_BLOCK_ERANGE);
+    assert(fauxfat_block_plan_gpt(&plan, 4129u, 2048u, 0u, 1) ==
+           FAUXFAT_BLOCK_ERANGE);
+    assert(fauxfat_block_plan_gpt(&plan, UINT64_MAX, 1u, UINT64_MAX, 0) ==
+           FAUXFAT_BLOCK_ERANGE);
+}
+
 static void test_gpt_open_format_and_guards(void)
 {
     fauxfat_config cfg;
@@ -191,10 +260,10 @@ static void test_gpt_open_format_and_guards(void)
     media.data[user_probe * FAUXFAT_BLOCK_SIZE + 3u] = 0x5au;
 
     /* Unknown/blank is not assumed disposable merely because it looks bored. */
-    rc = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+    rc = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                               NULL, NULL, 0u);
     assert(rc == FAUXFAT_BLOCK_ENOTFAUXFAT);
-    rc = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+    rc = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                               NULL, NULL,
                               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA);
     assert(rc == FAUXFAT_BLOCK_OK);
@@ -209,20 +278,20 @@ static void test_gpt_open_format_and_guards(void)
     assert((probe.gpt_probe.backup.flags & FAUXGPT_COPY_VALID) != 0u);
 
     memset(&opened, 0, sizeof(opened));
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, &layout,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, &layout,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
-    assert(opened.layout == FAUXFAT_BLOCK_GPT);
+    assert(opened.wrapper == FAUXFAT_BLOCK_WRAPPER_GPT);
     assert(opened.volume_first_block == p1_first);
     assert(opened.volume_blocks == view.volume_blocks);
     assert(opened.classification == FAUXFAT_VOLUME_FAUXFAT_VALID);
     assert((opened.gpt.flags & FAUXGPT_INFO_PRIMARY_VALID) != 0u);
     assert((opened.gpt.flags & FAUXGPT_INFO_BACKUP_VALID) != 0u);
     assert((opened.gpt.flags & FAUXGPT_INFO_PMBR_VALID) != 0u);
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_BARE, NULL,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_EWRAPPER);
 
     /* Once the target proves it is ours, regeneration needs no destroy flag. */
-    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                 NULL, NULL, 0u) == FAUXFAT_BLOCK_OK);
     assert(media.data[user_probe * FAUXFAT_BLOCK_SIZE + 3u] == 0x5au);
 
@@ -236,19 +305,19 @@ static void test_gpt_open_format_and_guards(void)
         fill_guid(foreign_cfg.volume_guid, 0xd1u);
         assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
         assert(fauxfat_block_format(
-                   &foreign_view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &foreign_view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
 
         writes_before = media.write_calls;
         zeros_before  = media.zero_calls;
-        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                     NULL, NULL, 0u) ==
                FAUXFAT_BLOCK_EIDENTITY);
         assert(media.write_calls == writes_before);
         assert(media.zero_calls == zeros_before);
         assert(fauxfat_block_format(
-                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
 
@@ -256,18 +325,18 @@ static void test_gpt_open_format_and_guards(void)
         foreign_cfg.volume_serial ^= 0x01020304u;
         assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
         assert(fauxfat_block_format(
-                   &foreign_view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &foreign_view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
         writes_before = media.write_calls;
         zeros_before  = media.zero_calls;
-        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                     NULL, NULL, 0u) ==
                FAUXFAT_BLOCK_EIDENTITY);
         assert(media.write_calls == writes_before);
         assert(media.zero_calls == zeros_before);
         assert(fauxfat_block_format(
-                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
     }
@@ -294,13 +363,13 @@ static void test_gpt_open_format_and_guards(void)
 
         writes_before = media.write_calls;
         zeros_before  = media.zero_calls;
-        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                     NULL, NULL, 0u) ==
                FAUXFAT_BLOCK_EIDENTITY);
         assert(media.write_calls == writes_before);
         assert(media.zero_calls == zeros_before);
         assert(fauxfat_block_format(
-                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
 
@@ -312,13 +381,13 @@ static void test_gpt_open_format_and_guards(void)
         assert(fauxgpt_format(&alt_gpt, &gd) == FAUXGPT_OK);
         writes_before = media.write_calls;
         zeros_before  = media.zero_calls;
-        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                     NULL, NULL, 0u) ==
                FAUXFAT_BLOCK_EIDENTITY);
         assert(media.write_calls == writes_before);
         assert(media.zero_calls == zeros_before);
         assert(fauxfat_block_format(
-                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
     }
@@ -340,11 +409,11 @@ static void test_gpt_open_format_and_guards(void)
         renamed_layout            = layout;
         renamed_layout.partitions = renamed_parts;
         assert(fauxgpt_init(&renamed_gpt, &renamed_layout) == FAUXGPT_OK);
-        assert(fauxfat_block_format(&changed_view, &dev, FAUXFAT_BLOCK_GPT,
+        assert(fauxfat_block_format(&changed_view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT,
                                     &renamed_gpt, NULL, NULL, 0u) ==
                FAUXFAT_BLOCK_OK);
         /* Returning to the old presentation is also identity-safe. */
-        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                     NULL, NULL, 0u) == FAUXFAT_BLOCK_OK);
     }
 
@@ -367,14 +436,14 @@ static void test_gpt_open_format_and_guards(void)
         gd.context = &media;
         assert(fauxgpt_format(&alt_gpt, &gd) == FAUXGPT_OK);
 
-        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, &layout,
+        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, &layout,
                                   NULL, NULL, NULL) ==
                FAUXFAT_BLOCK_EPARTITION);
-        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                     NULL, NULL, 0u) ==
                FAUXFAT_BLOCK_EPARTITION);
         assert(fauxfat_block_format(
-                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
     }
@@ -387,14 +456,14 @@ static void test_gpt_open_format_and_guards(void)
     assert(fauxfat_block_probe(&probe, &dev) == FAUXFAT_BLOCK_OK);
     assert(probe.kind == FAUXFAT_BLOCK_MEDIA_GPT);
     assert(probe.classification == FAUXFAT_VOLUME_EXFAT_BEST_EFFORT);
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, &layout,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, &layout,
                               NULL, NULL, NULL) ==
            FAUXFAT_BLOCK_ENOTFAUXFAT);
-    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                                 NULL, NULL, 0u) ==
            FAUXFAT_BLOCK_ENOTFAUXFAT);
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
 
@@ -438,7 +507,7 @@ static void test_probe_damage_conflict_and_io_isolation(void)
     dev.flush       = mem_flush;
 
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
 
@@ -468,7 +537,7 @@ static void test_probe_damage_conflict_and_io_isolation(void)
     media.read_calls     = 0u;
     media.fail_read_call = 1u;
     media.fail_read_code = FAUXGPT_ENOTGPT;
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, &layout,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, &layout,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_EIO);
     assert(opened.backend_error == FAUXGPT_ENOTGPT);
     media.fail_read_call = 0u;
@@ -499,7 +568,7 @@ static void test_probe_damage_conflict_and_io_isolation(void)
         assert(probe.kind == FAUXFAT_BLOCK_MEDIA_GPT_CONFLICT);
         assert((probe.gpt_probe.primary.flags & FAUXGPT_COPY_VALID) != 0u);
         assert((probe.gpt_probe.backup.flags & FAUXGPT_COPY_VALID) != 0u);
-        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, NULL,
+        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, NULL,
                                   NULL, NULL, NULL) ==
                FAUXFAT_BLOCK_EWRAPPER);
 
@@ -544,7 +613,7 @@ static void test_probe_damage_conflict_and_io_isolation(void)
         assert(fauxfat_block_probe(&probe, &dev) == FAUXFAT_BLOCK_OK);
         assert(probe.kind == FAUXFAT_BLOCK_MEDIA_GPT);
         assert(probe.gpt.partition_count == 3u);
-        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, NULL,
+        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, NULL,
                                   NULL, NULL, NULL) ==
                FAUXFAT_BLOCK_EPARTITION);
         assert(fauxgpt_format(&gpt, &gd) == FAUXGPT_OK);
@@ -555,7 +624,7 @@ static void test_probe_damage_conflict_and_io_isolation(void)
     media.data[(disk_blocks - 1u) * FAUXFAT_BLOCK_SIZE + 17u] ^= 0x80u;
     assert(fauxfat_block_probe(&probe, &dev) == FAUXFAT_BLOCK_OK);
     assert(probe.kind == FAUXFAT_BLOCK_MEDIA_GPT_DAMAGED);
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, NULL,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, NULL,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_EWRAPPER);
 
     free(media.data);
@@ -591,36 +660,36 @@ static void test_bare_open_and_format(void)
     dev.flush       = mem_flush;
 
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_AUTO, NULL,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, NULL,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
-    assert(opened.layout == FAUXFAT_BLOCK_BARE);
+    assert(opened.wrapper == FAUXFAT_BLOCK_WRAPPER_BARE);
     assert(opened.volume_first_block == 0u);
     assert(opened.volume_blocks == view.volume_blocks);
     assert(opened.classification == FAUXFAT_VOLUME_FAUXFAT_VALID);
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_GPT, NULL,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, NULL,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_EWRAPPER);
-    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_BARE, NULL,
+    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL,
                                 NULL, NULL, 0u) == FAUXFAT_BLOCK_OK);
 
     foreign_cfg = cfg;
     fill_guid(foreign_cfg.volume_guid, 0xe1u);
     assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
     assert(fauxfat_block_format(
-               &foreign_view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &foreign_view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
     writes_before = media.write_calls;
     zeros_before  = media.zero_calls;
-    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_BARE, NULL,
+    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL,
                                 NULL, NULL, 0u) ==
            FAUXFAT_BLOCK_EIDENTITY);
     assert(media.write_calls == writes_before);
     assert(media.zero_calls == zeros_before);
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
 
@@ -665,7 +734,7 @@ static void test_gpt_wrapper_repair(void)
     dev.flush       = mem_flush;
 
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
 
@@ -711,7 +780,7 @@ static void test_gpt_wrapper_repair(void)
     assert(memcmp(body_snapshot,
                   media.data + (size_t)(p1_first * FAUXFAT_BLOCK_SIZE),
                   body_bytes) == 0);
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_GPT, &layout,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &layout,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
     assert((opened.gpt.flags & FAUXGPT_INFO_PRIMARY_VALID) != 0u);
     assert((opened.gpt.flags & FAUXGPT_INFO_BACKUP_VALID) != 0u);
@@ -813,7 +882,7 @@ static void test_gpt_wrapper_repair(void)
         assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
         dev.io.zero = mem_zero;
         assert(fauxfat_block_format(
-                   &foreign_view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &foreign_view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
         dev.io.zero = NULL;
@@ -825,7 +894,7 @@ static void test_gpt_wrapper_repair(void)
 
         dev.io.zero = mem_zero;
         assert(fauxfat_block_format(
-                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
                FAUXFAT_BLOCK_OK);
         dev.io.zero = NULL;
@@ -844,7 +913,7 @@ static void test_gpt_wrapper_repair(void)
     /* Restore p1, then prove raw backend failures cannot alias policy errors. */
     dev.io.zero = mem_zero;
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
     dev.io.zero = NULL;
@@ -899,13 +968,13 @@ static void test_media_generation_fencing(void)
     dev.generation  = mem_generation;
 
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_OK);
 
     assert(fauxfat_block_probe(&probe, &dev) == FAUXFAT_BLOCK_OK);
     assert(probe.media_generation == 1u);
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_BARE, NULL,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
     assert(opened.media_generation == 1u);
 
@@ -935,7 +1004,7 @@ static void test_media_generation_fencing(void)
     writes_before                      = media.write_calls;
     zeros_before                       = media.zero_calls;
     media.bump_generation_on_read_call = reads_before + 1u;
-    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_BARE, NULL,
+    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL,
                                 NULL, NULL, 0u) == FAUXFAT_BLOCK_ESTALE);
     assert(media.write_calls == writes_before);
     assert(media.zero_calls == zeros_before);
@@ -944,7 +1013,7 @@ static void test_media_generation_fencing(void)
     /* A replacement which occurs inside a backend write can only be detected
      * after that callback returns. It poisons the handle immediately; no
      * subsequent write through the old adapter reaches the backend. */
-    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_BARE, NULL,
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL,
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
     writes_before                       = media.write_calls;
     media.bump_generation_on_write_call = writes_before + 1u;
@@ -984,28 +1053,28 @@ static void test_mutating_callback_error_translation(void)
 
     media.fail_write_code = FAUXFAT_ESTRUCTURE;
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_EIO);
     media.fail_write_code = 0;
 
     media.fail_zero_code = FAUXGPT_ESTRUCTURE;
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_EIO);
     media.fail_zero_code = 0;
 
     media.fail_skip_code = FAUXGPT_EPARTITIONS;
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_EIO);
     media.fail_skip_code = 0;
 
     media.fail_flush_code = FAUXGPT_ENOTGPT;
     assert(fauxfat_block_format(
-               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
                FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
            FAUXFAT_BLOCK_EIO);
 
@@ -1014,6 +1083,7 @@ static void test_mutating_callback_error_translation(void)
 
 int main(void)
 {
+    test_gpt_geometry_planner();
     test_gpt_open_format_and_guards();
     test_probe_damage_conflict_and_io_isolation();
     test_bare_open_and_format();

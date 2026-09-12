@@ -62,12 +62,11 @@ typedef int (*fauxgpt_dev_write_fn)(void *context,
 typedef int (*fauxgpt_dev_flush_fn)(void *context);
 
 typedef struct fauxgpt_device {
+    fauxgpt_dev_read_fn read;
     fauxgpt_dev_write_fn write;
     /* Required by fauxgpt_format(); may be a no-op for synchronous media. */
     fauxgpt_dev_flush_fn flush;
     void *context;
-    /* Required by fauxgpt_open(). Appended to preserve old positional init. */
-    fauxgpt_dev_read_fn read;
 } fauxgpt_device;
 
 /* Parsed active GPT entry. Names are deliberately omitted from safety policy. */
@@ -176,10 +175,6 @@ int fauxgpt_geometry_matches(const fauxgpt_info *info,
  */
 int fauxgpt_identity_matches(const fauxgpt_info *info,
                              const fauxgpt_layout *expected);
-
-/* Compatibility spelling retained while callers migrate to the clearer name. */
-int fauxgpt_partitioning_matches(const fauxgpt_info *info,
-                                 const fauxgpt_layout *expected);
 
 /*
  * Render one whole-disk GPT metadata sector. Partition bodies are deliberately

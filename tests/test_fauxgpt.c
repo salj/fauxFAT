@@ -334,7 +334,6 @@ static void test_open_and_partition_match(void)
     assert(fauxgpt_geometry_matches(&info, &expected));
     assert(fauxgpt_identity_matches(&info, &expected));
     /* Compatibility spelling still means geometry, not identity. */
-    assert(fauxgpt_partitioning_matches(&info, &expected));
 
     /* One intact copy is enough to open; the missing copy is visible. */
     src.corrupt_lba = FAUXGPT_PRIMARY_HEADER_LBA;

@@ -472,7 +472,40 @@ Do not assume fauxFAT provides any of the following:
 
 Those omissions are the point of the design, not pending filesystem features.
 
-## 15. Open a bare or GPT-wrapped block device
+## 15. Plan canonical GPT placement
+
+The high-level block layer owns the appliance-specific placement policy. The
+low-level `fauxgpt` module deliberately does not. Use
+`fauxfat_block_plan_gpt()` to compute partition LBAs before constructing the GPT
+records:
+
+```c
+fauxfat_block_gpt_plan plan;
+
+rc = fauxfat_block_plan_gpt(&plan,
+                            card_blocks,
+                            fauxfat_block_count(&view),
+                            card_au_blocks,
+                            1); /* include user partition */
+```
+
+The planner chooses `max(2048, card_au_blocks)` 512-byte blocks as the
+alignment, puts fauxFAT at the first aligned LBA at or after GPT's first usable
+LBA, and optionally puts the user partition at the next aligned LBA and extends
+it through the final usable GPT LBA. A zero `card_au_blocks` means the card did
+not report an AU.
+
+The returned structure contains only geometry. It does not invent GUIDs, names,
+or partition types, and it does not silently grow fauxFAT. If the application
+wants no gap between partitions, size the anonymous fauxFAT tail first and call
+the planner again with the resulting final volume size. `partition_count` is 1
+or 2 and the user fields are zero when the user partition is omitted.
+
+The physical partition offset does not affect `fauxfat_block_count()`, so it is
+valid to compute the volume size first, plan the disk, assign
+`config.partition_lba = plan.fauxfat_first_lba`, then initialize the final view.
+
+## 16. Open a bare or GPT-wrapped block device
 
 `include/fauxfat_block.h` binds the bounded GPT reader to schema-free fauxFAT
 reopen. The physical device supplies its total block count plus the existing
@@ -496,7 +529,7 @@ fauxfat_block_device disk = {
 
 fauxfat_block_opened opened;
 rc = fauxfat_block_open(&opened, &disk,
-                        FAUXFAT_BLOCK_AUTO,
+                        FAUXFAT_BLOCK_WRAPPER_AUTO,
                         &expected_layout,
                         emit_file, ctx, &count);
 ```
@@ -520,7 +553,7 @@ bounded scan once, whether or not an emit callback is set, so
 open success does not depend on whether descriptor output happened to be
 requested.
 
-`FAUXFAT_BLOCK_AUTO` accepts either:
+`FAUXFAT_BLOCK_WRAPPER_AUTO` accepts either:
 
 - a bare fauxFAT volume beginning at physical LBA 0; or
 - the narrow GPT profile with one or two active partitions and fauxFAT in GPT
@@ -566,14 +599,14 @@ backend write callback, the library can detect that only when the callback
 returns; preventing such a write from reaching replacement media is the block
 driver/hotplug state machine's job.
 
-## 16. Publish or reformat a complete target
+## 17. Publish or reformat a complete target
 
 Formatting uses the same integration layer, but AUTO is forbidden. Destructive
 code must say whether it intends a bare volume or GPT:
 
 ```c
 rc = fauxfat_block_format(&view, &disk,
-                          FAUXFAT_BLOCK_GPT, &gpt,
+                          FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                           preserve, preserve_ctx, 0);
 ```
 
@@ -626,7 +659,7 @@ callback value is retained as `probe.backend_error` by
 successfully opened volume adapter. The lower-level `fauxfat` and `fauxgpt`
 APIs continue to propagate their callbacks unchanged.
 
-## 17. Repair only the GPT wrapper
+## 18. Repair only the GPT wrapper
 
 When the product already knows the intended GPT layout and partition-1
 fauxFAT identity, repair the wrapper without reformatting the volume:
@@ -650,7 +683,7 @@ API. Foreign geometry or identity must be handled by the explicit destructive
 formatting path instead of quietly smuggling repartitioning in under the word
 "repair".
 
-## 18. Low-level whole-card GPT API
+## 19. Low-level whole-card GPT API
 
 `include/fauxgpt.h` is deliberately separate from fauxFAT. It renders only the protective MBR, primary/backup GPT entry arrays, and primary/backup headers. It never reads or writes a partition body.
 
@@ -661,21 +694,20 @@ fauxgpt_partition parts[2] = {0};
 
 memcpy(parts[0].type_guid, fauxgpt_type_microsoft_basic_data, 16);
 memcpy(parts[0].unique_guid, app_partition_guid, 16);
-parts[0].first_lba = 2048;
-parts[0].block_count = fauxfat_block_count(&view);
+parts[0].first_lba = plan.fauxfat_first_lba;
+parts[0].block_count = plan.fauxfat_block_count;
 parts[0].name = "INGRESS";
 
 memcpy(parts[1].type_guid, fauxgpt_type_microsoft_basic_data, 16);
 memcpy(parts[1].unique_guid, user_partition_guid, 16);
-parts[1].first_lba = align_up(parts[0].first_lba + parts[0].block_count,
-                              alignment_blocks);
-parts[1].block_count = (card_blocks - 34) - parts[1].first_lba + 1;
+parts[1].first_lba = plan.user_first_lba;
+parts[1].block_count = plan.user_block_count;
 parts[1].name = "USER DATA";
 
 fauxgpt_layout layout = {
     .disk_blocks = card_blocks,
     .partitions = parts,
-    .partition_count = 2,
+    .partition_count = plan.partition_count,
 };
 memcpy(layout.disk_guid, card_guid, 16);
 
@@ -717,9 +749,8 @@ than two active partitions returns `FAUXGPT_EPARTITIONS`.
 
 `fauxgpt_geometry_matches()` performs the safety-geometry comparison used by
 the high-level block API. `fauxgpt_identity_matches()` separately compares the
-disk GUID and active partition unique GUIDs. The older
-`fauxgpt_partitioning_matches()` spelling remains an alias for geometry only;
-it does not quietly acquire identity semantics.
+disk GUID and active partition unique GUIDs. The API exposes only those two
+clear operations; the earlier ambiguous geometry helper spelling is gone.
 
 For physical provisioning, format/materialize firmware-owned partition content first, then publish GPT metadata:
 
