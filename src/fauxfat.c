@@ -545,10 +545,42 @@ static void ff_make_fat_block(const fauxfat_view *v,
     }
 }
 
+static int ff_locate_file_block(const fauxfat_view *v,
+                                uint32_t cluster,
+                                uint32_t block_in_cluster,
+                                size_t *file_index,
+                                uint64_t *file_offset,
+                                size_t *length);
+
 static int ff_read_file_block(const fauxfat_view *v,
                               uint32_t cluster,
                               uint32_t block_in_cluster,
                               uint8_t out[512])
+{
+    size_t file_index;
+    uint64_t file_offset;
+    size_t length;
+    int rc = ff_locate_file_block(v, cluster, block_in_cluster,
+                                  &file_index, &file_offset, &length);
+
+    if (rc != FAUXFAT_OK)
+        return rc;
+    if (file_offset > (uint64_t)SIZE_MAX)
+        return FAUXFAT_EGEOMETRY;
+
+    memset(out, 0, 512);
+    if (length)
+        memcpy(out, v->config->files[file_index].data + (size_t)file_offset,
+               length);
+    return FAUXFAT_OK;
+}
+
+static int ff_locate_file_block(const fauxfat_view *v,
+                                uint32_t cluster,
+                                uint32_t block_in_cluster,
+                                size_t *file_index,
+                                uint64_t *file_offset,
+                                size_t *length)
 {
     uint32_t first = v->data_first_cluster;
     size_t i;
@@ -556,23 +588,28 @@ static int ff_read_file_block(const fauxfat_view *v,
     for (i = 0; i < v->config->file_count; ++i) {
         const fauxfat_file *f = &v->config->files[i];
         uint32_t nclusters    = (uint32_t)ff_file_clusters(f);
+
         if (cluster >= first && cluster < first + nclusters) {
             uint64_t off = ((uint64_t)(cluster - first) * FAUXFAT_CLUSTER_SIZE) +
                            ((uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE);
             size_t n = 0;
 
-            memset(out, 0, 512);
             if (off < f->size) {
                 uint64_t left = f->size - off;
-                n             = left > 512u ? 512u : (size_t)left;
-                if (off > (uint64_t)SIZE_MAX)
-                    return FAUXFAT_EGEOMETRY;
-                memcpy(out, f->data + (size_t)off, n);
+                n             = left > FAUXFAT_BLOCK_SIZE ? FAUXFAT_BLOCK_SIZE : (size_t)left;
             }
+
+            if (file_index)
+                *file_index = i;
+            if (file_offset)
+                *file_offset = off;
+            if (length)
+                *length = n;
             return FAUXFAT_OK;
         }
         first += nclusters;
     }
+
     return FAUXFAT_EGEOMETRY;
 }
 
@@ -835,5 +872,99 @@ int fauxfat_read_blocks(const fauxfat_view *v,
         if (rc != FAUXFAT_OK)
             return rc;
     }
+    return FAUXFAT_OK;
+}
+
+int fauxfat_translate_write(const fauxfat_view *v,
+                            uint64_t block_address,
+                            fauxfat_write_mapping *mapping)
+{
+    uint64_t heap_rel;
+    uint32_t cluster;
+    uint32_t block_in_cluster;
+    size_t file_index;
+    uint64_t file_offset;
+    size_t length;
+    int rc;
+
+    if (!v || !v->config || !mapping)
+        return FAUXFAT_EINVAL;
+    if (block_address >= v->volume_blocks)
+        return FAUXFAT_ERANGE;
+    if (block_address < v->cluster_heap_block)
+        return FAUXFAT_EUNMAPPED;
+
+    heap_rel         = block_address - v->cluster_heap_block;
+    cluster          = 2u + (uint32_t)(heap_rel / FAUXFAT_BLOCKS_PER_CLUSTER);
+    block_in_cluster = (uint32_t)(heap_rel % FAUXFAT_BLOCKS_PER_CLUSTER);
+
+    if (cluster < v->data_first_cluster)
+        return FAUXFAT_EUNMAPPED;
+
+    rc = ff_locate_file_block(v, cluster, block_in_cluster,
+                              &file_index, &file_offset, &length);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    if (length == 0u)
+        return FAUXFAT_EUNMAPPED;
+    if (file_offset > (uint64_t)SIZE_MAX)
+        return FAUXFAT_EGEOMETRY;
+
+    mapping->file_index  = file_index;
+    mapping->file_offset = file_offset;
+    mapping->data        = v->config->files[file_index].data + (size_t)file_offset;
+    mapping->length      = length;
+    return FAUXFAT_OK;
+}
+
+int fauxfat_write_block(const fauxfat_view *v,
+                        uint64_t block_address,
+                        const uint8_t in[FAUXFAT_BLOCK_SIZE])
+{
+    fauxfat_write_mapping mapping;
+    int rc;
+
+    if (!in)
+        return FAUXFAT_EINVAL;
+
+    rc = fauxfat_translate_write(v, block_address, &mapping);
+    if (rc != FAUXFAT_OK)
+        return rc;
+
+    memmove(mapping.data, in, mapping.length);
+    return FAUXFAT_OK;
+}
+
+int fauxfat_write_blocks(const fauxfat_view *v,
+                         uint64_t first_block,
+                         size_t block_count,
+                         const uint8_t *in)
+{
+    size_t i;
+
+    if (!v || (!in && block_count))
+        return FAUXFAT_EINVAL;
+    if (block_count > SIZE_MAX / FAUXFAT_BLOCK_SIZE)
+        return FAUXFAT_ERANGE;
+    if ((uint64_t)block_count > UINT64_MAX - first_block ||
+        first_block + (uint64_t)block_count > v->volume_blocks)
+        return FAUXFAT_ERANGE;
+
+    /* Validate the complete request before changing any caller-owned bytes. */
+    for (i = 0; i < block_count; ++i) {
+        fauxfat_write_mapping mapping;
+        int rc = fauxfat_translate_write(v, first_block + i, &mapping);
+        if (rc != FAUXFAT_OK)
+            return rc;
+    }
+
+    for (i = 0; i < block_count; ++i) {
+        fauxfat_write_mapping mapping;
+        int rc = fauxfat_translate_write(v, first_block + i, &mapping);
+        if (rc != FAUXFAT_OK)
+            return rc;
+        memmove(mapping.data, in + i * FAUXFAT_BLOCK_SIZE, mapping.length);
+    }
+
     return FAUXFAT_OK;
 }

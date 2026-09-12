@@ -216,6 +216,42 @@ int main(void)
     assert(fauxfat_read_block(&view, config_block + 17u, b) == FAUXFAT_OK);
     assert(memcmp(b, config_data + 17u * 512u, sizeof(b)) == 0);
 
+    /* A disk write translates directly into a bounded caller-owned range. */
+    {
+        fauxfat_write_mapping m;
+        uint8_t in[512];
+
+        memset(in, 0x5au, sizeof(in));
+        assert(fauxfat_translate_write(&view, solver_block + 17u, &m) == FAUXFAT_OK);
+        assert(m.file_index == 0u);
+        assert(m.file_offset == 17u * 512u);
+        assert(m.data == solver + 17u * 512u);
+        assert(m.length == 512u);
+
+        assert(fauxfat_write_block(&view, solver_block + 17u, in) == FAUXFAT_OK);
+        assert(memcmp(solver + 17u * 512u, in, sizeof(in)) == 0);
+        assert(fauxfat_read_block(&view, solver_block + 17u, b) == FAUXFAT_OK);
+        assert(memcmp(b, in, sizeof(in)) == 0);
+
+        assert(fauxfat_translate_write(&view, 0u, &m) == FAUXFAT_EUNMAPPED);
+        assert(fauxfat_write_block(&view, root_block, in) == FAUXFAT_EUNMAPPED);
+        assert(fauxfat_translate_write(&view, view.volume_blocks, &m) == FAUXFAT_ERANGE);
+    }
+
+    /* Adjacent requests may cross between adjacent file extents. */
+    {
+        uint8_t in[1024];
+        uint64_t last_solver_block = solver_block +
+                                     (sizeof(solver) / FAUXFAT_BLOCK_SIZE) - 1u;
+
+        memset(in, 0x61u, 512u);
+        memset(in + 512u, 0x7cu, 512u);
+        assert(last_solver_block + 1u == config_block);
+        assert(fauxfat_write_blocks(&view, last_solver_block, 2u, in) == FAUXFAT_OK);
+        assert(memcmp(solver + sizeof(solver) - 512u, in, 512u) == 0);
+        assert(memcmp(config_data, in + 512u, 512u) == 0);
+    }
+
     assert(fauxfat_read_block(&view, view.volume_blocks, b) == FAUXFAT_ERANGE);
 
     /* v1 refuses names or capacities which would mutate the manufactured map. */
@@ -246,6 +282,41 @@ int main(void)
         assert(fauxfat_read_block(&short_view, data_block + 3u, b) == FAUXFAT_OK);
         for (i = 0; i < 512u; ++i)
             assert(b[i] == 0u);
+
+        /* Last-sector writes are clipped at DataLength, not backing-buffer size. */
+        {
+            fauxfat_write_mapping m;
+            uint8_t in[512];
+            uint8_t before[210];
+
+            memset(in, 0xa5u, sizeof(in));
+            assert(fauxfat_translate_write(&short_view, data_block + 2u, &m) == FAUXFAT_OK);
+            assert(m.file_index == 0u);
+            assert(m.file_offset == 1024u);
+            assert(m.data == short_data + 1024u);
+            assert(m.length == 210u);
+            assert(fauxfat_write_block(&short_view, data_block + 2u, in) == FAUXFAT_OK);
+            for (i = 1024u; i < sizeof(short_data); ++i)
+                assert(short_data[i] == 0xa5u);
+            assert(fauxfat_read_block(&short_view, data_block + 2u, b) == FAUXFAT_OK);
+            for (i = 0; i < 210u; ++i)
+                assert(b[i] == 0xa5u);
+            for (i = 210u; i < 512u; ++i)
+                assert(b[i] == 0u);
+
+            assert(fauxfat_translate_write(&short_view, data_block + 3u, &m) ==
+                   FAUXFAT_EUNMAPPED);
+
+            /* Multi-block writes preflight the full mapping before mutation. */
+            memcpy(before, short_data + 1024u, sizeof(before));
+            {
+                uint8_t two[1024];
+                memset(two, 0x3cu, sizeof(two));
+                assert(fauxfat_write_blocks(&short_view, data_block + 2u, 2u, two) ==
+                       FAUXFAT_EUNMAPPED);
+            }
+            assert(memcmp(before, short_data + 1024u, sizeof(before)) == 0);
+        }
     }
 
     puts("fauxfat tests: ok");
