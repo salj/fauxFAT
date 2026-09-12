@@ -22,6 +22,8 @@ typedef struct memdev {
     uint64_t generation;
     uint64_t bump_generation_on_read_call;
     uint64_t bump_generation_on_write_call;
+    uint64_t drop_write_lba;
+    int drop_write_enabled;
 } memdev;
 
 static int mem_read(void *context, uint64_t first_block,
@@ -54,8 +56,9 @@ static int mem_write(void *context, uint64_t first_block,
         return m->fail_write_code;
     if (first_block > m->blocks || count > m->blocks - first_block)
         return -102;
-    memcpy(m->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE), data,
-           block_count * FAUXFAT_BLOCK_SIZE);
+    if (!(m->drop_write_enabled && first_block == m->drop_write_lba))
+        memcpy(m->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE), data,
+               block_count * FAUXFAT_BLOCK_SIZE);
     if (m->bump_generation_on_write_call != 0u &&
         m->write_calls == m->bump_generation_on_write_call)
         ++m->generation;
@@ -266,6 +269,21 @@ static void test_gpt_open_format_and_guards(void)
     rc = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
                               NULL, NULL,
                               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA);
+    assert(rc == FAUXFAT_BLOCK_OK);
+    assert(media.data[user_probe * FAUXFAT_BLOCK_SIZE + 3u] == 0x5au);
+
+    /* GPT formatting verifies its exact wrapper as well as strict fauxFAT. */
+    media.data[510u]         = 0u;
+    media.drop_write_enabled = 1;
+    media.drop_write_lba     = 0u;
+    rc                       = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
+                                                    NULL, NULL,
+                                                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA);
+    assert(rc == FAUXFAT_BLOCK_EVERIFY);
+    media.drop_write_enabled = 0;
+    rc                       = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
+                                                    NULL, NULL,
+                                                    FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA);
     assert(rc == FAUXFAT_BLOCK_OK);
     assert(media.data[user_probe * FAUXFAT_BLOCK_SIZE + 3u] == 0x5au);
 
@@ -696,6 +714,76 @@ static void test_bare_open_and_format(void)
     free(media.data);
 }
 
+static void test_post_format_verification(void)
+{
+    fauxfat_config cfg;
+    fauxfat_view view;
+    fauxfat_block_device dev;
+    memdev media;
+    size_t bytes;
+
+    init_fauxfat(&cfg, &view, 0u);
+    bytes = (size_t)(view.volume_blocks * FAUXFAT_BLOCK_SIZE);
+    memset(&media, 0, sizeof(media));
+    media.blocks = view.volume_blocks;
+    media.data   = (uint8_t *)calloc(1u, bytes);
+    assert(media.data != NULL);
+
+    memset(&dev, 0, sizeof(dev));
+    dev.block_count = media.blocks;
+    dev.io.read     = mem_read;
+    dev.io.write    = mem_write;
+    dev.io.zero     = mem_zero;
+    dev.io.skip     = mem_skip;
+    dev.io.context  = &media;
+    dev.flush       = mem_flush;
+
+    /* The high-level safety API requires a real durability boundary and then
+     * reads back what it just wrote. A synchronous backend may supply a no-op
+     * flush, but omitting the contract entirely is not accepted. */
+    dev.flush = NULL;
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_EINVAL);
+    dev.flush   = mem_flush;
+    dev.io.read = NULL;
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_EINVAL);
+    dev.io.read = mem_read;
+
+    /* A backend which reports successful writes but drops a generated block
+     * is a verification failure, not success and not a parser-policy error. */
+    media.drop_write_enabled = 1;
+    media.drop_write_lba     = 0u;
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_EVERIFY);
+    media.drop_write_enabled = 0;
+
+    /* A real read failure during verification remains I/O, rather than being
+     * misreported as a mismatching materialization. */
+    memset(media.data, 0, bytes);
+    media.read_calls     = 0u;
+    media.fail_read_call = 1u;
+    media.fail_read_code = -5;
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_EIO);
+    media.fail_read_call = 0u;
+    media.fail_read_code = 0;
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_WRAPPER_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_OK);
+
+    free(media.data);
+}
+
 static void test_gpt_wrapper_repair(void)
 {
     fauxfat_config cfg;
@@ -751,6 +839,19 @@ static void test_gpt_wrapper_repair(void)
 
     /* Repair has no use for the sparse formatter's zero callback. */
     dev.io.zero = NULL;
+
+    /* Repair also reads back the wrapper. A backend that silently drops the
+     * primary-header rewrite must not turn a damaged GPT into reported success. */
+    media.data[FAUXGPT_PRIMARY_HEADER_LBA * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
+    media.drop_write_enabled = 1;
+    media.drop_write_lba     = FAUXGPT_PRIMARY_HEADER_LBA;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+           FAUXFAT_BLOCK_EVERIFY);
+    assert(memcmp(body_snapshot,
+                  media.data + (size_t)(p1_first * FAUXFAT_BLOCK_SIZE),
+                  body_bytes) == 0);
+    media.drop_write_enabled = 0;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) == FAUXFAT_BLOCK_OK);
 
     /* One bad copy, or only the PMBR, is ordinary wrapper repair. */
     media.data[FAUXGPT_PRIMARY_HEADER_LBA * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
@@ -1087,6 +1188,7 @@ int main(void)
     test_gpt_open_format_and_guards();
     test_probe_damage_conflict_and_io_isolation();
     test_bare_open_and_format();
+    test_post_format_verification();
     test_gpt_wrapper_repair();
     test_media_generation_fencing();
     test_mutating_callback_error_translation();

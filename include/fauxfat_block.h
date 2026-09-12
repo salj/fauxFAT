@@ -20,7 +20,7 @@ typedef uint64_t (*fauxfat_block_generation_fn)(void *context);
 typedef struct fauxfat_block_device {
     uint64_t block_count;
     fauxfat_device io;
-    /* Required for GPT formatting; optional for read/open and bare formatting. */
+    /* Required for whole-device formatting and GPT repair. */
     fauxgpt_dev_flush_fn flush;
     /* Optional. Called with io.context before/after raw I/O to detect swaps. */
     fauxfat_block_generation_fn generation;
@@ -127,7 +127,9 @@ enum {
     /* Geometry is acceptable, but stable fauxFAT/GPT identity differs. */
     FAUXFAT_BLOCK_EIDENTITY = -38,
     /* Optional media generation changed during or after opening an operation. */
-    FAUXFAT_BLOCK_ESTALE = -39
+    FAUXFAT_BLOCK_ESTALE = -39,
+    /* Post-mutation readback did not match the requested materialization. */
+    FAUXFAT_BLOCK_EVERIFY = -40
 };
 
 enum {
@@ -199,6 +201,14 @@ int fauxfat_block_open(fauxfat_block_opened *opened,
  * Unknown/blank media therefore needs explicit destructive authorization too;
  * absence of recognizable metadata is not proof that the device contains
  * nothing valuable.
+ *
+ * Formatting always requires device.io.read/write/zero plus device.flush.
+ * After the final durability barrier, the whole-device layer reads the result
+ * back: the fauxFAT presentation must pass strict validation against `view`,
+ * and GPT
+ * metadata (when requested) must exactly match the rendered GPT plus reopen as
+ * the requested geometry/identity. A successful backend write followed by a
+ * mismatching readback returns FAUXFAT_BLOCK_EVERIFY.
  *
  * GPT formatting requires gpt, requires partition entry 0 to exactly cover
  * view, materializes fauxFAT first, flushes it, then publishes GPT metadata.

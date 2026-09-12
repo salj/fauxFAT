@@ -613,8 +613,9 @@ static int fb_format_profile_valid(const fauxfat_view *view,
 {
     uint64_t volume_blocks;
 
-    if (!view || !view->config || !device || !device->io.write ||
-        !device->io.zero || device->block_count == 0u)
+    if (!view || !view->config || !device || !device->io.read ||
+        !device->io.write || !device->io.zero || !device->flush ||
+        device->block_count == 0u)
         return 0;
     volume_blocks = fauxfat_block_count(view);
 
@@ -633,6 +634,52 @@ static int fb_fauxfat_identity_matches(const fauxfat_reopen_info *actual,
            actual->volume_serial == expected->config->volume_serial &&
            memcmp(actual->volume_guid,
                   expected->config->volume_guid, 16u) == 0;
+}
+
+static int fb_verify_fauxfat_materialization(const fauxfat_view *view,
+                                             fauxfat_block_opened *target)
+{
+    fauxfat_volume_class classification = FAUXFAT_VOLUME_INVALID;
+    int rc;
+
+    rc = fauxfat_validate_strict(view, &target->volume_device, &classification);
+    if (rc == FAUXFAT_BLOCK_EIO || rc == FAUXFAT_BLOCK_ESTALE)
+        return rc;
+    if (rc != FAUXFAT_OK || classification != FAUXFAT_VOLUME_FAUXFAT_VALID)
+        return FAUXFAT_BLOCK_EVERIFY;
+    return fb_check_generation(&target->raw, target->media_generation);
+}
+
+static int fb_verify_gpt_materialization(const fauxgpt_view *gpt,
+                                         fauxfat_block_opened *target)
+{
+    fauxgpt_device gd;
+    fauxgpt_info actual;
+    unsigned required = FAUXGPT_INFO_PRIMARY_VALID |
+                        FAUXGPT_INFO_BACKUP_VALID |
+                        FAUXGPT_INFO_PMBR_VALID;
+    int rc;
+
+    memset(&gd, 0, sizeof(gd));
+    gd.read    = fb_raw_read;
+    gd.context = target;
+
+    rc = fauxgpt_verify(gpt, &gd);
+    if (rc == FAUXFAT_BLOCK_EIO || rc == FAUXFAT_BLOCK_ESTALE)
+        return rc;
+    if (rc != FAUXGPT_OK)
+        return FAUXFAT_BLOCK_EVERIFY;
+
+    memset(&actual, 0, sizeof(actual));
+    rc = fauxgpt_open(&actual, &gd, target->raw.block_count);
+    if (rc == FAUXFAT_BLOCK_EIO || rc == FAUXFAT_BLOCK_ESTALE)
+        return rc;
+    if (rc != FAUXGPT_OK || (actual.flags & required) != required ||
+        !fauxgpt_geometry_matches(&actual, gpt->layout) ||
+        !fauxgpt_identity_matches(&actual, gpt->layout))
+        return FAUXFAT_BLOCK_EVERIFY;
+
+    return fb_check_generation(&target->raw, target->media_generation);
 }
 
 static int fb_format_preflight(const fauxfat_view *view,
@@ -714,9 +761,10 @@ int fauxfat_block_format(const fauxfat_view *view,
         return rc;
 
     if (wrapper == FAUXFAT_BLOCK_WRAPPER_BARE) {
-        if (device->flush)
-            return fb_raw_flush(&target);
-        return fb_check_generation(device, media_generation);
+        rc = fb_raw_flush(&target);
+        if (rc != FAUXFAT_BLOCK_OK)
+            return rc;
+        return fb_verify_fauxfat_materialization(view, &target);
     }
 
     rc = fb_raw_flush(&target);
@@ -730,7 +778,10 @@ int fauxfat_block_format(const fauxfat_view *view,
     rc         = fauxgpt_format(gpt, &gd);
     if (rc != FAUXGPT_OK)
         return rc;
-    return fb_check_generation(device, media_generation);
+    rc = fb_verify_gpt_materialization(gpt, &target);
+    if (rc != FAUXFAT_BLOCK_OK)
+        return rc;
+    return fb_verify_fauxfat_materialization(view, &target);
 }
 
 int fauxfat_block_repair_gpt(const fauxfat_view *expected_volume,
@@ -821,5 +872,5 @@ int fauxfat_block_repair_gpt(const fauxfat_view *expected_volume,
     rc = fauxgpt_format(expected_gpt, &gd);
     if (rc != FAUXGPT_OK)
         return rc;
-    return fb_check_generation(device, media_generation);
+    return fb_verify_gpt_materialization(expected_gpt, &target);
 }

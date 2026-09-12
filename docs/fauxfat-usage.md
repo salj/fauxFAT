@@ -639,6 +639,18 @@ The formatter materializes fauxFAT first, flushes it, then publishes GPT via
 the backup-array/header -> flush -> primary-array/header/PMBR -> flush sequence.
 Partition entry 1 is never formatted or otherwise touched by this API.
 
+Unlike the lower-level `fauxfat_format()` renderer, `fauxfat_block_format()` is
+a safety boundary and therefore requires `disk.io.read` and `disk.flush` as
+well as write/zero. Synchronous media can provide a no-op flush callback, but
+the durability contract is explicit rather than inferred. After the last flush
+it reads the result back before reporting success. The fauxFAT partition must
+pass `fauxfat_validate_strict()` against the requested view. GPT output must
+also exactly match every rendered GPT metadata sector and reopen through the
+bounded parser with both copies plus the PMBR valid and the requested geometry
+and stable GUID identity. A successful write callback followed by mismatching
+readback returns `FAUXFAT_BLOCK_EVERIFY`; a real read failure is still
+`FAUXFAT_BLOCK_EIO`, and media replacement is still `FAUXFAT_BLOCK_ESTALE`.
+
 `FAUXFAT_BLOCK_FORMAT_ZERO_UNDEFINED` maps to the existing fauxFAT
 reproducibility flag. `DESTROY_USER_DATA` authorizes destructive replacement;
 it does not turn fauxFAT preserve ranges or the user partition into erase
@@ -650,6 +662,8 @@ whose partition map is unacceptable, and `FAUXFAT_BLOCK_ENOTFAUXFAT` when the
 candidate volume lacks recognizable fauxFAT identity.
 `FAUXFAT_BLOCK_EIDENTITY` means the wrapper/geometry is acceptable but one of
 the stable ownership identifiers differs from the requested format target.
+`FAUXFAT_BLOCK_EVERIFY` means a format or GPT repair completed its mutation
+callbacks but immediate readback did not match the requested materialization.
 `FAUXFAT_BLOCK_ESTALE` means the optional media-generation token changed
 during the operation or after an opened adapter was created. Raw block callback
 failures are translated to `FAUXFAT_BLOCK_EIO`, so an SD/backend errno such as
@@ -678,7 +692,9 @@ partition GUIDs. Two valid copies which disagree are refused as ambiguous.
 If both GPT copies are damaged or missing, exact partition-1 identity is enough
 to reconstruct the protective MBR and both GPT copies. The operation writes
 only GPT metadata, backup first, and never calls the fauxFAT formatter or
-writes either partition body. There is no `DESTROY_USER_DATA` option on this
+writes either partition body. Before returning success it reads every GPT
+metadata sector back and requires an exact match to the authoritative view.
+There is no `DESTROY_USER_DATA` option on this
 API. Foreign geometry or identity must be handled by the explicit destructive
 formatting path instead of quietly smuggling repartitioning in under the word
 "repair".
@@ -742,7 +758,10 @@ result instead of being collapsed immediately into `FAUXGPT_ESTRUCTURE`.
 policy to that observation.
 
 `fauxgpt_open()` validates the canonical header geometry, header CRCs, complete
-128-entry array CRCs, and active entry ranges. Either primary or backup GPT is
+128-entry array CRCs, and active entry ranges. `fauxgpt_verify()` is the stricter
+immediate-materialization check: it reads only GPT metadata sectors and requires
+them to match `fauxgpt_render_block()` byte-for-byte, including names and unused
+metadata bytes. Either primary or backup GPT is
 enough to open a degraded disk; `gi.flags` says which copies and whether the
 protective MBR are valid. If both GPT copies validate they must agree. More
 than two active partitions returns `FAUXGPT_EPARTITIONS`.

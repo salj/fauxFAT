@@ -54,6 +54,7 @@ typedef struct render_source {
     const fauxgpt_view *backup_view;
     uint64_t corrupt_lba;
     int corrupt_pmbr;
+    int fail_read_code;
 } render_source;
 
 static int render_read(void *context, uint64_t first_block,
@@ -63,6 +64,8 @@ static int render_read(void *context, uint64_t first_block,
     uint8_t *out       = (uint8_t *)data;
     size_t i;
 
+    if (src->fail_read_code != 0)
+        return src->fail_read_code;
     for (i = 0u; i < block_count; ++i) {
         uint64_t lba             = first_block + i;
         const fauxgpt_view *view = src->view;
@@ -249,6 +252,27 @@ static void test_render_and_format(void)
     for (i = 0u; i < log.writes; ++i) {
         assert(log.lba[i] < FAUXGPT_FIRST_USABLE_LBA ||
                log.lba[i] > view.last_usable_lba);
+    }
+
+    /* Immediate verification is exact, including names and unused metadata
+     * bytes, because a host has not yet been allowed to mutate the disk. */
+    {
+        render_source src;
+        fauxgpt_device verify_dev;
+
+        memset(&src, 0, sizeof(src));
+        src.view        = &view;
+        src.corrupt_lba = UINT64_MAX;
+        memset(&verify_dev, 0, sizeof(verify_dev));
+        verify_dev.read    = render_read;
+        verify_dev.context = &src;
+
+        assert(fauxgpt_verify(&view, &verify_dev) == FAUXGPT_OK);
+        src.corrupt_lba = FAUXGPT_PRIMARY_HEADER_LBA;
+        assert(fauxgpt_verify(&view, &verify_dev) == FAUXGPT_ESTRUCTURE);
+        src.corrupt_lba    = UINT64_MAX;
+        src.fail_read_code = -123;
+        assert(fauxgpt_verify(&view, &verify_dev) == -123);
     }
 }
 

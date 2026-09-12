@@ -609,6 +609,52 @@ static int fg_write_block(const fauxgpt_view *view,
     return device->write(device->context, lba, 1u, block);
 }
 
+static int fg_verify_block(const fauxgpt_view *view,
+                           const fauxgpt_device *device,
+                           uint64_t lba)
+{
+    uint8_t expected[FAUXGPT_BLOCK_SIZE];
+    uint8_t actual[FAUXGPT_BLOCK_SIZE];
+    int rc;
+
+    rc = fauxgpt_render_block(view, lba, expected);
+    if (rc != FAUXGPT_OK)
+        return rc;
+    rc = fg_dev_read(device, lba, 1u, actual);
+    if (rc != 0)
+        return rc;
+    return memcmp(expected, actual, sizeof(expected)) == 0 ? FAUXGPT_OK : FAUXGPT_ESTRUCTURE;
+}
+
+int fauxgpt_verify(const fauxgpt_view *view, const fauxgpt_device *device)
+{
+    uint64_t lba;
+    int rc;
+
+    if (!view || !view->layout || !device || !device->read)
+        return FAUXGPT_EINVAL;
+
+    rc = fg_verify_block(view, device, 0u);
+    if (rc != FAUXGPT_OK)
+        return rc;
+    rc = fg_verify_block(view, device, FAUXGPT_PRIMARY_HEADER_LBA);
+    if (rc != FAUXGPT_OK)
+        return rc;
+    for (lba = FAUXGPT_PRIMARY_ARRAY_LBA;
+         lba < FAUXGPT_PRIMARY_ARRAY_LBA + FAUXGPT_ENTRY_ARRAY_BLOCKS;
+         ++lba) {
+        rc = fg_verify_block(view, device, lba);
+        if (rc != FAUXGPT_OK)
+            return rc;
+    }
+    for (lba = view->backup_array_lba; lba <= view->backup_header_lba; ++lba) {
+        rc = fg_verify_block(view, device, lba);
+        if (rc != FAUXGPT_OK)
+            return rc;
+    }
+    return FAUXGPT_OK;
+}
+
 int fauxgpt_format(const fauxgpt_view *view, const fauxgpt_device *device)
 {
     uint8_t block[FAUXGPT_BLOCK_SIZE];

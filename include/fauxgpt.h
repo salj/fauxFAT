@@ -185,6 +185,15 @@ int fauxgpt_render_block(const fauxgpt_view *view,
                          uint8_t out[FAUXGPT_BLOCK_SIZE]);
 
 /*
+ * Read back every metadata sector rendered by `view` and require an exact
+ * byte-for-byte match. This is intended for immediate post-format/repair
+ * verification, before a host has had any opportunity to rewrite harmless
+ * presentation fields such as partition names. Partition bodies are never
+ * read. Device callback errors are propagated unchanged.
+ */
+int fauxgpt_verify(const fauxgpt_view *view, const fauxgpt_device *device);
+
+/*
  * Materialize only GPT metadata, backup copy first:
  *
  *   backup array, backup header, flush,
