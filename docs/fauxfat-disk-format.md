@@ -152,7 +152,7 @@ The main OEM Parameters sector is sector 9 and the backup copy is sector 21. Bot
 
 There are ten 48-byte OEM parameter records. fauxFAT v1 uses the first two and writes Null Parameters to the remaining eight.
 
-### 5.1 Parameter 0: map SHA-256
+### 5.1 Parameter 0: structural map fingerprint
 
 GUID:
 
@@ -161,15 +161,16 @@ GUID:
 on-disk bytes: E7 E6 5B 99 45 34 DC 46 A2 13 74 D9 85 B3 01 34
 ```
 
-Its 32-byte `CustomDefined` payload is:
+Its 32-byte `CustomDefined` payload is exactly:
 
-```
-SHA256(fauxfat_map_bytes)
-```
+| Offset | Size | Meaning |
+|---:|---:|---|
+| 0 | 4 | XXH32 of `fauxfat_map_bytes`, seed `0x00000000` |
+| 4 | 28 | zero |
 
-`fauxfat_map_bytes` is defined in section 11. It is derived directly from the on-disk boot geometry, FAT, Allocation Bitmap, and root directory after masking the explicitly host-mutable file metadata.
+`fauxfat_map_bytes` is defined in section 11. It is derived directly from the on-disk boot geometry, FAT, Allocation Bitmap, Up-case Table, and root directory after masking the explicitly host-mutable file metadata. The XXH32 value is the fauxFAT structural fingerprint. This is an accidental-corruption/unaware-writer detector, not an authentication mechanism.
 
-### 5.2 Parameter 1: epoch and component CRCs
+### 5.2 Parameter 1: epoch and component fingerprints
 
 GUID:
 
@@ -186,12 +187,12 @@ Its 32-byte `CustomDefined` payload is exactly:
 | 4 | 2 | format version = 1 |
 | 6 | 2 | flags = 0 |
 | 8 | 8 | little-endian structural epoch |
-| 16 | 4 | CRC32C of canonical FAT bytes |
-| 20 | 4 | CRC32C of Allocation Bitmap meaningful bytes |
-| 24 | 4 | CRC32C of canonicalized root cluster |
-| 28 | 4 | CRC32C of bytes 0..27 of this payload |
+| 16 | 4 | XXH32 of canonical FAT bytes, seed `0x46415431` |
+| 20 | 4 | XXH32 of Allocation Bitmap meaningful bytes, seed `0x42495431` |
+| 24 | 4 | XXH32 of canonicalized root cluster, seed `0x524F4F54` |
+| 28 | 4 | XXH32 of exact Up-case Table bytes, seed `0x55504331` |
 
-All CRC fields use CRC-32C/Castagnoli. The SHA field uses ordinary SHA-256.
+All fauxFAT-private hashes use standard XXH32. exFAT-mandated boot checksums, directory-set checksums, NameHash, and Up-case Table checksum retain their native exFAT algorithms.
 
 The structural epoch changes only when the device intentionally changes the fauxFAT structure: file slot activation/deactivation, file extent movement/resize, public/private range reclassification, or other material layout changes. Ordinary host writes to file contents do not change it.
 
@@ -513,7 +514,7 @@ Deleting the hidden descriptor File set is structural damage. The exFAT specific
 
 ## 11. Structural seal computation
 
-The OEM SHA-256 and component CRCs are computed from disk structures, not from a separate manifest serialization.
+The OEM XXH32 structural and component fingerprints are computed from disk structures, not from a separate manifest serialization.
 
 ### 11.1 Canonical FAT bytes
 
@@ -554,9 +555,9 @@ padding entries
 system entries
 ```
 
-Then CRC32C the 65536 canonicalized root bytes.
+XXH32 the 65536 canonicalized root bytes with seed `0x524F4F54`.
 
-### 11.4 Map SHA-256 input
+### 11.4 Map XXH32 input
 
 `fauxfat_map_bytes` is the byte concatenation:
 
@@ -572,7 +573,9 @@ canonicalized root cluster
 
 The current `VolumeFlags` and `PercentInUse` are intentionally absent.
 
-The SHA-256 of that exact byte stream is OEM Parameter 0.
+For `N = ClusterCount`, the map input length is `65726 + 4*N + ceil(N/8)` bytes: 65,726 fixed bytes, four FAT bytes per cluster (plus the two reserved FAT entries), and one allocation-bitmap bit per cluster. With 64 KiB clusters this is about 66 KiB per GiB of volume plus the fixed ~64 KiB root/geometry overhead. A ~4 GiB volume therefore hashes about 328 KiB; a 32 GiB volume hashes about 2.1 MiB. Payload bytes are never included.
+
+Compute one XXH32 over that exact byte stream with seed `0x00000000`. Store the 32-bit result in OEM Parameter 0. The seal is only a non-adversarial structural fingerprint; the verifier also checks the structural invariants and exFAT-native checksums directly, so fauxFAT deliberately does not spend another 32 bits on a second map hash.
 
 This seal detects every change to physical extent ownership, file positions/sizes/names, FAT bad-cluster reservations, root slot use, the fauxFAT case-folding table, filesystem metadata chains, and geometry while tolerating ordinary timestamp/archive updates.
 
@@ -602,7 +605,7 @@ To create another small predefined file from the tail while the card is private:
 3. keep all Allocation Bitmap bits at `1`;
 4. replace one three-entry padding slot with a valid `0x85/0xC0/0xC1` file set pointing at that range;
 5. increment the structural epoch;
-6. recompute FAT/root CRCs and map SHA-256;
+6. recompute FAT/root/bitmap/upcase XXH32 component fingerprints and the map fingerprint;
 7. update both OEM sectors and both boot checksums;
 8. validate the rebuilt façade before exposing it.
 
@@ -685,7 +688,7 @@ Strict validation performs this bounded sequence:
 5. verify the root is exactly one cluster and FAT-chained EOC;
 6. verify every root entry is one of the expected system entries, public file sets, fauxFAT opaque descriptor sets, or canonical `0xA1` padding;
 7. verify each public/opaque File set checksum and permit only the host-mutable timestamp/archive fields listed above;
-8. recompute FAT CRC, bitmap CRC, canonical root CRC, and map SHA-256;
+8. recompute FAT, bitmap, root, and upcase XXH32 component fingerprints and the map fingerprint;
 9. compare those values to OEM Parameters;
 10. only then inspect candidate file payloads.
 

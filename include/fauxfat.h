@@ -118,11 +118,12 @@ typedef struct fauxfat_view {
     uint32_t cluster_heap_block;
     uint64_t volume_blocks;
 
-    uint32_t fat_crc32c;
-    uint32_t bitmap_crc32c;
-    uint32_t root_crc32c;
+    uint32_t map_xxh32;
+    uint32_t fat_xxh32;
+    uint32_t bitmap_xxh32;
+    uint32_t root_xxh32;
+    uint32_t upcase_xxh32;
     uint32_t upcase_checksum;
-    uint8_t map_sha256[32];
     uint32_t boot_checksum;
 } fauxfat_view;
 

@@ -272,6 +272,12 @@ int main(void)
     assert(view.fat_length_blocks == 128u);
     assert(view.cluster_heap_block == 256u);
     assert(view.volume_blocks == 1024u);
+    /* Fixed fauxFAT-private XXH32 test vector, checked against libxxhash. */
+    assert(view.map_xxh32 == 0xe1067e84u);
+    assert(view.fat_xxh32 == 0xd0470b77u);
+    assert(view.bitmap_xxh32 == 0x080118f4u);
+    assert(view.root_xxh32 == 0x00831099u);
+    assert(view.upcase_xxh32 == 0x70b6935bu);
     assert(fauxfat_block_count(&view) == 1024u);
     assert(fauxfat_disk_file_count(&view) == 2u);
     {
@@ -306,12 +312,17 @@ int main(void)
 
     assert(fauxfat_read_block(&view, 9, b) == FAUXFAT_OK);
     assert(memcmp(b, "\xe7\xe6\x5b\x99\x45\x34\xdc\x46\xa2\x13\x74\xd9\x85\xb3\x01\x34", 16) == 0);
+    assert(load32(b + 16) == view.map_xxh32);
+    assert(load32(b + 20) == 0u);
+    for (i = 24; i < 48; ++i)
+        assert(b[i] == 0u);
     assert(memcmp(b + 64, "FFV1", 4) == 0);
     assert(load16(b + 68) == 1u);
     assert(load64(b + 72) == 0x1122334455667788ull);
-    assert(load32(b + 80) == view.fat_crc32c);
-    assert(load32(b + 84) == view.bitmap_crc32c);
-    assert(load32(b + 88) == view.root_crc32c);
+    assert(load32(b + 80) == view.fat_xxh32);
+    assert(load32(b + 84) == view.bitmap_xxh32);
+    assert(load32(b + 88) == view.root_xxh32);
+    assert(load32(b + 92) == view.upcase_xxh32);
 
     assert(boot_checksum(&view) == view.boot_checksum);
     assert(fauxfat_read_block(&view, 11, b) == FAUXFAT_OK);

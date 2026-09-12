@@ -12,6 +12,18 @@
 #define FF_FAT_EOC            0xffffffffu
 #define FF_MAX_CLUSTER_COUNT  0xfffffff5u
 
+#define FF_XXH32_PRIME1 0x9e3779b1u
+#define FF_XXH32_PRIME2 0x85ebca77u
+#define FF_XXH32_PRIME3 0xc2b2ae3du
+#define FF_XXH32_PRIME4 0x27d4eb2fu
+#define FF_XXH32_PRIME5 0x165667b1u
+
+#define FF_XXH32_MAP_SEED    0x00000000u
+#define FF_XXH32_FAT_SEED    0x46415431u /* "FAT1" */
+#define FF_XXH32_BITMAP_SEED 0x42495431u /* "BIT1" */
+#define FF_XXH32_ROOT_SEED   0x524f4f54u /* "ROOT" */
+#define FF_XXH32_UPCASE_SEED 0x55504331u /* "UPC1" */
+
 #define FF_ENTRY_BITMAP       0x81u
 #define FF_ENTRY_UPCASE       0x82u
 #define FF_ENTRY_LABEL        0x83u
@@ -68,6 +80,19 @@ static void ff_store64(uint8_t *p, uint64_t v)
 {
     ff_store32(p, (uint32_t)v);
     ff_store32(p + 4, (uint32_t)(v >> 32));
+}
+
+static uint32_t ff_load32(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint32_t ff_rol32(uint32_t v, unsigned n)
+{
+    return (v << n) | (v >> (32u - n));
 }
 
 static uint16_t ff_ror16(uint16_t v)
@@ -340,161 +365,113 @@ static uint16_t ff_entry_set_checksum(const uint8_t *p, size_t bytes)
     return sum;
 }
 
-/* CRC-32C/Castagnoli, reflected polynomial, initial/final xor all ones. */
-static uint32_t ff_crc32c_update(uint32_t crc, const uint8_t *p, size_t n)
-{
-    size_t i;
-    unsigned bit;
+/*
+ * Streaming XXH32.  fauxFAT uses this only for its private structural seal;
+ * exFAT's mandated boot, directory-set, NameHash, and up-case checksums remain
+ * their native algorithms.
+ */
+typedef struct ff_xxh32 {
+    uint32_t total_len;
+    uint32_t v1;
+    uint32_t v2;
+    uint32_t v3;
+    uint32_t v4;
+    uint8_t mem[16];
+    uint8_t memsize;
+    uint8_t large_len;
+} ff_xxh32;
 
-    for (i = 0; i < n; ++i) {
-        crc ^= p[i];
-        for (bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
-    }
-    return crc;
+static uint32_t ff_xxh32_round(uint32_t acc, uint32_t input)
+{
+    acc += input * FF_XXH32_PRIME2;
+    acc = ff_rol32(acc, 13u);
+    return acc * FF_XXH32_PRIME1;
 }
 
-static uint32_t ff_crc32c(const uint8_t *p, size_t n)
+static void ff_xxh32_stripe(ff_xxh32 *s, const uint8_t p[16])
 {
-    return ~ff_crc32c_update(0xffffffffu, p, n);
+    s->v1        = ff_xxh32_round(s->v1, ff_load32(p + 0));
+    s->v2        = ff_xxh32_round(s->v2, ff_load32(p + 4));
+    s->v3        = ff_xxh32_round(s->v3, ff_load32(p + 8));
+    s->v4        = ff_xxh32_round(s->v4, ff_load32(p + 12));
+    s->large_len = 1u;
 }
 
-typedef struct ff_sha256 {
-    uint32_t h[8];
-    uint64_t bytes;
-    uint8_t block[64];
-    size_t used;
-} ff_sha256;
-
-static uint32_t ff_rotr32(uint32_t x, unsigned n)
+static void ff_xxh32_init(ff_xxh32 *s, uint32_t seed)
 {
-    return (x >> n) | (x << (32u - n));
+    s->total_len = 0u;
+    s->v1        = seed + FF_XXH32_PRIME1 + FF_XXH32_PRIME2;
+    s->v2        = seed + FF_XXH32_PRIME2;
+    s->v3        = seed;
+    s->v4        = seed - FF_XXH32_PRIME1;
+    s->memsize   = 0u;
+    s->large_len = 0u;
 }
 
-static void ff_sha256_compress(ff_sha256 *s, const uint8_t block[64])
+static void ff_xxh32_update(ff_xxh32 *s, const uint8_t *p, size_t n)
 {
-    static const uint32_t k[64] = {
-        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
-        0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
-        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
-        0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
-        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
-        0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
-        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
-        0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
-        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
-        0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
-        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
-        0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
-        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
-        0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
-        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
-        0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
-    };
-    uint32_t w[64];
-    uint32_t a, b, c, d, e, f, g, h;
-    unsigned i;
+    s->total_len += (uint32_t)n;
 
-    for (i = 0; i < 16; ++i) {
-        const uint8_t *p = block + 4u * i;
-        w[i]             = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-               ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-    }
-    for (; i < 64; ++i) {
-        uint32_t x  = w[i - 15];
-        uint32_t y  = w[i - 2];
-        uint32_t s0 = ff_rotr32(x, 7) ^ ff_rotr32(x, 18) ^ (x >> 3);
-        uint32_t s1 = ff_rotr32(y, 17) ^ ff_rotr32(y, 19) ^ (y >> 10);
-        w[i]        = w[i - 16] + s0 + w[i - 7] + s1;
+    if ((size_t)s->memsize + n < 16u) {
+        memcpy(s->mem + s->memsize, p, n);
+        s->memsize = (uint8_t)(s->memsize + n);
+        return;
     }
 
-    a = s->h[0];
-    b = s->h[1];
-    c = s->h[2];
-    d = s->h[3];
-    e = s->h[4];
-    f = s->h[5];
-    g = s->h[6];
-    h = s->h[7];
-
-    for (i = 0; i < 64; ++i) {
-        uint32_t s1  = ff_rotr32(e, 6) ^ ff_rotr32(e, 11) ^ ff_rotr32(e, 25);
-        uint32_t ch  = (e & f) ^ (~e & g);
-        uint32_t t1  = h + s1 + ch + k[i] + w[i];
-        uint32_t s0  = ff_rotr32(a, 2) ^ ff_rotr32(a, 13) ^ ff_rotr32(a, 22);
-        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-        uint32_t t2  = s0 + maj;
-        h            = g;
-        g            = f;
-        f            = e;
-        e            = d + t1;
-        d            = c;
-        c            = b;
-        b            = a;
-        a            = t1 + t2;
+    if (s->memsize != 0u) {
+        size_t fill = 16u - s->memsize;
+        memcpy(s->mem + s->memsize, p, fill);
+        ff_xxh32_stripe(s, s->mem);
+        p += fill;
+        n -= fill;
+        s->memsize = 0u;
     }
 
-    s->h[0] += a;
-    s->h[1] += b;
-    s->h[2] += c;
-    s->h[3] += d;
-    s->h[4] += e;
-    s->h[5] += f;
-    s->h[6] += g;
-    s->h[7] += h;
-}
+    while (n >= 16u) {
+        ff_xxh32_stripe(s, p);
+        p += 16u;
+        n -= 16u;
+    }
 
-static void ff_sha256_init(ff_sha256 *s)
-{
-    static const uint32_t h0[8] = {
-        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
-    };
-    memcpy(s->h, h0, sizeof(h0));
-    s->bytes = 0;
-    s->used  = 0;
-}
-
-static void ff_sha256_update(ff_sha256 *s, const uint8_t *p, size_t n)
-{
-    s->bytes += n;
-    while (n) {
-        size_t take = sizeof(s->block) - s->used;
-        if (take > n)
-            take = n;
-        memcpy(s->block + s->used, p, take);
-        s->used += take;
-        p += take;
-        n -= take;
-        if (s->used == sizeof(s->block)) {
-            ff_sha256_compress(s, s->block);
-            s->used = 0;
-        }
+    if (n != 0u) {
+        memcpy(s->mem, p, n);
+        s->memsize = (uint8_t)n;
     }
 }
 
-static void ff_sha256_final(ff_sha256 *s, uint8_t out[32])
+static uint32_t ff_xxh32_digest(const ff_xxh32 *s)
 {
-    uint64_t bits = s->bytes * 8u;
-    unsigned i;
+    const uint8_t *p = s->mem;
+    size_t n         = s->memsize;
+    uint32_t h;
 
-    s->block[s->used++] = 0x80u;
-    if (s->used > 56u) {
-        memset(s->block + s->used, 0, 64u - s->used);
-        ff_sha256_compress(s, s->block);
-        s->used = 0;
+    if (s->large_len) {
+        h = ff_rol32(s->v1, 1u) + ff_rol32(s->v2, 7u) +
+            ff_rol32(s->v3, 12u) + ff_rol32(s->v4, 18u);
+    } else {
+        h = s->v3 + FF_XXH32_PRIME5;
     }
-    memset(s->block + s->used, 0, 56u - s->used);
-    for (i = 0; i < 8; ++i)
-        s->block[63u - i] = (uint8_t)(bits >> (8u * i));
-    ff_sha256_compress(s, s->block);
 
-    for (i = 0; i < 8; ++i) {
-        out[4u * i + 0] = (uint8_t)(s->h[i] >> 24);
-        out[4u * i + 1] = (uint8_t)(s->h[i] >> 16);
-        out[4u * i + 2] = (uint8_t)(s->h[i] >> 8);
-        out[4u * i + 3] = (uint8_t)s->h[i];
+    h += s->total_len;
+
+    while (n >= 4u) {
+        h += ff_load32(p) * FF_XXH32_PRIME3;
+        h = ff_rol32(h, 17u) * FF_XXH32_PRIME4;
+        p += 4u;
+        n -= 4u;
     }
+    while (n != 0u) {
+        h += (uint32_t)*p++ * FF_XXH32_PRIME5;
+        h = ff_rol32(h, 11u) * FF_XXH32_PRIME1;
+        --n;
+    }
+
+    h ^= h >> 15;
+    h *= FF_XXH32_PRIME2;
+    h ^= h >> 13;
+    h *= FF_XXH32_PRIME3;
+    h ^= h >> 16;
+    return h;
 }
 
 static uint64_t ff_file_clusters(const fauxfat_file *f)
@@ -604,7 +581,8 @@ static void ff_make_oem_sector(const fauxfat_view *v, uint8_t out[512])
 
     memset(out, 0, 512);
     memcpy(out, ff_oem_map_guid, 16);
-    memcpy(out + 16, v->map_sha256, 32);
+    ff_store32(out + 16, v->map_xxh32);
+    ff_store32(out + 20, 0u);
 
     memcpy(out + 48, ff_oem_epoch_guid, 16);
     memset(payload, 0, sizeof(payload));
@@ -612,10 +590,10 @@ static void ff_make_oem_sector(const fauxfat_view *v, uint8_t out[512])
     ff_store16(payload + 4, 1u);
     ff_store16(payload + 6, 0u);
     ff_store64(payload + 8, v->config->structural_epoch);
-    ff_store32(payload + 16, v->fat_crc32c);
-    ff_store32(payload + 20, v->bitmap_crc32c);
-    ff_store32(payload + 24, v->root_crc32c);
-    ff_store32(payload + 28, ff_crc32c(payload, 28));
+    ff_store32(payload + 16, v->fat_xxh32);
+    ff_store32(payload + 20, v->bitmap_xxh32);
+    ff_store32(payload + 24, v->root_xxh32);
+    ff_store32(payload + 28, v->upcase_xxh32);
     memcpy(out + 64, payload, sizeof(payload));
 }
 
@@ -1142,74 +1120,66 @@ static int ff_translate_data_block(const fauxfat_view *v,
 static void ff_compute_component_hashes(fauxfat_view *v)
 {
     uint8_t block[512];
-    uint32_t crc;
-    ff_sha256 sha;
-    uint8_t prefix[8]             = { 'F', 'F', 'M', 'A', 'P', '1', 0, 0 };
-    uint64_t bitmap_bytes         = ((uint64_t)v->cluster_count + 7u) / 8u;
-    uint64_t fat_meaningful_bytes = ((uint64_t)v->cluster_count + 2u) * 4u;
-    uint32_t fat_blocks           = (uint32_t)((fat_meaningful_bytes + 511u) / 512u);
+    ff_xxh32 fat;
+    ff_xxh32 bitmap;
+    ff_xxh32 root;
+    ff_xxh32 upcase;
+    ff_xxh32 map;
+    static const uint8_t prefix[8] = { 'F', 'F', 'M', 'A', 'P', '1', 0, 0 };
+    uint64_t bitmap_bytes          = ((uint64_t)v->cluster_count + 7u) / 8u;
+    uint64_t fat_meaningful_bytes  = ((uint64_t)v->cluster_count + 2u) * 4u;
+    uint32_t fat_blocks            = (uint32_t)((fat_meaningful_bytes + 511u) / 512u);
     uint32_t i;
 
-    crc = 0xffffffffu;
-    for (i = 0; i < fat_blocks; ++i) {
-        uint64_t left = fat_meaningful_bytes - (uint64_t)i * 512u;
-        size_t n      = left > 512u ? 512u : (size_t)left;
-        (void)ff_render_structural_block(v, FF_FAT_OFFSET_BLOCKS + i, block);
-        crc = ff_crc32c_update(crc, block, n);
-    }
-    v->fat_crc32c = ~crc;
+    ff_xxh32_init(&fat, FF_XXH32_FAT_SEED);
+    ff_xxh32_init(&bitmap, FF_XXH32_BITMAP_SEED);
+    ff_xxh32_init(&root, FF_XXH32_ROOT_SEED);
+    ff_xxh32_init(&upcase, FF_XXH32_UPCASE_SEED);
+    ff_xxh32_init(&map, FF_XXH32_MAP_SEED);
 
-    crc = 0xffffffffu;
-    for (i = 0; (uint64_t)i * 512u < bitmap_bytes; ++i) {
-        uint64_t left = bitmap_bytes - (uint64_t)i * 512u;
-        size_t n      = left > 512u ? 512u : (size_t)left;
-        (void)ff_render_structural_block(v,
-                                         (uint64_t)v->cluster_heap_block + i, block);
-        crc = ff_crc32c_update(crc, block, n);
-    }
-    v->bitmap_crc32c = ~crc;
+    ff_xxh32_update(&map, prefix, sizeof(prefix));
 
-    crc = 0xffffffffu;
-    for (i = 0; i < FAUXFAT_BLOCKS_PER_CLUSTER; ++i) {
-        uint64_t root_block = (uint64_t)v->cluster_heap_block +
-                              (uint64_t)(v->root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER + i;
-        (void)ff_render_structural_block(v, root_block, block);
-        crc = ff_crc32c_update(crc, block, 512);
-    }
-    v->root_crc32c = ~crc;
-
-    ff_sha256_init(&sha);
-    ff_sha256_update(&sha, prefix, sizeof(prefix));
     (void)ff_render_structural_block(v, 0u, block);
-    ff_sha256_update(&sha, block + 64, 42);
-    ff_sha256_update(&sha, block + 108, 4);
+    ff_xxh32_update(&map, block + 64, 42u);
+    ff_xxh32_update(&map, block + 108, 4u);
 
     for (i = 0; i < fat_blocks; ++i) {
         uint64_t left = fat_meaningful_bytes - (uint64_t)i * 512u;
         size_t n      = left > 512u ? 512u : (size_t)left;
         (void)ff_render_structural_block(v, FF_FAT_OFFSET_BLOCKS + i, block);
-        ff_sha256_update(&sha, block, n);
+        ff_xxh32_update(&fat, block, n);
+        ff_xxh32_update(&map, block, n);
     }
+    v->fat_xxh32 = ff_xxh32_digest(&fat);
+
     for (i = 0; (uint64_t)i * 512u < bitmap_bytes; ++i) {
         uint64_t left = bitmap_bytes - (uint64_t)i * 512u;
         size_t n      = left > 512u ? 512u : (size_t)left;
         (void)ff_render_structural_block(v,
                                          (uint64_t)v->cluster_heap_block + i, block);
-        ff_sha256_update(&sha, block, n);
+        ff_xxh32_update(&bitmap, block, n);
+        ff_xxh32_update(&map, block, n);
     }
+    v->bitmap_xxh32 = ff_xxh32_digest(&bitmap);
+
     {
         uint64_t upcase_block = (uint64_t)v->cluster_heap_block +
                                 (uint64_t)(v->upcase_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
         (void)ff_render_structural_block(v, upcase_block, block);
-        ff_sha256_update(&sha, block, FF_UPCASE_BYTES);
+        ff_xxh32_update(&upcase, block, FF_UPCASE_BYTES);
+        ff_xxh32_update(&map, block, FF_UPCASE_BYTES);
     }
+    v->upcase_xxh32 = ff_xxh32_digest(&upcase);
+
     for (i = 0; i < FAUXFAT_BLOCKS_PER_CLUSTER; ++i) {
         uint64_t root_block = (uint64_t)v->cluster_heap_block +
                               (uint64_t)(v->root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER + i;
         (void)ff_render_structural_block(v, root_block, block);
-        ff_sha256_update(&sha, block, 512);
+        ff_xxh32_update(&root, block, 512u);
+        ff_xxh32_update(&map, block, 512u);
     }
-    ff_sha256_final(&sha, v->map_sha256);
+    v->root_xxh32 = ff_xxh32_digest(&root);
+    v->map_xxh32  = ff_xxh32_digest(&map);
 }
 
 static uint32_t ff_compute_boot_checksum(const fauxfat_view *v)
