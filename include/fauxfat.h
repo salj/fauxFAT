@@ -15,6 +15,7 @@ extern "C" {
 #define FAUXFAT_MAX_FILES          408u
 #define FAUXFAT_MAX_OPAQUE_FILES   408u
 #define FAUXFAT_NAME_MAX           15u
+#define FAUXFAT_CLUSTER_AUTO       UINT32_MAX
 
 /* One host-visible file. File data itself is owned by the callback backend. */
 typedef struct fauxfat_file {
@@ -29,6 +30,13 @@ typedef struct fauxfat_file {
      * Valid range is 1980-01-01 through 2107-12-31 inclusive.
      */
     time_t mtime;
+
+    /*
+     * Zero-based cluster offset within the fauxFAT payload arena. Use
+     * FAUXFAT_CLUSTER_AUTO to pack immediately after the previous extent.
+     * Explicit placements must be nondecreasing and nonoverlapping.
+     */
+    uint32_t data_cluster;
 } fauxfat_file;
 
 /*
@@ -49,6 +57,9 @@ typedef struct fauxfat_opaque_file {
     int fd;
     uint64_t size;
     time_t mtime;
+
+    /* Same payload-arena placement rule as fauxfat_file.data_cluster. */
+    uint32_t data_cluster;
 } fauxfat_opaque_file;
 
 /*
@@ -74,15 +85,22 @@ typedef int (*fauxfat_write_fn)(void *context,
 
 typedef struct fauxfat_config {
     /*
-     * Public files are packed first in array order.  Opaque/private ranges
-     * follow, also in array order.  The upcoming formatter/parser refactor
-     * will generalize this to explicit physical ranges; this packing rule is
-     * retained for the synthetic view API.
+     * Public files remain before opaque/private descriptors in root order,
+     * but each table entry may request an explicit payload-arena cluster.
+     * FAUXFAT_CLUSTER_AUTO packs after the previous extent. Gaps and unused
+     * tail clusters are anonymous opaque reservations: bitmap allocated, FAT
+     * 0xFFFFFFF7, never modified by fauxFAT formatting.
      */
     const fauxfat_file *files;
     size_t file_count;
     const fauxfat_opaque_file *opaque_files;
     size_t opaque_file_count;
+
+    /*
+     * Total payload-arena clusters. Zero means end at the last configured
+     * extent. A larger value creates an anonymous opaque tail reservation.
+     */
+    uint32_t data_cluster_count;
 
     /*
      * Payload storage backend. read is required when either table is nonempty;

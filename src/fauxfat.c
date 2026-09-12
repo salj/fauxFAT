@@ -618,41 +618,76 @@ static uint64_t ff_opaque_clusters(const fauxfat_opaque_file *f)
     return f->size / FAUXFAT_CLUSTER_SIZE;
 }
 
-static uint64_t ff_public_cluster_count(const fauxfat_view *v)
+/*
+ * Configured placement is expressed relative to the first payload cluster,
+ * not as an absolute exFAT cluster/LBA.  That avoids a geometry loop: the FAT
+ * and bitmap sizes may move the cluster heap, but payload offsets remain the
+ * same.  We deliberately recompute these small prefix sums instead of keeping
+ * an extent index in RAM.
+ */
+static uint64_t ff_file_data_cluster(const fauxfat_view *v, size_t file_index)
 {
-    uint64_t n = 0;
+    uint64_t cursor = 0u;
     size_t i;
 
-    for (i = 0; i < v->config->file_count; ++i)
-        n += ff_file_clusters(&v->config->files[i]);
-    return n;
+    for (i = 0u; i <= file_index; ++i) {
+        const fauxfat_file *f = &v->config->files[i];
+        uint64_t start        = f->data_cluster == FAUXFAT_CLUSTER_AUTO ? cursor : f->data_cluster;
+        if (i == file_index)
+            return start;
+        cursor = start + ff_file_clusters(f);
+    }
+    return cursor;
+}
+
+static uint64_t ff_public_end_data_cluster(const fauxfat_view *v)
+{
+    uint64_t cursor = 0u;
+    size_t i;
+
+    for (i = 0u; i < v->config->file_count; ++i) {
+        const fauxfat_file *f = &v->config->files[i];
+        uint64_t start        = f->data_cluster == FAUXFAT_CLUSTER_AUTO ? cursor : f->data_cluster;
+        cursor                = start + ff_file_clusters(f);
+    }
+    return cursor;
+}
+
+static uint64_t ff_opaque_data_cluster(const fauxfat_view *v,
+                                       size_t opaque_index)
+{
+    uint64_t cursor = ff_public_end_data_cluster(v);
+    size_t i;
+
+    for (i = 0u; i <= opaque_index; ++i) {
+        const fauxfat_opaque_file *f = &v->config->opaque_files[i];
+        uint64_t start               = f->data_cluster == FAUXFAT_CLUSTER_AUTO ? cursor : f->data_cluster;
+        if (i == opaque_index)
+            return start;
+        cursor = start + ff_opaque_clusters(f);
+    }
+    return cursor;
 }
 
 static uint32_t ff_file_first_cluster(const fauxfat_view *v, size_t file_index)
 {
-    uint64_t c = v->data_first_cluster;
-    size_t i;
-
-    for (i = 0; i < file_index; ++i)
-        c += ff_file_clusters(&v->config->files[i]);
-    return (uint32_t)c;
+    return (uint32_t)((uint64_t)v->data_first_cluster +
+                      ff_file_data_cluster(v, file_index));
 }
 
-static uint32_t ff_opaque_first_cluster(const fauxfat_view *v, size_t opaque_index)
+static uint32_t ff_opaque_first_cluster(const fauxfat_view *v,
+                                        size_t opaque_index)
 {
-    uint64_t c = (uint64_t)v->data_first_cluster + ff_public_cluster_count(v);
-    size_t i;
-
-    for (i = 0; i < opaque_index; ++i)
-        c += ff_opaque_clusters(&v->config->opaque_files[i]);
-    return (uint32_t)c;
+    return (uint32_t)((uint64_t)v->data_first_cluster +
+                      ff_opaque_data_cluster(v, opaque_index));
 }
 
 static uint32_t ff_fat_entry(const fauxfat_view *v, uint32_t entry)
 {
     uint32_t bitmap_first = 2u;
     uint32_t bitmap_last  = bitmap_first + v->bitmap_clusters - 1u;
-    uint32_t opaque_first;
+    uint64_t data_cluster;
+    size_t i;
 
     if (entry == 0u)
         return 0xfffffff8u;
@@ -665,14 +700,25 @@ static uint32_t ff_fat_entry(const fauxfat_view *v, uint32_t entry)
         return entry == bitmap_last ? FF_FAT_EOC : entry + 1u;
     if (entry == v->upcase_cluster || entry == v->root_cluster)
         return FF_FAT_EOC;
+    if (entry < v->data_first_cluster)
+        return 0u;
 
-    opaque_first = (uint32_t)((uint64_t)v->data_first_cluster +
-                              ff_public_cluster_count(v));
-    if (entry >= opaque_first)
-        return 0xfffffff7u;
+    data_cluster = (uint64_t)entry - v->data_first_cluster;
+    for (i = 0u; i < v->config->file_count; ++i) {
+        const fauxfat_file *f = &v->config->files[i];
+        uint64_t first        = ff_file_data_cluster(v, i);
+        uint64_t end          = first + ff_file_clusters(f);
 
-    /* Host-visible NoFatChain file payload: FAT contents are invalid; zero is canonical. */
-    return 0u;
+        if (data_cluster < first)
+            break;
+        if (data_cluster < end) {
+            /* NoFatChain payload: FAT contents are invalid; zero is canonical. */
+            return 0u;
+        }
+    }
+
+    /* Opaque descriptors, explicit holes and tail reserve are blockers. */
+    return 0xfffffff7u;
 }
 
 static void ff_make_boot_sector(const fauxfat_view *v, uint8_t out[512])
@@ -1029,6 +1075,7 @@ typedef enum ff_range_kind {
     FF_RANGE_REQUIRED_ZERO,
     FF_RANGE_PUBLIC_PAYLOAD,
     FF_RANGE_OPAQUE_PRESERVE,
+    FF_RANGE_RESERVED_PRESERVE,
     FF_RANGE_UNDEFINED
 } ff_range_kind;
 
@@ -1063,7 +1110,6 @@ static int ff_classify_block(const fauxfat_view *v,
     uint32_t fat_meaningful_blocks;
     uint64_t bitmap_bytes;
     uint32_t bitmap_data_blocks;
-    uint32_t first;
     size_t i;
 
     if (block_address >= v->volume_blocks)
@@ -1160,42 +1206,62 @@ static int ff_classify_block(const fauxfat_view *v,
         return FAUXFAT_OK;
     }
 
-    first = v->data_first_cluster;
-    for (i = 0; i < v->config->file_count; ++i) {
-        const fauxfat_file *f = &v->config->files[i];
-        uint32_t nclusters    = (uint32_t)ff_file_clusters(f);
+    if (cluster < v->data_first_cluster ||
+        cluster > v->cluster_count + 1u)
+        return FAUXFAT_EGEOMETRY;
 
-        if (cluster >= first && cluster < first + nclusters) {
-            uint64_t off = ((uint64_t)(cluster - first) * FAUXFAT_CLUSTER_SIZE) +
-                           ((uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE);
-            if (off < f->size) {
-                uint64_t left    = f->size - off;
-                m->kind          = FF_RANGE_PUBLIC_PAYLOAD;
-                m->object_index  = i;
-                m->object_offset = off;
-                m->length        = left > FAUXFAT_BLOCK_SIZE ? FAUXFAT_BLOCK_SIZE : (size_t)left;
-            } else {
-                m->kind = FF_RANGE_UNDEFINED;
+    {
+        uint64_t data_cluster = (uint64_t)cluster - v->data_first_cluster;
+
+        for (i = 0; i < v->config->file_count; ++i) {
+            const fauxfat_file *f = &v->config->files[i];
+            uint64_t first_data   = ff_file_data_cluster(v, i);
+            uint64_t nclusters    = ff_file_clusters(f);
+
+            if (data_cluster < first_data) {
+                m->kind = FF_RANGE_RESERVED_PRESERVE;
+                return FAUXFAT_OK;
             }
-            return FAUXFAT_OK;
+            if (data_cluster < first_data + nclusters) {
+                uint64_t off = (data_cluster - first_data) *
+                                   FAUXFAT_CLUSTER_SIZE +
+                               (uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE;
+                if (off < f->size) {
+                    uint64_t left    = f->size - off;
+                    m->kind          = FF_RANGE_PUBLIC_PAYLOAD;
+                    m->object_index  = i;
+                    m->object_offset = off;
+                    m->length        = left > FAUXFAT_BLOCK_SIZE ? FAUXFAT_BLOCK_SIZE : (size_t)left;
+                } else {
+                    m->kind = FF_RANGE_UNDEFINED;
+                }
+                return FAUXFAT_OK;
+            }
         }
-        first += nclusters;
-    }
 
-    for (i = 0; i < v->config->opaque_file_count; ++i) {
-        const fauxfat_opaque_file *f = &v->config->opaque_files[i];
-        uint32_t nclusters           = (uint32_t)ff_opaque_clusters(f);
+        for (i = 0; i < v->config->opaque_file_count; ++i) {
+            const fauxfat_opaque_file *f = &v->config->opaque_files[i];
+            uint64_t first_data          = ff_opaque_data_cluster(v, i);
+            uint64_t nclusters           = ff_opaque_clusters(f);
 
-        if (cluster >= first && cluster < first + nclusters) {
-            m->kind         = FF_RANGE_OPAQUE_PRESERVE;
-            m->object_index = i;
-            m->object_offset =
-                ((uint64_t)(cluster - first) * FAUXFAT_CLUSTER_SIZE) +
-                ((uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE);
-            m->length = FAUXFAT_BLOCK_SIZE;
-            return FAUXFAT_OK;
+            if (data_cluster < first_data) {
+                m->kind = FF_RANGE_RESERVED_PRESERVE;
+                return FAUXFAT_OK;
+            }
+            if (data_cluster < first_data + nclusters) {
+                m->kind         = FF_RANGE_OPAQUE_PRESERVE;
+                m->object_index = i;
+                m->object_offset =
+                    (data_cluster - first_data) * FAUXFAT_CLUSTER_SIZE +
+                    (uint64_t)block_in_cluster * FAUXFAT_BLOCK_SIZE;
+                m->length = FAUXFAT_BLOCK_SIZE;
+                return FAUXFAT_OK;
+            }
         }
-        first += nclusters;
+
+        /* Explicit holes and any configured tail capacity are private reserve. */
+        m->kind = FF_RANGE_RESERVED_PRESERVE;
+        return FAUXFAT_OK;
     }
 
     return FAUXFAT_EGEOMETRY;
@@ -1205,7 +1271,8 @@ static int ff_render_classified_block(const fauxfat_view *v,
                                       const ff_block_mapping *m,
                                       uint8_t out[512])
 {
-    if (m->kind == FF_RANGE_REQUIRED_ZERO || m->kind == FF_RANGE_UNDEFINED) {
+    if (m->kind == FF_RANGE_REQUIRED_ZERO || m->kind == FF_RANGE_UNDEFINED ||
+        m->kind == FF_RANGE_RESERVED_PRESERVE) {
         memset(out, 0, 512);
         return FAUXFAT_OK;
     }
@@ -1360,8 +1427,8 @@ static uint32_t ff_compute_boot_checksum(const fauxfat_view *v)
 
 int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
 {
-    uint64_t file_clusters   = 0;
-    uint64_t opaque_clusters = 0;
+    uint64_t cursor = 0u;
+    uint64_t data_clusters;
     uint32_t bitmap_clusters = 1u;
     uint64_t clusters64;
     uint64_t fat_bytes;
@@ -1393,6 +1460,8 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
         const fauxfat_file *f = &cfg->files[i];
         uint32_t ignored_timestamp;
         uint8_t ignored_ten_ms;
+        uint64_t nclusters;
+        uint64_t first;
 
         if (!ff_name_valid(f->name, &dummy) || f->size == 0u ||
             !ff_exfat_timestamp(f->mtime, &ignored_timestamp, &ignored_ten_ms))
@@ -1401,26 +1470,36 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
             if (ff_name_equal_folded(f->name, cfg->files[j].name))
                 return FAUXFAT_EINVAL;
         }
-        if (ff_file_clusters(f) > UINT32_MAX ||
-            file_clusters > UINT64_MAX - ff_file_clusters(f))
+
+        nclusters = ff_file_clusters(f);
+        first     = f->data_cluster == FAUXFAT_CLUSTER_AUTO ? cursor : f->data_cluster;
+        if (first < cursor || nclusters > FF_MAX_CLUSTER_COUNT ||
+            first > FF_MAX_CLUSTER_COUNT ||
+            nclusters > FF_MAX_CLUSTER_COUNT - first)
             return FAUXFAT_EGEOMETRY;
-        file_clusters += ff_file_clusters(f);
+        cursor = first + nclusters;
     }
 
     for (i = 0; i < cfg->opaque_file_count; ++i) {
         const fauxfat_opaque_file *f = &cfg->opaque_files[i];
         uint32_t ignored_timestamp;
         uint8_t ignored_ten_ms;
+        uint64_t nclusters;
+        uint64_t first;
         char stub[FAUXFAT_NAME_MAX + 1u];
 
         if (!ff_name_valid(f->name, &dummy) || f->size == 0u ||
             (f->size % FAUXFAT_CLUSTER_SIZE) != 0u ||
             !ff_exfat_timestamp(f->mtime, &ignored_timestamp, &ignored_ten_ms))
             return FAUXFAT_EINVAL;
-        if (ff_opaque_clusters(f) > UINT32_MAX ||
-            opaque_clusters > UINT64_MAX - ff_opaque_clusters(f))
+
+        nclusters = ff_opaque_clusters(f);
+        first     = f->data_cluster == FAUXFAT_CLUSTER_AUTO ? cursor : f->data_cluster;
+        if (first < cursor || nclusters > FF_MAX_CLUSTER_COUNT ||
+            first > FF_MAX_CLUSTER_COUNT ||
+            nclusters > FF_MAX_CLUSTER_COUNT - first)
             return FAUXFAT_EGEOMETRY;
-        opaque_clusters += ff_opaque_clusters(f);
+        cursor = first + nclusters;
 
         /* The hidden descriptor's real namespace name must not collide. */
         ff_opaque_stub_name(i, stub);
@@ -1430,12 +1509,16 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
         }
     }
 
+    data_clusters = cfg->data_cluster_count ? cfg->data_cluster_count : cursor;
+    if (data_clusters < cursor || data_clusters > FF_MAX_CLUSTER_COUNT)
+        return FAUXFAT_EGEOMETRY;
+
     for (;;) {
         uint64_t bitmap_bytes;
         uint64_t need;
-        if (file_clusters > UINT64_MAX - opaque_clusters - bitmap_clusters - 2u)
+        if (data_clusters > UINT64_MAX - bitmap_clusters - 2u)
             return FAUXFAT_EGEOMETRY;
-        clusters64 = file_clusters + opaque_clusters + bitmap_clusters + 2u;
+        clusters64 = data_clusters + bitmap_clusters + 2u;
         if (clusters64 > FF_MAX_CLUSTER_COUNT)
             return FAUXFAT_EGEOMETRY;
         bitmap_bytes = (clusters64 + 7u) / 8u;
@@ -1540,6 +1623,7 @@ int fauxfat_read_block(const fauxfat_view *v,
 
     if (m.kind == FF_RANGE_GENERATED ||
         m.kind == FF_RANGE_REQUIRED_ZERO ||
+        m.kind == FF_RANGE_RESERVED_PRESERVE ||
         m.kind == FF_RANGE_UNDEFINED)
         return ff_render_classified_block(v, &m, out);
 
@@ -1619,6 +1703,23 @@ int fauxfat_read_blocks(const fauxfat_view *v,
                                  length);
             if (rc != 0)
                 return rc;
+            i += blocks;
+            continue;
+        }
+
+        if (m.kind == FF_RANGE_RESERVED_PRESERVE) {
+            size_t blocks = 1u;
+            while (blocks < block_count - i) {
+                ff_block_mapping next;
+                rc = ff_classify_block(v, first_block + i + blocks, &next);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+                if (next.kind != FF_RANGE_RESERVED_PRESERVE)
+                    break;
+                ++blocks;
+            }
+            memset(out + i * FAUXFAT_BLOCK_SIZE, 0,
+                   blocks * FAUXFAT_BLOCK_SIZE);
             i += blocks;
             continue;
         }
@@ -1830,6 +1931,25 @@ int fauxfat_format(const fauxfat_view *v,
             if (rc != FAUXFAT_OK)
                 return rc;
             block += d.allocation_blocks;
+            continue;
+        }
+
+        if (m.kind == FF_RANGE_RESERVED_PRESERVE) {
+            uint64_t first = block;
+
+            do {
+                ++block;
+                if (block >= v->volume_blocks)
+                    break;
+                rc = ff_classify_block(v, block, &m);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+            } while (m.kind == FF_RANGE_RESERVED_PRESERVE);
+
+            rc = ff_device_skip(device, first, block - first,
+                                FAUXFAT_SKIP_PRESERVE);
+            if (rc != FAUXFAT_OK)
+                return rc;
             continue;
         }
 
@@ -3160,7 +3280,6 @@ int fauxfat_scan_loose(const fauxfat_view *v,
 typedef struct ff_reopen_layout_summary {
     const fauxfat_view *view;
     uint64_t next_cluster;
-    uint32_t opaque_first_cluster;
     int seen_opaque;
     int name_changed;
 } ff_reopen_layout_summary;
@@ -3184,14 +3303,11 @@ static int ff_reopen_layout_emit(void *context, unsigned index,
     first_cluster = 2u +
                     (file->first_block - heap) / FAUXFAT_BLOCKS_PER_CLUSTER;
     clusters = file->allocation_blocks / FAUXFAT_BLOCKS_PER_CLUSTER;
-    if (first_cluster != s->next_cluster || clusters > limit - first_cluster)
+    if (first_cluster < s->next_cluster || clusters > limit - first_cluster)
         return FAUXFAT_ESTRUCTURE;
 
     if (file->kind == FAUXFAT_DISK_FILE_OPAQUE) {
-        if (!s->seen_opaque) {
-            s->seen_opaque          = 1;
-            s->opaque_first_cluster = (uint32_t)first_cluster;
-        }
+        s->seen_opaque = 1;
     } else if (s->seen_opaque) {
         return FAUXFAT_ESTRUCTURE;
     }
@@ -3386,9 +3502,75 @@ static int ff_reopen_hash_root(const fauxfat_view *v,
     return 1;
 }
 
-static uint32_t ff_reopen_fat_entry(const fauxfat_view *v,
-                                    uint32_t entry,
-                                    uint32_t opaque_first_cluster)
+typedef struct ff_reopen_public_cursor {
+    ff_root_reader reader;
+    uint32_t entry;
+    uint32_t first_cluster;
+    uint64_t end_cluster;
+    int have;
+    int done;
+} ff_reopen_public_cursor;
+
+static int ff_reopen_public_next(const fauxfat_view *v,
+                                 ff_reopen_public_cursor *c)
+{
+    uint8_t first[32];
+    uint8_t set[160];
+    fauxfat_disk_file d;
+    uint64_t end_cluster;
+    int rc;
+
+    if (c->done) {
+        c->have = 0;
+        return 0;
+    }
+    if (c->entry >= FF_ROOT_ENTRIES) {
+        c->done = 1;
+        c->have = 0;
+        return 0;
+    }
+
+    rc = ff_root_entry(&c->reader, c->entry, first);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    if (first[0] == FF_ENTRY_PAD) {
+        c->done = 1;
+        c->have = 0;
+        return 0;
+    }
+    if (first[0] != FF_ENTRY_FILE || first[1] != 4u ||
+        c->entry > FF_ROOT_ENTRIES - 5u)
+        return FAUXFAT_ESTRUCTURE;
+
+    rc = ff_root_set(&c->reader, c->entry, 5u, set);
+    if (rc != FAUXFAT_OK)
+        return rc;
+    if (ff_load16(set + 2u) != ff_entry_set_checksum(set, sizeof(set)))
+        return FAUXFAT_ESTRUCTURE;
+
+    if (set[128u] == FF_ENTRY_VENDOR_EXT &&
+        memcmp(set + 130u, ff_public_name_guid1, 16u) == 0) {
+        if (!ff_parse_public_set(v, set, &d, &end_cluster))
+            return FAUXFAT_ESTRUCTURE;
+        c->first_cluster = ff_load32(set + 32u + 20u);
+        c->end_cluster   = end_cluster;
+        c->entry += 5u;
+        c->have = 1;
+        return 1;
+    }
+
+    if (set[128u] == FF_ENTRY_VENDOR_ALLOC &&
+        memcmp(set + 130u, ff_opaque_alloc_guid, 16u) == 0) {
+        c->done = 1;
+        c->have = 0;
+        return 0;
+    }
+
+    return FAUXFAT_ESTRUCTURE;
+}
+
+static uint32_t ff_reopen_fixed_fat_entry(const fauxfat_view *v,
+                                          uint32_t entry)
 {
     uint32_t bitmap_last = 2u + v->bitmap_clusters - 1u;
 
@@ -3400,40 +3582,68 @@ static uint32_t ff_reopen_fat_entry(const fauxfat_view *v,
         return entry == bitmap_last ? FF_FAT_EOC : entry + 1u;
     if (entry == v->upcase_cluster || entry == v->root_cluster)
         return FF_FAT_EOC;
-    if (entry < v->data_first_cluster || entry > v->cluster_count + 1u)
-        return 0u;
-    return entry >= opaque_first_cluster ? 0xfffffff7u : 0u;
+    return 0u;
 }
 
 static int ff_reopen_verify_fat(const fauxfat_view *v,
                                 const fauxfat_device *device,
-                                uint32_t opaque_first_cluster,
                                 ff_xxh32 *component,
                                 ff_xxh32 *map)
 {
+    ff_reopen_public_cursor cursor;
     uint8_t actual[FAUXFAT_BLOCK_SIZE];
     uint8_t expected[FAUXFAT_BLOCK_SIZE];
     uint64_t bytes       = ((uint64_t)v->cluster_count + 2u) * 4u;
     uint32_t block_index = 0u;
+    uint64_t root_first  = (uint64_t)v->cluster_heap_block +
+                          (uint64_t)(v->root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+    int rc;
+
+    memset(&cursor, 0, sizeof(cursor));
+    cursor.reader.device      = device;
+    cursor.reader.first_block = root_first;
+    cursor.entry              = FF_FILE_SLOT_FIRST;
+    rc                        = ff_reopen_public_next(v, &cursor);
+    if (rc < 0)
+        return rc;
 
     while (bytes != 0u) {
         uint64_t first_entry = (uint64_t)block_index * 128u;
         size_t n             = bytes > FAUXFAT_BLOCK_SIZE ? FAUXFAT_BLOCK_SIZE : (size_t)bytes;
         unsigned i;
-        int rc = ff_dev_read_block(device,
-                                   (uint64_t)FF_FAT_OFFSET_BLOCKS + block_index,
-                                   actual);
+
+        rc = ff_dev_read_block(device,
+                               (uint64_t)FF_FAT_OFFSET_BLOCKS + block_index,
+                               actual);
         if (rc != 0)
             return rc;
         memset(expected, 0, sizeof(expected));
+
         for (i = 0u; i < 128u; ++i) {
-            uint64_t e = first_entry + i;
-            if (e > (uint64_t)v->cluster_count + 1u)
+            uint64_t e64 = first_entry + i;
+            uint32_t value;
+
+            if (e64 > (uint64_t)v->cluster_count + 1u)
                 break;
-            ff_store32(expected + 4u * i,
-                       ff_reopen_fat_entry(v, (uint32_t)e,
-                                           opaque_first_cluster));
+            if (e64 < v->data_first_cluster) {
+                value = ff_reopen_fixed_fat_entry(v, (uint32_t)e64);
+            } else {
+                uint32_t e = (uint32_t)e64;
+
+                while (cursor.have && e >= cursor.end_cluster) {
+                    rc = ff_reopen_public_next(v, &cursor);
+                    if (rc < 0)
+                        return rc;
+                }
+                if (cursor.have && e >= cursor.first_cluster &&
+                    e < cursor.end_cluster)
+                    value = 0u;
+                else
+                    value = 0xfffffff7u;
+            }
+            ff_store32(expected + 4u * i, value);
         }
+
         if (memcmp(actual, expected, n) != 0)
             return 0;
         ff_xxh32_update(component, actual, n);
@@ -3496,18 +3706,16 @@ static int ff_reopen_validate_self(const fauxfat_view *v,
         return FAUXFAT_OK;
 
     memset(&summary, 0, sizeof(summary));
-    summary.view                 = v;
-    summary.next_cluster         = v->data_first_cluster;
-    summary.opaque_first_cluster = v->cluster_count + 2u;
-    rc                           = fauxfat_parse_root_strict(v, device, ff_reopen_layout_emit,
-                                                             &summary, &count);
+    summary.view         = v;
+    summary.next_cluster = v->data_first_cluster;
+    rc                   = fauxfat_parse_root_strict(v, device, ff_reopen_layout_emit,
+                                                     &summary, &count);
     if (rc != FAUXFAT_OK) {
         if (rc == FAUXFAT_ESTRUCTURE || rc == FAUXFAT_EGEOMETRY)
             return FAUXFAT_OK;
         return rc;
     }
-    if (summary.next_cluster != (uint64_t)v->cluster_count + 2u ||
-        summary.name_changed)
+    if (summary.name_changed)
         return FAUXFAT_OK;
 
     ff_xxh32_init(&fat, FF_XXH32_FAT_SEED);
@@ -3519,8 +3727,7 @@ static int ff_reopen_validate_self(const fauxfat_view *v,
     ff_xxh32_update(&map, main_boot + 64u, 42u);
     ff_xxh32_update(&map, main_boot + 108u, 4u);
 
-    rc = ff_reopen_verify_fat(v, device, summary.opaque_first_cluster,
-                              &fat, &map);
+    rc = ff_reopen_verify_fat(v, device, &fat, &map);
     if (rc < 0)
         return rc;
     if (rc == 0)

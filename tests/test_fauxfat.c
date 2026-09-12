@@ -319,8 +319,8 @@ int main(void)
         0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
     };
     fauxfat_file files[] = {
-        { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045 },
-        { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798 }
+        { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO },
+        { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, FAUXFAT_CLUSTER_AUTO }
     };
 
     test_io io;
@@ -622,7 +622,7 @@ int main(void)
     /* File names are ISO-8859-1 bytes rendered directly as UTF-16 code units. */
     {
         fauxfat_file latin = {
-            "caf\xe9.bin", 11, sizeof(config_data), (time_t)1735787045
+            "caf\xe9.bin", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
         };
 
         fauxfat_config latincfg = cfg;
@@ -639,8 +639,8 @@ int main(void)
     }
     {
         fauxfat_file collision[] = {
-            { "caf\xe9.bin", 10, sizeof(solver), (time_t)1735787045 },
-            { "CAF\xc9.BIN", 11, sizeof(config_data), (time_t)1735787045 }
+            { "caf\xe9.bin", 10, sizeof(solver), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO },
+            { "CAF\xc9.BIN", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO }
         };
 
         fauxfat_config badcfg = cfg;
@@ -650,7 +650,7 @@ int main(void)
     }
     {
         fauxfat_file bad = {
-            "BAD/NAME", 11, sizeof(config_data), (time_t)1735787045
+            "BAD/NAME", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
         };
 
         fauxfat_config badcfg = cfg;
@@ -669,7 +669,7 @@ int main(void)
     {
         uint8_t short_data[1234];
         fauxfat_file short_file = {
-            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045
+            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
         };
 
         fauxfat_config short_cfg = cfg;
@@ -738,7 +738,7 @@ int main(void)
      */
     {
         fauxfat_opaque_file opaque[] = {
-            { "SOLVER.DB", 13, sizeof(opaque_data), (time_t)1735787045 }
+            { "SOLVER.DB", 13, sizeof(opaque_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO }
         };
 
         fauxfat_config ocfg = cfg;
@@ -855,10 +855,10 @@ int main(void)
     {
         uint8_t short_data[1234];
         fauxfat_file short_file = {
-            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045
+            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
         };
         fauxfat_opaque_file opaque = {
-            "SECRET.BIN", 13, sizeof(opaque_data), (time_t)1735787045
+            "SECRET.BIN", 13, sizeof(opaque_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
         };
 
         fauxfat_config fcfg = cfg;
@@ -1398,7 +1398,7 @@ int main(void)
      * Vendor Allocation.VendorDefined; no second name-extension entry needed. */
     {
         fauxfat_opaque_file opaque = {
-            "ABCDEFGHIJKLMNO", 13, sizeof(opaque_data), (time_t)1735787045
+            "ABCDEFGHIJKLMNO", 13, sizeof(opaque_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
         };
 
         fauxfat_config ocfg = cfg;
@@ -1442,7 +1442,7 @@ int main(void)
      * benign original-name Vendor Extension records. */
     {
         fauxfat_file long_file = {
-            "ABCDEFGHIJKLMNO", 11, sizeof(config_data), (time_t)1735787045
+            "ABCDEFGHIJKLMNO", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
         };
 
         fauxfat_config lcfg = cfg;
@@ -1479,10 +1479,122 @@ int main(void)
         assert(got.file[0].flags == 0u);
     }
 
+    /*
+     * Explicit payload placement may leave anonymous private gaps and a tail
+     * reserve.  Those clusters are bitmap-allocated/F7, survive formatting,
+     * and do not need directory descriptors.  Reopen still validates the
+     * view in constant memory by streaming the physically ordered public
+     * extents from the root while checking the FAT.
+     */
+    {
+        fauxfat_file placed_files[] = {
+            { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, 0u },
+            { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, 4u }
+        };
+        fauxfat_opaque_file placed_opaque = {
+            "SOLVER.DB", 13, sizeof(opaque_data), (time_t)1735787045, 7u
+        };
+
+        fauxfat_config pcfg = cfg;
+        fauxfat_view pv;
+        fauxfat_disk_file d;
+        fauxfat_device pdev;
+        test_device pmedia;
+        emit_test got;
+        fauxfat_volume_class vc;
+        size_t count = 0u;
+        uint64_t bytes;
+        uint64_t gap_block;
+        uint8_t fat[512];
+        unsigned j;
+
+        pcfg.files              = placed_files;
+        pcfg.file_count         = 2u;
+        pcfg.opaque_files       = &placed_opaque;
+        pcfg.opaque_file_count  = 1u;
+        pcfg.data_cluster_count = 10u;
+        assert(fauxfat_init(&pv, &pcfg) == FAUXFAT_OK);
+        assert(pv.data_first_cluster == 5u);
+        assert(pv.cluster_count == 13u);
+        assert(pv.volume_blocks == 1920u);
+
+        assert(fauxfat_describe_disk_file(&pv, 0u, &d) == FAUXFAT_OK);
+        assert(d.first_block == 640u);
+        assert(d.allocation_blocks == 2u * FAUXFAT_BLOCKS_PER_CLUSTER);
+        assert(fauxfat_describe_disk_file(&pv, 1u, &d) == FAUXFAT_OK);
+        assert(d.first_block == 1152u);
+        assert(fauxfat_describe_disk_file(&pv, 2u, &d) == FAUXFAT_OK);
+        assert(d.kind == FAUXFAT_DISK_FILE_OPAQUE);
+        assert(d.first_block == 1536u);
+
+        assert(fauxfat_read_block(&pv, 128u, fat) == FAUXFAT_OK);
+        assert(load32(fat + 4u * 5u) == 0u);
+        assert(load32(fat + 4u * 6u) == 0u);
+        assert(load32(fat + 4u * 7u) == 0xfffffff7u);
+        assert(load32(fat + 4u * 8u) == 0xfffffff7u);
+        assert(load32(fat + 4u * 9u) == 0u);
+        for (j = 10u; j <= 14u; ++j)
+            assert(load32(fat + 4u * j) == 0xfffffff7u);
+
+        gap_block = pv.cluster_heap_block +
+                    (uint64_t)(pv.data_first_cluster + 2u - 2u) *
+                        FAUXFAT_BLOCKS_PER_CLUSTER;
+        memset(b, 0x5a, sizeof(b));
+        assert(fauxfat_read_block(&pv, gap_block, b) == FAUXFAT_OK);
+        for (j = 0u; j < sizeof(b); ++j)
+            assert(b[j] == 0u);
+        assert(fauxfat_translate_write(&pv, gap_block,
+                                       &(fauxfat_write_mapping){ 0 }) ==
+               FAUXFAT_EUNMAPPED);
+
+        bytes = pv.volume_blocks * FAUXFAT_BLOCK_SIZE;
+        assert(bytes <= SIZE_MAX);
+        memset(&pmedia, 0, sizeof(pmedia));
+        pmedia.blocks = pv.volume_blocks;
+        pmedia.data   = (uint8_t *)malloc((size_t)bytes);
+        assert(pmedia.data != NULL);
+        memset(pmedia.data, 0xa9, (size_t)bytes);
+
+        memset(&pdev, 0, sizeof(pdev));
+        pdev.read    = dev_read;
+        pdev.write   = dev_write;
+        pdev.zero    = dev_zero;
+        pdev.skip    = dev_skip;
+        pdev.context = &pmedia;
+        assert(fauxfat_format(&pv, &pdev, NULL, NULL, 0u) == FAUXFAT_OK);
+
+        /* Anonymous reservation bytes are truly preserve, not undefined. */
+        for (j = 0u; j < FAUXFAT_BLOCK_SIZE; ++j)
+            assert(pmedia.data[gap_block * FAUXFAT_BLOCK_SIZE + j] == 0xa9u);
+        assert(pmedia.preserve_skips != 0u);
+
+        assert(fauxfat_validate_strict(&pv, &pdev, &vc) == FAUXFAT_OK);
+        assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+        memset(&got, 0, sizeof(got));
+        assert(fauxfat_reopen(&pdev, collect_file, &got, &count, &vc, NULL) ==
+               FAUXFAT_OK);
+        assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+        assert(count == 3u && got.count == 3u);
+        assert(got.file[0].first_block == 640u);
+        assert(got.file[1].first_block == 1152u);
+        assert(got.file[2].first_block == 1536u);
+        free(pmedia.data);
+
+        /* Placement is ordered, nonoverlapping, and bounded by the arena. */
+        placed_files[1].data_cluster = 1u;
+        assert(fauxfat_init(&pv, &pcfg) == FAUXFAT_EGEOMETRY);
+        placed_files[1].data_cluster = 4u;
+        placed_opaque.data_cluster   = 4u;
+        assert(fauxfat_init(&pv, &pcfg) == FAUXFAT_EGEOMETRY);
+        placed_opaque.data_cluster = 7u;
+        pcfg.data_cluster_count    = 7u;
+        assert(fauxfat_init(&pv, &pcfg) == FAUXFAT_EGEOMETRY);
+    }
+
     /* exFAT cannot encode dates before 1980 or after 2107. */
     {
         fauxfat_file bad_time = {
-            "BADTIME.BIN", 11, sizeof(config_data), (time_t)315532799
+            "BADTIME.BIN", 11, sizeof(config_data), (time_t)315532799, FAUXFAT_CLUSTER_AUTO
         };
 
         fauxfat_config badcfg = cfg;

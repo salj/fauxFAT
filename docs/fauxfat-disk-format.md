@@ -73,18 +73,22 @@ FatLength = align_up(ceil((ClusterCount + 2) * 4 / 512), 128)
 ClusterHeapOffset = FatOffset + FatLength
 ```
 
-`ClusterCount` and `FatLength` depend on one another. The formatter solves them by iteration:
+The schema specifies a payload arena in 64 KiB clusters. `DataClusterCount` is either the end of the last configured extent or a larger explicit capacity used to reserve an anonymous tail. Bitmap size is therefore the only fixed-point step:
 
 ```
-fat_len = 128
+BitmapClusters = 1
 repeat:
-    heap_off = 128 + fat_len
-    clusters = floor((VolumeLength - heap_off) / 128)
-    new_fat_len = align_up(ceil((clusters + 2) * 4 / 512), 128)
-until new_fat_len == fat_len
+    ClusterCount = DataClusterCount + BitmapClusters + 2   // upcase + root
+    BitmapBytes = ceil(ClusterCount / 8)
+    NewBitmapClusters = ceil(BitmapBytes / 65536)
+until NewBitmapClusters == BitmapClusters
+
+FatLength = align_up(ceil((ClusterCount + 2) * 4 / 512), 128)
+ClusterHeapOffset = 128 + FatLength
+VolumeLength = ClusterHeapOffset + ClusterCount * 128
 ```
 
-The final values are written to the boot sectors. Any trailing sectors which do not form a whole cluster are Excess Space and are never used by fauxFAT.
+The current v1 formatter ends the volume on a cluster boundary, so it creates no Excess Space of its own. A parser may still encounter ordinary exFAT excess space in best-effort mode, but fauxFAT does not assign it payload semantics.
 
 ## 4. Boot regions
 
@@ -231,7 +235,7 @@ The FAT value is deliberately not meaningful for a `NoFatChain` allocation. Zero
 
 ### 6.3 Opaque/private/reserved raw data
 
-Every cluster which must not be visible or allocatable to the host has:
+Every cluster which must not be visible or allocatable to the host, including anonymous placement gaps and tail reserve, has:
 
 ```
 FAT[cluster] = 0xFFFFFFF7   // exFAT bad-cluster marker
@@ -302,6 +306,22 @@ FFFF FF00                   U+0100..U+FFFF identity
 This covers the complete 16-bit Unicode range while doing useful case folding only for the character repertoire fauxFAT permits. Characters whose Unicode uppercase form is outside ISO-8859-1, notably `U+00FF`, remain identity mappings. The result is 128 bytes and has exFAT `TableChecksum = 0xA872CEE1`. The remaining bytes in the allocated cluster are outside the Up-case Table's `DataLength`; the synthetic view emits zero there, but a sparse/on-disk formatter may leave that cluster slack undefined and the verifier ignores it. `FAT[UpcaseCluster] = 0xFFFFFFFF`.
 
 The root occupies exactly one cluster. `FAT[RootCluster] = 0xFFFFFFFF`.
+
+### 8.1 Payload arena placement
+
+`DataFirstCluster = RootCluster + 1` is the start of a zero-based payload arena. Configured public and opaque descriptors carry a payload-arena cluster offset. `FAUXFAT_CLUSTER_AUTO` in the code-facing schema means "immediately after the preceding configured extent"; it is resolved before bytes are generated and is not an on-disk value.
+
+Configured extents are monotonically ordered and may not overlap. Public extents precede opaque descriptor extents in canonical root order. A gap between configured extents, and any capacity after the final extent up to `DataClusterCount`, is an **anonymous opaque reservation**:
+
+```text
+AllocationBitmap[cluster] = 1
+FAT[cluster] = 0xFFFFFFF7
+root descriptor           = none
+```
+
+Anonymous reservations are intentional physical ownership, not free space and not undefined padding. Sparse/in-place formatting must preserve their bytes. The synthetic block view returns zero for such raw sectors because there is no caller fd associated with them; their contents are not host-visible through a file.
+
+This lets a schema reserve fixed A/B slots, alignment holes, and tail capacity without allocating RAM for an extent map. Named opaque state that must be rediscovered after losing the schema still uses the vendor descriptor in section 10.6.
 
 ## 9. Root directory layout
 

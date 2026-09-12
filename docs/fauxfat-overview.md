@@ -58,9 +58,11 @@ cluster heap:
     allocation bitmap
     upcase table
     root directory
-    public file extents
-    opaque/private extents
-    reserve / tail space
+    payload arena:
+        public file extents
+        anonymous opaque gaps/reserve
+        opaque/private descriptors
+        anonymous opaque tail reserve
 ```
 
 Public file clusters have FAT value `0` because `NoFatChain` files do not use those entries as a chain. Opaque ranges use `0xFFFFFFF7`. Filesystem metadata clusters use normal fixed EOC/chain values.
@@ -119,6 +121,7 @@ typedef struct fauxfat_file {
     int fd;
     uint64_t size;
     time_t mtime;
+    uint32_t data_cluster;
 } fauxfat_file;
 ```
 
@@ -171,12 +174,12 @@ static int storage_write(void *ctx, int fd, uint64_t off,
 }
 
 static const fauxfat_file files[] = {
-    { "SOLVER.DB",  10, 2ULL * 1024 * 1024 * 1024, 1789161600 },
-    { "CONFIG.BIN", 11, 64 * 1024,                  1789161600 },
+    { "SOLVER.DB",  10, 2ULL * 1024 * 1024 * 1024, 1789161600, 0 },
+    { "CONFIG.BIN", 11, 64 * 1024,                  1789161600, 32772 },
 };
 
 static const fauxfat_opaque_file private_files[] = {
-    { "SOLVER.DB", 20, 2ULL * 1024 * 1024 * 1024, 1789161600 },
+    { "SOLVER.DB", 20, 2ULL * 1024 * 1024 * 1024, 1789161600, 32776 },
 };
 
 fauxfat_config cfg = {
@@ -184,6 +187,7 @@ fauxfat_config cfg = {
     .file_count = sizeof(files) / sizeof(files[0]),
     .opaque_files = private_files,
     .opaque_file_count = sizeof(private_files) / sizeof(private_files[0]),
+    .data_cluster_count = 65548,
     .read = storage_read,
     .write = storage_write,
     .io_context = storage_context,
@@ -200,7 +204,7 @@ int rc = fauxfat_init(&view, &cfg);
 
 `fauxfat_init()` allocates nothing. The configuration and file arrays must outlive the view.
 
-The current implementation packs public files first, then opaque files, in array order. Explicit physical placement is part of the planned layout/parser refactor; it is not implemented yet.
+`data_cluster` is a zero-based cluster offset inside the payload arena. `FAUXFAT_CLUSTER_AUTO` packs an extent immediately after the previous one. Explicit entries must remain in increasing, nonoverlapping order. A gap between entries, or unused space up to `cfg.data_cluster_count`, is an anonymous opaque reservation: the bitmap stays allocated, the FAT entry is `0xFFFFFFF7`, formatting never touches the bytes, and no root descriptor is required. This makes fixed A/B slots, tail reserve, and future carve-outs possible without an in-RAM extent index.
 
 ## 6. Serving the view as a block device
 
@@ -419,15 +423,16 @@ Implemented now:
 - bounded loose root scanning with original-name recovery and rename flagging;
 - single structural XXH32 seal plus component XXH32 fingerprints;
 - sparse/in-place formatter with generated/zero/undefined/preserve range semantics;
-- Unix `time_t` input for file timestamps.
+- Unix `time_t` input for file timestamps;
+- explicit payload-arena placement, anonymous F7 gaps, and an optional anonymous tail reserve;
+- schema-free validation of those sparse layouts without retaining an extent table.
 
 Planned, not implemented yet:
 
 - binding recovered descriptors to caller-backed bounded block/range fds;
-- explicit physical placement instead of the current packed layout;
 - optional dual-view A/B presentation optimization.
 
-That boundary is important. The library can now manufacture and serve fauxFAT, prove that a volume matches a trusted manufactured view, or reopen the supported fauxFAT geometry directly from a block device with no schema in hand. It still does not grow arbitrary exFAT geometry/traversal, and it does not yet bind recovered descriptors to application fds or let the caller place extents explicitly.
+That boundary is important. The library can now manufacture and serve sparse fixed layouts, prove that a volume matches a trusted manufactured view, or reopen the supported fauxFAT geometry directly from a block device with no schema in hand. It still does not grow arbitrary exFAT geometry/traversal, and recovered descriptors are not yet bound to application fds by the library itself.
 
 ## 12. Design rules worth preserving
 
