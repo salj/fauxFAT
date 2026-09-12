@@ -505,8 +505,8 @@ int fauxgpt_open(fauxgpt_info *info,
     return FAUXGPT_OK;
 }
 
-int fauxgpt_partitioning_matches(const fauxgpt_info *info,
-                                 const fauxgpt_layout *expected)
+int fauxgpt_geometry_matches(const fauxgpt_info *info,
+                             const fauxgpt_layout *expected)
 {
     size_t i;
 
@@ -529,6 +529,33 @@ int fauxgpt_partitioning_matches(const fauxgpt_info *info,
             return 0;
     }
     return 1;
+}
+
+int fauxgpt_identity_matches(const fauxgpt_info *info,
+                             const fauxgpt_layout *expected)
+{
+    size_t i;
+
+    if (!info || !expected ||
+        (expected->partition_count != 0u && !expected->partitions) ||
+        expected->partition_count > FAUXGPT_OPEN_MAX_PARTITIONS ||
+        info->partition_count != expected->partition_count)
+        return 0;
+    if (memcmp(info->disk_guid, expected->disk_guid, 16u) != 0)
+        return 0;
+
+    for (i = 0u; i < info->partition_count; ++i) {
+        if (memcmp(info->partitions[i].unique_guid,
+                   expected->partitions[i].unique_guid, 16u) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+int fauxgpt_partitioning_matches(const fauxgpt_info *info,
+                                 const fauxgpt_layout *expected)
+{
+    return fauxgpt_geometry_matches(info, expected);
 }
 
 int fauxgpt_render_block(const fauxgpt_view *view,

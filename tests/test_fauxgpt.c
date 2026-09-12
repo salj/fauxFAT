@@ -310,7 +310,8 @@ static void test_open_and_partition_match(void)
     assert(info.partition_count == 2u);
     assert(info.partitions[0].first_lba == parts[0].first_lba);
     assert(info.partitions[1].block_count == parts[1].block_count);
-    assert(fauxgpt_partitioning_matches(&info, &layout));
+    assert(fauxgpt_geometry_matches(&info, &layout));
+    assert(fauxgpt_identity_matches(&info, &layout));
 
     /* GUID/name identity changes do not make the partition geometry unsafe. */
     memcpy(expected_parts, parts, sizeof(expected_parts));
@@ -319,10 +320,21 @@ static void test_open_and_partition_match(void)
     fill_guid(expected.disk_guid, 0xe0u);
     fill_guid(expected_parts[0].unique_guid, 0xe8u);
     expected_parts[0].name = "RENAMED";
-    assert(fauxgpt_partitioning_matches(&info, &expected));
+    assert(fauxgpt_geometry_matches(&info, &expected));
+    assert(!fauxgpt_identity_matches(&info, &expected));
     expected_parts[0].block_count += 1u;
-    assert(!fauxgpt_partitioning_matches(&info, &expected));
+    assert(!fauxgpt_geometry_matches(&info, &expected));
     expected_parts[0].block_count -= 1u;
+
+    /* GPT names are presentation only; identity is GUID-only. */
+    expected            = layout;
+    expected.partitions = expected_parts;
+    memcpy(expected_parts, parts, sizeof(expected_parts));
+    expected_parts[0].name = "RENAMED";
+    assert(fauxgpt_geometry_matches(&info, &expected));
+    assert(fauxgpt_identity_matches(&info, &expected));
+    /* Compatibility spelling still means geometry, not identity. */
+    assert(fauxgpt_partitioning_matches(&info, &expected));
 
     /* One intact copy is enough to open; the missing copy is visible. */
     src.corrupt_lba = FAUXGPT_PRIMARY_HEADER_LBA;

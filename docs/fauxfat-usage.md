@@ -560,10 +560,19 @@ rc = fauxfat_block_format(&view, &disk,
 Without `FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA`, the existing target must
 already open as the requested wrapper. For GPT it must also match the requested
 partitioning and partition 1 must already carry recognizable fauxFAT identity.
+Safe reformatting then performs an ownership check: the existing fauxFAT
+Volume GUID and volume serial must equal the requested view, and GPT media must
+also retain the requested disk GUID and every active partition's unique GUID.
+The structural epoch, volume label, and GPT partition names are deliberately
+excluded from this identity test because ordinary regeneration is allowed to
+change presentation metadata without pretending the disk became somebody
+else's.
 Therefore all of these are refused by default:
 
 - a GPT whose partition map differs from the expected layout;
 - a valid one- or two-partition GPT whose first partition is not fauxFAT;
+- a same-shaped fauxFAT volume with a different Volume GUID or serial;
+- a same-shaped GPT with a different disk or partition GUID;
 - converting bare <-> GPT;
 - unknown or apparently blank media.
 
@@ -585,7 +594,10 @@ requests.
 The integration-specific failures are `FAUXFAT_BLOCK_EWRAPPER` for malformed
 or wrong wrapper metadata, `FAUXFAT_BLOCK_EPARTITION` for a valid-enough GPT
 whose partition map is unacceptable, and `FAUXFAT_BLOCK_ENOTFAUXFAT` when the
-candidate volume lacks recognizable fauxFAT identity. Raw block callback
+candidate volume lacks recognizable fauxFAT identity.
+`FAUXFAT_BLOCK_EIDENTITY` means the wrapper/geometry is acceptable but one of
+the stable ownership identifiers differs from the requested format target.
+Raw block callback
 failures are translated to `FAUXFAT_BLOCK_EIO`, so an SD/backend errno such as
 `-5`, `-6`, or `-7` cannot accidentally become GPT parser state. The original
 callback value is retained as `probe.backend_error` by
@@ -658,8 +670,11 @@ enough to open a degraded disk; `gi.flags` says which copies and whether the
 protective MBR are valid. If both GPT copies validate they must agree. More
 than two active partitions returns `FAUXGPT_EPARTITIONS`.
 
-`fauxgpt_partitioning_matches()` performs the same safety-geometry comparison
-used by the high-level block API.
+`fauxgpt_geometry_matches()` performs the safety-geometry comparison used by
+the high-level block API. `fauxgpt_identity_matches()` separately compares the
+disk GUID and active partition unique GUIDs. The older
+`fauxgpt_partitioning_matches()` spelling remains an alias for geometry only;
+it does not quietly acquire identity semantics.
 
 For physical provisioning, format/materialize firmware-owned partition content first, then publish GPT metadata:
 

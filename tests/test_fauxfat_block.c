@@ -11,6 +11,8 @@ typedef struct memdev {
     uint64_t blocks;
     unsigned flushes;
     uint64_t read_calls;
+    uint64_t write_calls;
+    uint64_t zero_calls;
     uint64_t fail_read_call;
     int fail_read_code;
     int fail_write_code;
@@ -41,6 +43,7 @@ static int mem_write(void *context, uint64_t first_block,
     memdev *m      = (memdev *)context;
     uint64_t count = (uint64_t)block_count;
 
+    ++m->write_calls;
     if (m->fail_write_code != 0)
         return m->fail_write_code;
     if (first_block > m->blocks || count > m->blocks - first_block)
@@ -54,6 +57,7 @@ static int mem_zero(void *context, uint64_t first_block, uint64_t block_count)
 {
     memdev *m = (memdev *)context;
 
+    ++m->zero_calls;
     if (m->fail_zero_code != 0)
         return m->fail_zero_code;
     if (first_block > m->blocks || block_count > m->blocks - first_block)
@@ -206,6 +210,128 @@ static void test_gpt_open_format_and_guards(void)
     assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
                                 NULL, NULL, 0u) == FAUXFAT_BLOCK_OK);
     assert(media.data[user_probe * FAUXFAT_BLOCK_SIZE + 3u] == 0x5au);
+
+    /* Safe reformat proves fauxFAT stable identity, not merely shape. */
+    {
+        fauxfat_config foreign_cfg = cfg;
+        fauxfat_view foreign_view;
+        uint64_t writes_before;
+        uint64_t zeros_before;
+
+        fill_guid(foreign_cfg.volume_guid, 0xd1u);
+        assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
+        assert(fauxfat_block_format(
+                   &foreign_view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+
+        writes_before = media.write_calls;
+        zeros_before  = media.zero_calls;
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+                                    NULL, NULL, 0u) ==
+               FAUXFAT_BLOCK_EIDENTITY);
+        assert(media.write_calls == writes_before);
+        assert(media.zero_calls == zeros_before);
+        assert(fauxfat_block_format(
+                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+
+        foreign_cfg = cfg;
+        foreign_cfg.volume_serial ^= 0x01020304u;
+        assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
+        assert(fauxfat_block_format(
+                   &foreign_view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+        writes_before = media.write_calls;
+        zeros_before  = media.zero_calls;
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+                                    NULL, NULL, 0u) ==
+               FAUXFAT_BLOCK_EIDENTITY);
+        assert(media.write_calls == writes_before);
+        assert(media.zero_calls == zeros_before);
+        assert(fauxfat_block_format(
+                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+    }
+
+    /* Safe GPT format also preserves the disk and partition GUID identities. */
+    {
+        fauxgpt_partition alt_parts[2];
+        fauxgpt_layout alt_layout;
+        fauxgpt_view alt_gpt;
+        fauxgpt_device gd;
+        uint64_t writes_before;
+        uint64_t zeros_before;
+
+        memcpy(alt_parts, parts, sizeof(alt_parts));
+        alt_layout            = layout;
+        alt_layout.partitions = alt_parts;
+        fill_guid(alt_layout.disk_guid, 0xc1u);
+        assert(fauxgpt_init(&alt_gpt, &alt_layout) == FAUXGPT_OK);
+        memset(&gd, 0, sizeof(gd));
+        gd.write   = mem_write;
+        gd.flush   = mem_flush;
+        gd.context = &media;
+        assert(fauxgpt_format(&alt_gpt, &gd) == FAUXGPT_OK);
+
+        writes_before = media.write_calls;
+        zeros_before  = media.zero_calls;
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+                                    NULL, NULL, 0u) ==
+               FAUXFAT_BLOCK_EIDENTITY);
+        assert(media.write_calls == writes_before);
+        assert(media.zero_calls == zeros_before);
+        assert(fauxfat_block_format(
+                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+
+        memcpy(alt_parts, parts, sizeof(alt_parts));
+        alt_layout            = layout;
+        alt_layout.partitions = alt_parts;
+        fill_guid(alt_parts[0].unique_guid, 0xb1u);
+        assert(fauxgpt_init(&alt_gpt, &alt_layout) == FAUXGPT_OK);
+        assert(fauxgpt_format(&alt_gpt, &gd) == FAUXGPT_OK);
+        writes_before = media.write_calls;
+        zeros_before  = media.zero_calls;
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+                                    NULL, NULL, 0u) ==
+               FAUXFAT_BLOCK_EIDENTITY);
+        assert(media.write_calls == writes_before);
+        assert(media.zero_calls == zeros_before);
+        assert(fauxfat_block_format(
+                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+    }
+
+    /* Epoch/labels/names are mutable presentation state, not ownership. */
+    {
+        fauxfat_config changed_cfg = cfg;
+        fauxfat_view changed_view;
+        fauxgpt_partition renamed_parts[2];
+        fauxgpt_layout renamed_layout;
+        fauxgpt_view renamed_gpt;
+
+        changed_cfg.structural_epoch += 1u;
+        changed_cfg.volume_label = "UPDATED";
+        assert(fauxfat_init(&changed_view, &changed_cfg) == FAUXFAT_OK);
+        memcpy(renamed_parts, parts, sizeof(renamed_parts));
+        renamed_parts[0].name     = "RENAMED";
+        renamed_parts[1].name     = "SCRATCH";
+        renamed_layout            = layout;
+        renamed_layout.partitions = renamed_parts;
+        assert(fauxgpt_init(&renamed_gpt, &renamed_layout) == FAUXGPT_OK);
+        assert(fauxfat_block_format(&changed_view, &dev, FAUXFAT_BLOCK_GPT,
+                                    &renamed_gpt, NULL, NULL, 0u) ==
+               FAUXFAT_BLOCK_OK);
+        /* Returning to the old presentation is also identity-safe. */
+        assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_GPT, &gpt,
+                                    NULL, NULL, 0u) == FAUXFAT_BLOCK_OK);
+    }
 
     /* Change only partition 2 geometry: valid GPT, wrong product layout. */
     {
@@ -424,9 +550,13 @@ static void test_bare_open_and_format(void)
 {
     fauxfat_config cfg;
     fauxfat_view view;
+    fauxfat_config foreign_cfg;
+    fauxfat_view foreign_view;
     fauxfat_block_device dev;
     fauxfat_block_opened opened;
     memdev media;
+    uint64_t writes_before;
+    uint64_t zeros_before;
     size_t bytes;
 
     init_fauxfat(&cfg, &view, 0u);
@@ -459,6 +589,25 @@ static void test_bare_open_and_format(void)
                               NULL, NULL, NULL) == FAUXFAT_BLOCK_EWRAPPER);
     assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_BARE, NULL,
                                 NULL, NULL, 0u) == FAUXFAT_BLOCK_OK);
+
+    foreign_cfg = cfg;
+    fill_guid(foreign_cfg.volume_guid, 0xe1u);
+    assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
+    assert(fauxfat_block_format(
+               &foreign_view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_OK);
+    writes_before = media.write_calls;
+    zeros_before  = media.zero_calls;
+    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_BARE, NULL,
+                                NULL, NULL, 0u) ==
+           FAUXFAT_BLOCK_EIDENTITY);
+    assert(media.write_calls == writes_before);
+    assert(media.zero_calls == zeros_before);
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_OK);
 
     free(media.data);
 }

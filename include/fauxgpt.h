@@ -161,11 +161,23 @@ int fauxgpt_open(fauxgpt_info *info,
                  uint64_t disk_blocks);
 
 /*
- * Compare safety-relevant partitioning against a desired layout. Disk and
- * partition GUIDs and names are identity/presentation, not geometry, and are
- * intentionally ignored. Type GUID, range, attributes, count, and disk size
- * must match exactly.
+ * Compare safety-relevant partition geometry against a desired layout. Disk
+ * and partition GUIDs and names are identity/presentation, not geometry, and
+ * are intentionally ignored. Type GUID, range, attributes, count, and disk
+ * size must match exactly.
  */
+int fauxgpt_geometry_matches(const fauxgpt_info *info,
+                             const fauxgpt_layout *expected);
+
+/*
+ * Compare stable GPT identity only: disk GUID plus every active partition's
+ * unique GUID. Geometry/type/name fields are deliberately outside this test;
+ * callers which need both invariants should call geometry_matches() first.
+ */
+int fauxgpt_identity_matches(const fauxgpt_info *info,
+                             const fauxgpt_layout *expected);
+
+/* Compatibility spelling retained while callers migrate to the clearer name. */
 int fauxgpt_partitioning_matches(const fauxgpt_info *info,
                                  const fauxgpt_layout *expected);
 

@@ -188,7 +188,7 @@ struct fauxgpt_layout {
 };
 ```
 
-The generator accepts raw on-disk GUID bytes rather than inventing identifiers or parsing UUID strings. The product can preserve disk/partition GUIDs across a reformat, and GUID generation policy remains outside this low-level module.
+The generator accepts raw on-disk GUID bytes rather than inventing identifiers or parsing UUID strings. GUID generation policy remains outside this low-level module. At the whole-device API, an ordinary non-destructive reformat requires the on-disk GPT disk GUID and active partition unique GUIDs to equal the requested layout; changing them requires the explicit destructive authorization path. This keeps stable OS-visible disk identity from being rewritten merely because the partition geometry happened to match.
 
 Names are restricted to printable ASCII and encoded as UTF-16LE into GPT's 36-code-unit field. We have no reason to acquire a Unicode subsystem merely to make Disk Management prettier.
 
@@ -250,8 +250,11 @@ repairs it.
 The whole-device safety layer deliberately treats a GPT whose first partition
 lacks recognizable fauxFAT identity as foreign user data even when it contains
 a perfectly readable generic exFAT volume. Likewise, an expected-layout
-mismatch is an error. Formatting may override either condition only with the
-explicit `FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA` flag.
+mismatch is an error. A matching layout is not by itself ownership proof:
+safe formatting also requires the fauxFAT Volume GUID + serial and the GPT
+disk/partition GUIDs to match the requested target. Formatting may override
+these conditions only with the explicit
+`FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA` flag.
 
 There is no need to implement partition insertion, deletion, resize heuristics, hybrid-MBR interpretation, or filesystem discovery in this module.
 

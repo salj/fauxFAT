@@ -76,7 +76,9 @@ enum {
     /* Candidate volume is not recognizably fauxFAT. */
     FAUXFAT_BLOCK_ENOTFAUXFAT = -36,
     /* A raw read/write/zero/skip/flush callback failed. */
-    FAUXFAT_BLOCK_EIO = -37
+    FAUXFAT_BLOCK_EIO = -37,
+    /* Geometry is acceptable, but stable fauxFAT/GPT identity differs. */
+    FAUXFAT_BLOCK_EIDENTITY = -38
 };
 
 enum {
@@ -87,7 +89,8 @@ enum {
      * Authorize overwriting a target which does not already open as the
      * explicitly requested bare/GPT layout. This includes foreign GPT maps,
      * a 1-2 partition GPT whose first partition lacks the fauxFAT identity,
-     * bare/GPT wrapper conversion, and unknown/unformatted media.
+     * stable fauxFAT/GPT identity mismatch, bare/GPT wrapper conversion, and
+     * unknown/unformatted media.
      */
     FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA = 1u << 1
 };
@@ -134,10 +137,13 @@ int fauxfat_block_open(fauxfat_block_opened *opened,
  * meant.
  *
  * Without DESTROY_USER_DATA, the existing target must already open as the
- * requested wrapper. For GPT it must also match gpt->layout and partition 1
- * must already be recognizably fauxFAT. Unknown/blank media therefore needs
- * explicit destructive authorization too; absence of recognizable metadata is
- * not proof that the device contains nothing valuable.
+ * requested wrapper, match the requested fauxFAT Volume GUID + serial, and,
+ * for GPT, match both requested partition geometry and the stable GPT disk /
+ * partition GUIDs. Structural epoch, volume label, and GPT names are mutable
+ * presentation state and do not participate in ownership checks.
+ * Unknown/blank media therefore needs explicit destructive authorization too;
+ * absence of recognizable metadata is not proof that the device contains
+ * nothing valuable.
  *
  * GPT formatting requires gpt, requires partition entry 0 to exactly cover
  * view, materializes fauxFAT first, flushes it, then publishes GPT metadata.
