@@ -784,3 +784,67 @@ rc = fauxgpt_format(&gpt, &gd);
 ```
 
 `fauxgpt_format()` writes backup array/header, flushes, then primary array/header and the protective MBR, then flushes again. It emits no writes between `FAUXGPT_FIRST_USABLE_LBA` and `gpt.last_usable_lba`, so the blank/user-formatted second partition is preserved by construction.
+
+## 20. Windows VHDX qualification utility
+
+`tools/fauxfat_qualify_win.c` is a native Windows qualification harness. Build
+it from a Unix-like development host with Zig's bundled MinGW environment:
+
+```sh
+make windows-tool
+# -> build/fauxfat-qualify.exe
+```
+
+The target uses `zig cc -target x86_64-windows-gnu` and links the Windows
+Virtual Disk API directly. The source carries only the small Win32/Virtdisk ABI
+surface it needs, so no separate Windows SDK or mingw installation is required
+when Zig is present. `make check-windows-tool` performs an ordinary host C
+syntax/warning check without requiring Zig.
+
+The normal qualification path is a disposable dynamic VHDX, not a real disk:
+
+```text
+fauxfat-qualify.exe create-vhdx C:\\temp\\fauxfat-test.vhdx
+fauxfat-qualify.exe verify-vhdx C:\\temp\\fauxfat-test.vhdx
+fauxfat-qualify.exe detach-vhdx C:\\temp\\fauxfat-test.vhdx
+```
+
+`create-vhdx` defaults to a 512 MiB virtual disk with a 64 MiB fauxFAT payload
+arena. `--size-mib N` and `--fauxfat-data-mib N` override those values. The tool
+creates a 512-byte-logical-sector VHDX, attaches it without drive letters while
+formatting, materializes the canonical two-partition GPT through
+`fauxfat_block_format()`, detaches it, then attaches it normally with permanent
+lifetime. Partition 1 is labelled `FAUXQUAL` and contains one fixed 8 MiB
+`QUALIFY.BIN`; partition 2 is Microsoft Basic Data but intentionally has no
+filesystem. Windows can therefore mount/mutate partition 1 and the operator can
+format partition 2 with normal host tooling before running `verify-vhdx` again.
+
+`verify-vhdx` reuses an existing attachment when possible; otherwise it makes a
+temporary read-only/no-drive-letter attachment. It opens the resulting
+`\\.\\PhysicalDriveN` through the real block-device API, requires the PMBR and
+both GPT copies to validate, runs schema-free fauxFAT reopen/descriptor scanning,
+and requires the persisted `QUALIFY.BIN` descriptor to remain recoverable at
+its original logical size. The harness derives the GPT disk/partition GUIDs from
+the fauxFAT Volume GUID, so verification also detects identity rewrites without
+a sidecar file. It replans the canonical two-partition geometry from the reopened
+partition-1 size, so deleting/moving/resizing the user partition is not mistaken
+for a successful host-filesystem qualification. A namespace rename is acceptable
+because the vendor records preserve the logical name; deleting/truncating the
+qualification object is not.
+
+For real-media qualification there is a deliberately inconvenient destructive
+path:
+
+```text
+fauxfat-qualify.exe format-raw \\.\\PhysicalDrive7 --destroy-user-data
+fauxfat-qualify.exe verify-raw \\.\\PhysicalDrive7
+```
+
+`format-raw` accepts only the exact `\\.\\PhysicalDriveN` spelling and refuses
+to run without the literal `--destroy-user-data` option. It does not lock or
+dismount existing Windows volumes on the target; Windows may therefore reject
+writes to an in-use disk, which is preferable to this test utility quietly
+becoming `diskpart` with worse judgment. After direct GPT writes it issues
+`IOCTL_DISK_UPDATE_PROPERTIES` so Windows invalidates its cached partition map.
+The fauxFAT library's own `DESTROY_USER_DATA` flag is also set; partition 2's
+body is still never written by fauxFAT/GPT formatting.
