@@ -231,14 +231,27 @@ flush
 
 This does not make an arbitrary layout change transactionally atomic, but it makes it difficult to lose both GPT copies in one interrupted update. If the primary and backup disagree after a crash, firmware should reconstruct the intended table from authoritative product state rather than attempt a general-purpose GPT merge.
 
-A product-side validator/repair pass should remain similarly bounded; that parser is not part of the current `fauxgpt` slice:
+A bounded validator is now part of `fauxgpt`:
 
 - validate protective MBR shape;
 - validate primary header and entry-array CRC;
 - validate backup header and entry-array CRC;
-- require the expected fixed geometry and expected partition entries;
-- if only one copy is valid, repair the other from authoritative layout;
-- if both are valid but disagree, report structural change and rebuild from authority.
+- accept one intact GPT copy while reporting which copies are valid;
+- require both valid copies to agree;
+- reject active entries beyond the two-partition application profile;
+- optionally compare disk size, partition count/type/range/attributes against
+  an authoritative expected layout.
+
+The validator does not repair in place. `fauxfat_block_format()` uses the
+authoritative layout to republish GPT after materializing partition 1. If only
+one GPT copy or the PMBR was damaged, an otherwise accepted reformat naturally
+repairs it.
+
+The whole-device safety layer deliberately treats a GPT whose first partition
+lacks recognizable fauxFAT identity as foreign user data even when it contains
+a perfectly readable generic exFAT volume. Likewise, an expected-layout
+mismatch is an error. Formatting may override either condition only with the
+explicit `FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA` flag.
 
 There is no need to implement partition insertion, deletion, resize heuristics, hybrid-MBR interpretation, or filesystem discovery in this module.
 
@@ -246,7 +259,7 @@ There is no need to implement partition insertion, deletion, resize heuristics, 
 
 The partition layer and fauxFAT recovery are deliberately separate.
 
-A normal boot can do:
+A normal boot can now do this through `fauxfat_block_open()` directly:
 
 ```text
 validate narrow GPT profile

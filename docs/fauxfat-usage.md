@@ -329,6 +329,11 @@ rc = fauxfat_reopen(&device,
 
 `fauxfat_reopen()` derives only the supported fixed fauxFAT geometry. It does not attempt arbitrary exFAT discovery.
 
+This function is volume-relative. If the caller has a whole card/image which
+may be GPT-wrapped, prefer the integration API in `fauxfat_block.h` described
+below instead of manually guessing an LBA offset and handing it to
+`fauxfat_reopen()`.
+
 `info` reports the recovered stable presentation identity and geometry:
 
 ```c
@@ -452,7 +457,104 @@ Do not assume fauxFAT provides any of the following:
 
 Those omissions are the point of the design, not pending filesystem features.
 
-## 15. Publish a whole-card GPT
+## 15. Open a bare or GPT-wrapped block device
+
+`include/fauxfat_block.h` binds the bounded GPT reader to schema-free fauxFAT
+reopen. The physical device supplies its total block count plus the existing
+fauxFAT block callbacks:
+
+```c
+#include "fauxfat_block.h"
+
+fauxfat_block_device disk = {
+    .block_count = card_blocks,
+    .io = {
+        .read = raw_read,
+        .write = raw_write,
+        .zero = raw_zero,
+        .skip = raw_skip,
+        .context = card,
+    },
+    .flush = raw_flush,
+};
+
+fauxfat_block_opened opened;
+rc = fauxfat_block_open(&opened, &disk,
+                        FAUXFAT_BLOCK_AUTO,
+                        &expected_layout,
+                        emit_file, ctx, &count);
+```
+
+`FAUXFAT_BLOCK_AUTO` accepts either:
+
+- a bare fauxFAT volume beginning at physical LBA 0; or
+- the narrow GPT profile with one or two active partitions and fauxFAT in GPT
+  entry 0.
+
+GPT markers which are present but damaged are not reinterpreted as a bare
+volume. A valid GPT with more than two active partitions is also rejected
+rather than being partially understood.
+
+When `expected_layout` is non-NULL, the disk size, partition count, type GUIDs,
+ranges, and attributes must match. Disk/partition GUIDs and GPT names are not
+part of that geometry check. They are identity/presentation fields, not an
+excuse to reject an otherwise identical partition map because somebody renamed
+"USER DATA" in a partition editor.
+
+For GPT, partition 1 must contain a recognizable fauxFAT OEM identity.
+`FAUXFAT_VOLUME_EXFAT_BEST_EFFORT` is deliberately not sufficient here. A
+generic exFAT filesystem in the expected-looking first partition is user data,
+not an invitation to overwrite it.
+
+The returned `opened.volume_device` is a bounds-checked volume-relative adapter
+over the physical device and can be passed to `fauxfat_disk_file_read()` /
+`fauxfat_disk_file_write()`. `opened` must remain at the same address while
+that adapter is in use because its callback context points back to the opened
+object.
+
+## 16. Publish or reformat a complete target
+
+Formatting uses the same integration layer, but AUTO is forbidden. Destructive
+code must say whether it intends a bare volume or GPT:
+
+```c
+rc = fauxfat_block_format(&view, &disk,
+                          FAUXFAT_BLOCK_GPT, &gpt,
+                          preserve, preserve_ctx, 0);
+```
+
+Without `FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA`, the existing target must
+already open as the requested wrapper. For GPT it must also match the requested
+partitioning and partition 1 must already carry recognizable fauxFAT identity.
+Therefore all of these are refused by default:
+
+- a GPT whose partition map differs from the expected layout;
+- a valid one- or two-partition GPT whose first partition is not fauxFAT;
+- converting bare <-> GPT;
+- unknown or apparently blank media.
+
+The last case is intentionally conservative. Looking blank in the first few
+metadata sectors is not proof that an arbitrary block device contains no user
+data. Initial provisioning therefore passes
+`FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA` explicitly.
+
+For GPT output, GPT entry 0 must cover the fauxFAT view exactly.
+The formatter materializes fauxFAT first, flushes it, then publishes GPT via
+the backup-array/header -> flush -> primary-array/header/PMBR -> flush sequence.
+Partition entry 1 is never formatted or otherwise touched by this API.
+
+`FAUXFAT_BLOCK_FORMAT_ZERO_UNDEFINED` maps to the existing fauxFAT
+reproducibility flag. `DESTROY_USER_DATA` authorizes destructive replacement;
+it does not turn fauxFAT preserve ranges or the user partition into erase
+requests.
+
+The integration-specific failures are `FAUXFAT_BLOCK_EWRAPPER` for malformed
+or wrong wrapper metadata, `FAUXFAT_BLOCK_EPARTITION` for a valid-enough GPT
+whose partition map is unacceptable, and `FAUXFAT_BLOCK_ENOTFAUXFAT` when the
+candidate volume lacks recognizable fauxFAT identity. Block/backend callback
+failures are still propagated unchanged.
+
+## 17. Low-level whole-card GPT API
 
 `include/fauxgpt.h` is deliberately separate from fauxFAT. It renders only the protective MBR, primary/backup GPT entry arrays, and primary/backup headers. It never reads or writes a partition body.
 
@@ -488,6 +590,29 @@ rc = fauxgpt_init(&gpt, &layout);
 All GUID byte arrays are already in GPT on-disk byte order. The module does not parse UUID strings or invent identifiers. Names are optional printable ASCII, at most 36 bytes.
 
 For a synthetic whole-disk read path, call `fauxgpt_render_block()` first for GPT metadata LBAs; `FAUXGPT_EUNMAPPED` means route the request to a partition body or other storage.
+
+The same module now has a bounded reader:
+
+```c
+fauxgpt_device gd = {
+    .read = raw_read,
+    .write = raw_write,
+    .flush = raw_flush,
+    .context = card,
+};
+
+fauxgpt_info gi;
+rc = fauxgpt_open(&gi, &gd, card_blocks);
+```
+
+`fauxgpt_open()` validates the canonical header geometry, header CRCs, complete
+128-entry array CRCs, and active entry ranges. Either primary or backup GPT is
+enough to open a degraded disk; `gi.flags` says which copies and whether the
+protective MBR are valid. If both GPT copies validate they must agree. More
+than two active partitions returns `FAUXGPT_EPARTITIONS`.
+
+`fauxgpt_partitioning_matches()` performs the same safety-geometry comparison
+used by the high-level block API.
 
 For physical provisioning, format/materialize firmware-owned partition content first, then publish GPT metadata:
 

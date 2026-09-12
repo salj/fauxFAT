@@ -49,6 +49,43 @@ typedef struct write_log {
     size_t flushes;
 } write_log;
 
+typedef struct render_source {
+    const fauxgpt_view *view;
+    const fauxgpt_view *backup_view;
+    uint64_t corrupt_lba;
+    int corrupt_pmbr;
+} render_source;
+
+static int render_read(void *context, uint64_t first_block,
+                       size_t block_count, void *data)
+{
+    render_source *src = (render_source *)context;
+    uint8_t *out       = (uint8_t *)data;
+    size_t i;
+
+    for (i = 0u; i < block_count; ++i) {
+        uint64_t lba             = first_block + i;
+        const fauxgpt_view *view = src->view;
+        int rc;
+
+        if (src->backup_view &&
+            lba >= src->view->backup_array_lba)
+            view = src->backup_view;
+        rc = fauxgpt_render_block(view, lba,
+                                  out + i * FAUXGPT_BLOCK_SIZE);
+        if (rc == FAUXGPT_EUNMAPPED) {
+            memset(out + i * FAUXGPT_BLOCK_SIZE, 0, FAUXGPT_BLOCK_SIZE);
+        } else if (rc != FAUXGPT_OK) {
+            return rc;
+        }
+        if (lba == src->corrupt_lba)
+            out[i * FAUXGPT_BLOCK_SIZE + 17u] ^= 0x80u;
+        if (lba == 0u && src->corrupt_pmbr)
+            out[i * FAUXGPT_BLOCK_SIZE + 510u] = 0u;
+    }
+    return 0;
+}
+
 static int log_write(void *context, uint64_t first_block,
                      size_t block_count, const void *data)
 {
@@ -186,6 +223,7 @@ static void test_render_and_format(void)
     assert(rc == FAUXGPT_ERANGE);
 
     memset(&log, 0, sizeof(log));
+    memset(&dev, 0, sizeof(dev));
     dev.write   = log_write;
     dev.flush   = log_flush;
     dev.context = &log;
@@ -212,6 +250,106 @@ static void test_render_and_format(void)
         assert(log.lba[i] < FAUXGPT_FIRST_USABLE_LBA ||
                log.lba[i] > view.last_usable_lba);
     }
+}
+
+static void test_open_and_partition_match(void)
+{
+    fauxgpt_partition parts[3];
+    fauxgpt_partition expected_parts[2];
+    fauxgpt_layout layout;
+    fauxgpt_layout expected;
+    fauxgpt_partition disagree_parts[2];
+    fauxgpt_layout disagree_layout;
+    fauxgpt_view disagree_view;
+    fauxgpt_view view;
+    fauxgpt_device dev;
+    fauxgpt_info info;
+    render_source src;
+
+    memset(parts, 0, sizeof(parts));
+    memcpy(parts[0].type_guid, fauxgpt_type_microsoft_basic_data, 16u);
+    fill_guid(parts[0].unique_guid, 0x10u);
+    parts[0].first_lba   = 2048u;
+    parts[0].block_count = 4096u;
+    parts[0].name        = "FAUXFAT";
+    memcpy(parts[1].type_guid, fauxgpt_type_microsoft_basic_data, 16u);
+    fill_guid(parts[1].unique_guid, 0x40u);
+    parts[1].first_lba   = 8192u;
+    parts[1].block_count = 8192u;
+    parts[1].name        = "USER";
+
+    memset(&layout, 0, sizeof(layout));
+    layout.disk_blocks = 32768u;
+    fill_guid(layout.disk_guid, 0x90u);
+    layout.partitions      = parts;
+    layout.partition_count = 2u;
+    assert(fauxgpt_init(&view, &layout) == FAUXGPT_OK);
+
+    memset(&src, 0, sizeof(src));
+    src.view        = &view;
+    src.corrupt_lba = UINT64_MAX;
+    memset(&dev, 0, sizeof(dev));
+    dev.read    = render_read;
+    dev.context = &src;
+
+    assert(fauxgpt_open(&info, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert(info.flags == (FAUXGPT_INFO_PRIMARY_VALID |
+                          FAUXGPT_INFO_BACKUP_VALID |
+                          FAUXGPT_INFO_PMBR_VALID));
+    assert(info.partition_count == 2u);
+    assert(info.partitions[0].first_lba == parts[0].first_lba);
+    assert(info.partitions[1].block_count == parts[1].block_count);
+    assert(fauxgpt_partitioning_matches(&info, &layout));
+
+    /* GUID/name identity changes do not make the partition geometry unsafe. */
+    memcpy(expected_parts, parts, sizeof(expected_parts));
+    expected            = layout;
+    expected.partitions = expected_parts;
+    fill_guid(expected.disk_guid, 0xe0u);
+    fill_guid(expected_parts[0].unique_guid, 0xe8u);
+    expected_parts[0].name = "RENAMED";
+    assert(fauxgpt_partitioning_matches(&info, &expected));
+    expected_parts[0].block_count += 1u;
+    assert(!fauxgpt_partitioning_matches(&info, &expected));
+    expected_parts[0].block_count -= 1u;
+
+    /* One intact copy is enough to open; the missing copy is visible. */
+    src.corrupt_lba = FAUXGPT_PRIMARY_HEADER_LBA;
+    assert(fauxgpt_open(&info, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert((info.flags & FAUXGPT_INFO_PRIMARY_VALID) == 0u);
+    assert((info.flags & FAUXGPT_INFO_BACKUP_VALID) != 0u);
+    src.corrupt_lba = UINT64_MAX;
+
+    /* A bad PMBR is recoverable but is reported instead of silently blessed. */
+    src.corrupt_pmbr = 1;
+    assert(fauxgpt_open(&info, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert((info.flags & FAUXGPT_INFO_PMBR_VALID) == 0u);
+    src.corrupt_pmbr = 0;
+
+    /* Individually valid primary/backup copies are still rejected if they
+     * describe different partition maps. */
+    memcpy(disagree_parts, parts, sizeof(disagree_parts));
+    disagree_parts[1].first_lba += 1u;
+    disagree_parts[1].block_count -= 1u;
+    disagree_layout            = layout;
+    disagree_layout.partitions = disagree_parts;
+    assert(fauxgpt_init(&disagree_view, &disagree_layout) == FAUXGPT_OK);
+    src.backup_view = &disagree_view;
+    assert(fauxgpt_open(&info, &dev, layout.disk_blocks) ==
+           FAUXGPT_ESTRUCTURE);
+    src.backup_view = NULL;
+
+    /* A valid GPT with a third active entry is outside our bounded profile. */
+    memcpy(parts[2].type_guid, fauxgpt_type_microsoft_basic_data, 16u);
+    fill_guid(parts[2].unique_guid, 0x70u);
+    parts[2].first_lba     = 20000u;
+    parts[2].block_count   = 1024u;
+    parts[2].name          = "THIRD";
+    layout.partition_count = 3u;
+    assert(fauxgpt_init(&view, &layout) == FAUXGPT_OK);
+    src.view = &view;
+    assert(fauxgpt_open(&info, &dev, layout.disk_blocks) ==
+           FAUXGPT_EPARTITIONS);
 }
 
 static void test_reject_bad_layouts(void)
@@ -280,6 +418,7 @@ static void test_large_disk_pmbr_and_flush_requirement(void)
     assert(load32(block + 446u + 12u) == UINT32_MAX);
 
     memset(&log, 0, sizeof(log));
+    memset(&dev, 0, sizeof(dev));
     dev.write   = log_write;
     dev.flush   = NULL;
     dev.context = &log;
@@ -290,6 +429,7 @@ static void test_large_disk_pmbr_and_flush_requirement(void)
 int main(void)
 {
     test_render_and_format();
+    test_open_and_partition_match();
     test_reject_bad_layouts();
     test_large_disk_pmbr_and_flush_requirement();
     puts("fauxgpt tests: ok");
