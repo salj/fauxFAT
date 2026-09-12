@@ -220,7 +220,14 @@ typedef struct fauxfat_reopen_info {
     uint32_t root_cluster;
     uint8_t volume_guid[16];
     char volume_label[12];
+    unsigned flags;
 } fauxfat_reopen_info;
+
+enum {
+    FAUXFAT_REOPEN_GEOMETRY_VALID = 1u << 0,
+    FAUXFAT_REOPEN_ROOT_VALID     = 1u << 1,
+    FAUXFAT_REOPEN_SCAN_READY     = 1u << 2
+};
 
 /*
  * Raw block-device side of sparse formatting, validation, and reopen.
@@ -448,6 +455,23 @@ int fauxfat_reopen(const fauxfat_device *device,
                    size_t *descriptor_count,
                    fauxfat_volume_class *classification,
                    fauxfat_reopen_info *info);
+
+/*
+ * Split form of fauxfat_reopen() for callers which must apply policy between
+ * identifying a volume and exposing recovered descriptors. The probe performs
+ * geometry, identity, and structural classification but does not run the final
+ * loose descriptor scan. The scan consumes only geometry recorded by a
+ * successful probe and therefore avoids repeating the expensive validation.
+ */
+int fauxfat_reopen_probe(const fauxfat_device *device,
+                         fauxfat_volume_class *classification,
+                         fauxfat_reopen_info *info);
+
+int fauxfat_reopen_scan(const fauxfat_device *device,
+                        const fauxfat_reopen_info *info,
+                        fauxfat_file_emit_fn emit,
+                        void *emit_context,
+                        size_t *descriptor_count);
 
 /*
  * Use one recovered/direct physical descriptor as bounded byte-addressable

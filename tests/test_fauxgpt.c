@@ -264,6 +264,7 @@ static void test_open_and_partition_match(void)
     fauxgpt_view view;
     fauxgpt_device dev;
     fauxgpt_info info;
+    fauxgpt_probe_info probe;
     render_source src;
 
     memset(parts, 0, sizeof(parts));
@@ -292,6 +293,16 @@ static void test_open_and_partition_match(void)
     dev.read    = render_read;
     dev.context = &src;
 
+    assert(fauxgpt_probe(&probe, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert((probe.flags & FAUXGPT_PROBE_PMBR_MARKER) != 0u);
+    assert((probe.flags & FAUXGPT_PROBE_PMBR_VALID) != 0u);
+    assert((probe.primary.flags & FAUXGPT_COPY_MARKER) != 0u);
+    assert((probe.primary.flags & FAUXGPT_COPY_VALID) != 0u);
+    assert((probe.backup.flags & FAUXGPT_COPY_MARKER) != 0u);
+    assert((probe.backup.flags & FAUXGPT_COPY_VALID) != 0u);
+    assert(probe.primary.info.partition_count == 2u);
+    assert(probe.primary.partition_array_crc32 == view.partition_array_crc32);
+
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) == FAUXGPT_OK);
     assert(info.flags == (FAUXGPT_INFO_PRIMARY_VALID |
                           FAUXGPT_INFO_BACKUP_VALID |
@@ -315,6 +326,10 @@ static void test_open_and_partition_match(void)
 
     /* One intact copy is enough to open; the missing copy is visible. */
     src.corrupt_lba = FAUXGPT_PRIMARY_HEADER_LBA;
+    assert(fauxgpt_probe(&probe, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert((probe.primary.flags & FAUXGPT_COPY_MARKER) != 0u);
+    assert((probe.primary.flags & FAUXGPT_COPY_VALID) == 0u);
+    assert((probe.backup.flags & FAUXGPT_COPY_VALID) != 0u);
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) == FAUXGPT_OK);
     assert((info.flags & FAUXGPT_INFO_PRIMARY_VALID) == 0u);
     assert((info.flags & FAUXGPT_INFO_BACKUP_VALID) != 0u);
@@ -322,6 +337,9 @@ static void test_open_and_partition_match(void)
 
     /* A bad PMBR is recoverable but is reported instead of silently blessed. */
     src.corrupt_pmbr = 1;
+    assert(fauxgpt_probe(&probe, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert((probe.flags & FAUXGPT_PROBE_PMBR_MARKER) != 0u);
+    assert((probe.flags & FAUXGPT_PROBE_PMBR_VALID) == 0u);
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) == FAUXGPT_OK);
     assert((info.flags & FAUXGPT_INFO_PMBR_VALID) == 0u);
     src.corrupt_pmbr = 0;
@@ -335,6 +353,11 @@ static void test_open_and_partition_match(void)
     disagree_layout.partitions = disagree_parts;
     assert(fauxgpt_init(&disagree_view, &disagree_layout) == FAUXGPT_OK);
     src.backup_view = &disagree_view;
+    assert(fauxgpt_probe(&probe, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert((probe.primary.flags & FAUXGPT_COPY_VALID) != 0u);
+    assert((probe.backup.flags & FAUXGPT_COPY_VALID) != 0u);
+    assert(probe.primary.partition_array_crc32 !=
+           probe.backup.partition_array_crc32);
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) ==
            FAUXGPT_ESTRUCTURE);
     src.backup_view = NULL;
@@ -348,6 +371,9 @@ static void test_open_and_partition_match(void)
     layout.partition_count = 3u;
     assert(fauxgpt_init(&view, &layout) == FAUXGPT_OK);
     src.view = &view;
+    assert(fauxgpt_probe(&probe, &dev, layout.disk_blocks) == FAUXGPT_OK);
+    assert((probe.primary.flags & FAUXGPT_COPY_TOO_MANY) != 0u);
+    assert(probe.primary.info.partition_count == 3u);
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) ==
            FAUXGPT_EPARTITIONS);
 }

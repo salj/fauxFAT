@@ -7,18 +7,66 @@ static int fb_range_ok(uint64_t limit, uint64_t first, uint64_t count)
     return first <= limit && count <= limit - first;
 }
 
+static int fb_translate_backend_error(int *backend_error, int rc)
+{
+    if (rc == 0)
+        return 0;
+    if (backend_error)
+        *backend_error = rc;
+    return FAUXFAT_BLOCK_EIO;
+}
+
+static int fb_raw_read(void *context, uint64_t first_block,
+                       size_t block_count, void *data)
+{
+    fauxfat_block_opened *opened = (fauxfat_block_opened *)context;
+    uint64_t count               = (uint64_t)block_count;
+    int rc;
+
+    if (!opened->raw.io.read ||
+        !fb_range_ok(opened->raw.block_count, first_block, count))
+        return FAUXFAT_BLOCK_ERANGE;
+    rc = opened->raw.io.read(opened->raw.io.context, first_block,
+                             block_count, data);
+    return fb_translate_backend_error(&opened->backend_error, rc);
+}
+
+static int fb_raw_write(void *context, uint64_t first_block,
+                        size_t block_count, const void *data)
+{
+    fauxfat_block_opened *opened = (fauxfat_block_opened *)context;
+    uint64_t count               = (uint64_t)block_count;
+    int rc;
+
+    if (!opened->raw.io.write ||
+        !fb_range_ok(opened->raw.block_count, first_block, count))
+        return FAUXFAT_BLOCK_ERANGE;
+    rc = opened->raw.io.write(opened->raw.io.context, first_block,
+                              block_count, data);
+    return fb_translate_backend_error(&opened->backend_error, rc);
+}
+
+static int fb_raw_flush(void *context)
+{
+    fauxfat_block_opened *opened = (fauxfat_block_opened *)context;
+    int rc;
+
+    if (!opened->raw.flush)
+        return FAUXFAT_BLOCK_EINVAL;
+    rc = opened->raw.flush(opened->raw.io.context);
+    return fb_translate_backend_error(&opened->backend_error, rc);
+}
+
 static int fb_volume_read(void *context, uint64_t first_block,
                           size_t block_count, void *data)
 {
     fauxfat_block_opened *opened = (fauxfat_block_opened *)context;
     uint64_t count               = (uint64_t)block_count;
 
-    if (!opened->raw.io.read ||
-        !fb_range_ok(opened->volume_blocks, first_block, count))
+    if (!fb_range_ok(opened->volume_blocks, first_block, count))
         return FAUXFAT_BLOCK_ERANGE;
-    return opened->raw.io.read(opened->raw.io.context,
-                               opened->volume_first_block + first_block,
-                               block_count, data);
+    return fb_raw_read(opened, opened->volume_first_block + first_block,
+                       block_count, data);
 }
 
 static int fb_volume_write(void *context, uint64_t first_block,
@@ -27,39 +75,41 @@ static int fb_volume_write(void *context, uint64_t first_block,
     fauxfat_block_opened *opened = (fauxfat_block_opened *)context;
     uint64_t count               = (uint64_t)block_count;
 
-    if (!opened->raw.io.write ||
-        !fb_range_ok(opened->volume_blocks, first_block, count))
+    if (!fb_range_ok(opened->volume_blocks, first_block, count))
         return FAUXFAT_BLOCK_ERANGE;
-    return opened->raw.io.write(opened->raw.io.context,
-                                opened->volume_first_block + first_block,
-                                block_count, data);
+    return fb_raw_write(opened, opened->volume_first_block + first_block,
+                        block_count, data);
 }
 
 static int fb_volume_zero(void *context, uint64_t first_block,
                           uint64_t block_count)
 {
     fauxfat_block_opened *opened = (fauxfat_block_opened *)context;
+    int rc;
 
     if (!opened->raw.io.zero ||
         !fb_range_ok(opened->volume_blocks, first_block, block_count))
         return FAUXFAT_BLOCK_ERANGE;
-    return opened->raw.io.zero(opened->raw.io.context,
-                               opened->volume_first_block + first_block,
-                               block_count);
+    rc = opened->raw.io.zero(opened->raw.io.context,
+                             opened->volume_first_block + first_block,
+                             block_count);
+    return fb_translate_backend_error(&opened->backend_error, rc);
 }
 
 static int fb_volume_skip(void *context, uint64_t first_block,
                           uint64_t block_count, fauxfat_skip_kind kind)
 {
     fauxfat_block_opened *opened = (fauxfat_block_opened *)context;
+    int rc;
 
     if (!fb_range_ok(opened->volume_blocks, first_block, block_count))
         return FAUXFAT_BLOCK_ERANGE;
     if (!opened->raw.io.skip)
         return 0;
-    return opened->raw.io.skip(opened->raw.io.context,
-                               opened->volume_first_block + first_block,
-                               block_count, kind);
+    rc = opened->raw.io.skip(opened->raw.io.context,
+                             opened->volume_first_block + first_block,
+                             block_count, kind);
+    return fb_translate_backend_error(&opened->backend_error, rc);
 }
 
 static void fb_init_volume(fauxfat_block_opened *opened,
@@ -79,6 +129,170 @@ static void fb_init_volume(fauxfat_block_opened *opened,
     opened->volume_device.context = opened;
 }
 
+typedef struct fb_probe_window {
+    const fauxfat_block_device *device;
+    uint64_t first_block;
+    uint64_t block_count;
+    int backend_error;
+} fb_probe_window;
+
+static int fb_probe_read(void *context, uint64_t first_block,
+                         size_t block_count, void *data)
+{
+    fb_probe_window *window = (fb_probe_window *)context;
+    uint64_t count          = (uint64_t)block_count;
+    int rc;
+
+    if (!window->device->io.read ||
+        !fb_range_ok(window->block_count, first_block, count))
+        return FAUXFAT_BLOCK_ERANGE;
+    rc = window->device->io.read(window->device->io.context,
+                                 window->first_block + first_block,
+                                 block_count, data);
+    return fb_translate_backend_error(&window->backend_error, rc);
+}
+
+static int fb_partition_equal(const fauxgpt_partition_info *a,
+                              const fauxgpt_partition_info *b)
+{
+    return memcmp(a->type_guid, b->type_guid, 16u) == 0 &&
+           memcmp(a->unique_guid, b->unique_guid, 16u) == 0 &&
+           a->first_lba == b->first_lba &&
+           a->block_count == b->block_count &&
+           a->attributes == b->attributes;
+}
+
+static int fb_gpt_copies_equal(const fauxgpt_copy_info *a,
+                               const fauxgpt_copy_info *b)
+{
+    size_t i;
+    size_t compare_count;
+
+    if (a->partition_array_crc32 != b->partition_array_crc32 ||
+        a->info.disk_blocks != b->info.disk_blocks ||
+        a->info.first_usable_lba != b->info.first_usable_lba ||
+        a->info.last_usable_lba != b->info.last_usable_lba ||
+        memcmp(a->info.disk_guid, b->info.disk_guid, 16u) != 0 ||
+        a->info.partition_count != b->info.partition_count)
+        return 0;
+
+    compare_count = a->info.partition_count;
+    if (compare_count > FAUXGPT_OPEN_MAX_PARTITIONS)
+        compare_count = FAUXGPT_OPEN_MAX_PARTITIONS;
+    for (i = 0u; i < compare_count; ++i) {
+        if (!fb_partition_equal(&a->info.partitions[i],
+                                &b->info.partitions[i]))
+            return 0;
+    }
+    return 1;
+}
+
+static int fb_probe_volume(fauxfat_block_probe_info *probe,
+                           uint64_t first_block, uint64_t block_count,
+                           fb_probe_window *window)
+{
+    fauxfat_device volume;
+    int rc;
+
+    probe->volume_first_block = first_block;
+    probe->volume_blocks      = block_count;
+    window->first_block       = first_block;
+    window->block_count       = block_count;
+
+    memset(&volume, 0, sizeof(volume));
+    volume.read          = fb_probe_read;
+    volume.context       = window;
+    rc                   = fauxfat_reopen_probe(&volume, &probe->classification,
+                                                &probe->fauxfat);
+    probe->backend_error = window->backend_error;
+    if (rc == FAUXFAT_BLOCK_EIO)
+        return FAUXFAT_BLOCK_EIO;
+    if (rc == FAUXFAT_BLOCK_ERANGE || rc == FAUXFAT_EGEOMETRY ||
+        rc == FAUXFAT_ESTRUCTURE) {
+        probe->classification = FAUXFAT_VOLUME_INVALID;
+        memset(&probe->fauxfat, 0, sizeof(probe->fauxfat));
+        return FAUXFAT_BLOCK_OK;
+    }
+    if (rc == FAUXFAT_OK)
+        return FAUXFAT_BLOCK_OK;
+    return FAUXFAT_BLOCK_EINVAL;
+}
+
+int fauxfat_block_probe(fauxfat_block_probe_info *probe,
+                        const fauxfat_block_device *device)
+{
+    fb_probe_window window;
+    fauxgpt_device gd;
+    const fauxgpt_copy_info *chosen = NULL;
+    int primary_valid;
+    int backup_valid;
+    int rc;
+
+    if (!probe || !device || !device->io.read || device->block_count == 0u)
+        return FAUXFAT_BLOCK_EINVAL;
+    memset(probe, 0, sizeof(*probe));
+    memset(&window, 0, sizeof(window));
+    window.device      = device;
+    window.block_count = device->block_count;
+
+    if (device->block_count >= 68u) {
+        memset(&gd, 0, sizeof(gd));
+        gd.read              = fb_probe_read;
+        gd.context           = &window;
+        rc                   = fauxgpt_probe(&probe->gpt_probe, &gd, device->block_count);
+        probe->backend_error = window.backend_error;
+        if (rc == FAUXFAT_BLOCK_EIO)
+            return FAUXFAT_BLOCK_EIO;
+        if (rc != FAUXGPT_OK)
+            return FAUXFAT_BLOCK_EINVAL;
+
+        primary_valid = (probe->gpt_probe.primary.flags &
+                         FAUXGPT_COPY_VALID) != 0u;
+        backup_valid  = (probe->gpt_probe.backup.flags &
+                        FAUXGPT_COPY_VALID) != 0u;
+        if (primary_valid && backup_valid &&
+            !fb_gpt_copies_equal(&probe->gpt_probe.primary,
+                                 &probe->gpt_probe.backup)) {
+            probe->kind = FAUXFAT_BLOCK_MEDIA_GPT_CONFLICT;
+            return FAUXFAT_BLOCK_OK;
+        }
+
+        if (primary_valid || backup_valid) {
+            chosen      = primary_valid ? &probe->gpt_probe.primary : &probe->gpt_probe.backup;
+            probe->kind = FAUXFAT_BLOCK_MEDIA_GPT;
+            probe->gpt  = chosen->info;
+            if (primary_valid)
+                probe->gpt.flags |= FAUXGPT_INFO_PRIMARY_VALID;
+            if (backup_valid)
+                probe->gpt.flags |= FAUXGPT_INFO_BACKUP_VALID;
+            if ((probe->gpt_probe.flags & FAUXGPT_PROBE_PMBR_VALID) != 0u)
+                probe->gpt.flags |= FAUXGPT_INFO_PMBR_VALID;
+
+            if (chosen->info.partition_count == 0u)
+                return FAUXFAT_BLOCK_OK;
+            return fb_probe_volume(probe,
+                                   chosen->info.partitions[0].first_lba,
+                                   chosen->info.partitions[0].block_count,
+                                   &window);
+        }
+        if ((probe->gpt_probe.flags & FAUXGPT_PROBE_PMBR_MARKER) != 0u ||
+            (probe->gpt_probe.primary.flags & FAUXGPT_COPY_MARKER) != 0u ||
+            (probe->gpt_probe.backup.flags & FAUXGPT_COPY_MARKER) != 0u) {
+            probe->kind = FAUXFAT_BLOCK_MEDIA_GPT_DAMAGED;
+            return FAUXFAT_BLOCK_OK;
+        }
+    }
+
+    rc = fb_probe_volume(probe, 0u, device->block_count, &window);
+    if (rc != FAUXFAT_BLOCK_OK)
+        return rc;
+    if ((probe->fauxfat.flags & FAUXFAT_REOPEN_GEOMETRY_VALID) != 0u)
+        probe->kind = FAUXFAT_BLOCK_MEDIA_BARE;
+    else
+        probe->kind = FAUXFAT_BLOCK_MEDIA_UNKNOWN;
+    return FAUXFAT_BLOCK_OK;
+}
+
 static int fb_basic_data_profile(const fauxgpt_info *info)
 {
     size_t i;
@@ -95,50 +309,12 @@ static int fb_basic_data_profile(const fauxgpt_info *info)
     return 1;
 }
 
-static int fb_open_fauxfat(fauxfat_block_opened *opened,
-                           fauxfat_file_emit_fn emit,
-                           void *emit_context,
-                           size_t *descriptor_count)
+static int fb_open_fail(fauxfat_block_opened *opened, int rc,
+                        int backend_error)
 {
-    fauxfat_volume_class classification;
-    fauxfat_reopen_info info;
-    size_t ignored_count = 0u;
-    int rc;
-
-    rc = fauxfat_reopen(&opened->volume_device, NULL, NULL, &ignored_count,
-                        &classification, &info);
-    if (rc != FAUXFAT_OK)
-        return rc;
-    if (classification != FAUXFAT_VOLUME_FAUXFAT_VALID &&
-        classification != FAUXFAT_VOLUME_FAUXFAT_CHANGED)
-        return FAUXFAT_BLOCK_ENOTFAUXFAT;
-    if (info.partition_lba != opened->volume_first_block ||
-        info.volume_blocks != opened->volume_blocks)
-        return FAUXFAT_BLOCK_EPARTITION;
-
-    opened->classification = classification;
-    opened->fauxfat        = info;
-    if (!emit) {
-        if (descriptor_count)
-            *descriptor_count = ignored_count;
-        return FAUXFAT_BLOCK_OK;
-    }
-
-    rc = fauxfat_reopen(&opened->volume_device, emit, emit_context,
-                        descriptor_count, &classification, NULL);
-    if (rc != FAUXFAT_OK)
-        return rc;
-    return FAUXFAT_BLOCK_OK;
-}
-
-static int fb_probe_gpt(const fauxfat_block_device *device, fauxgpt_info *info)
-{
-    fauxgpt_device gd;
-
-    memset(&gd, 0, sizeof(gd));
-    gd.read    = device->io.read;
-    gd.context = device->io.context;
-    return fauxgpt_open(info, &gd, device->block_count);
+    memset(opened, 0, sizeof(*opened));
+    opened->backend_error = backend_error;
+    return rc;
 }
 
 int fauxfat_block_open(fauxfat_block_opened *opened,
@@ -149,9 +325,10 @@ int fauxfat_block_open(fauxfat_block_opened *opened,
                        void *emit_context,
                        size_t *descriptor_count)
 {
-    fauxgpt_info gpt;
-    int grc;
-    int use_gpt = 0;
+    fauxfat_block_probe_info probe;
+    fauxfat_block_layout layout;
+    uint64_t first_block;
+    uint64_t block_count;
     int rc;
 
     if (!opened || !device || !device->io.read || device->block_count == 0u ||
@@ -165,43 +342,61 @@ int fauxfat_block_open(fauxfat_block_opened *opened,
     if (expected_gpt && expected_gpt->disk_blocks != device->block_count)
         return FAUXFAT_BLOCK_EPARTITION;
 
-    grc = fb_probe_gpt(device, &gpt);
-    if (grc == FAUXGPT_OK) {
-        use_gpt = 1;
-    } else if (grc == FAUXGPT_EPARTITIONS) {
-        return FAUXFAT_BLOCK_EPARTITION;
-    } else if (grc == FAUXGPT_ESTRUCTURE) {
-        return FAUXFAT_BLOCK_EWRAPPER;
-    } else if (grc == FAUXGPT_ENOTGPT || grc == FAUXGPT_EGEOMETRY) {
-        use_gpt = 0;
-    } else if (grc != FAUXGPT_OK) {
-        return grc;
-    }
-
-    if (expectation == FAUXFAT_BLOCK_GPT && !use_gpt)
-        return FAUXFAT_BLOCK_EWRAPPER;
-    if (expectation == FAUXFAT_BLOCK_BARE && use_gpt)
-        return FAUXFAT_BLOCK_EWRAPPER;
-
-    if (use_gpt) {
-        if (!fb_basic_data_profile(&gpt))
-            return FAUXFAT_BLOCK_EPARTITION;
-        if (expected_gpt &&
-            !fauxgpt_partitioning_matches(&gpt, expected_gpt))
-            return FAUXFAT_BLOCK_EPARTITION;
-        fb_init_volume(opened, device, FAUXFAT_BLOCK_GPT,
-                       gpt.partitions[0].first_lba,
-                       gpt.partitions[0].block_count);
-        opened->gpt = gpt;
-    } else {
-        fb_init_volume(opened, device, FAUXFAT_BLOCK_BARE,
-                       0u, device->block_count);
-    }
-
-    rc = fb_open_fauxfat(opened, emit, emit_context, descriptor_count);
+    rc = fauxfat_block_probe(&probe, device);
     if (rc != FAUXFAT_BLOCK_OK)
-        memset(opened, 0, sizeof(*opened));
-    return rc;
+        return fb_open_fail(opened, rc, probe.backend_error);
+
+    if (probe.kind == FAUXFAT_BLOCK_MEDIA_GPT_DAMAGED ||
+        probe.kind == FAUXFAT_BLOCK_MEDIA_GPT_CONFLICT)
+        return fb_open_fail(opened, FAUXFAT_BLOCK_EWRAPPER, 0);
+
+    if (probe.kind == FAUXFAT_BLOCK_MEDIA_GPT) {
+        if (expectation == FAUXFAT_BLOCK_BARE)
+            return fb_open_fail(opened, FAUXFAT_BLOCK_EWRAPPER, 0);
+        if ((probe.gpt_probe.primary.flags &
+             (FAUXGPT_COPY_VALID | FAUXGPT_COPY_TOO_MANY)) ==
+                (FAUXGPT_COPY_VALID | FAUXGPT_COPY_TOO_MANY) ||
+            (probe.gpt_probe.backup.flags &
+             (FAUXGPT_COPY_VALID | FAUXGPT_COPY_TOO_MANY)) ==
+                (FAUXGPT_COPY_VALID | FAUXGPT_COPY_TOO_MANY))
+            return fb_open_fail(opened, FAUXFAT_BLOCK_EPARTITION, 0);
+        if (!fb_basic_data_profile(&probe.gpt))
+            return fb_open_fail(opened, FAUXFAT_BLOCK_EPARTITION, 0);
+        if (expected_gpt &&
+            !fauxgpt_partitioning_matches(&probe.gpt, expected_gpt))
+            return fb_open_fail(opened, FAUXFAT_BLOCK_EPARTITION, 0);
+        layout      = FAUXFAT_BLOCK_GPT;
+        first_block = probe.gpt.partitions[0].first_lba;
+        block_count = probe.gpt.partitions[0].block_count;
+    } else {
+        if (expectation == FAUXFAT_BLOCK_GPT)
+            return fb_open_fail(opened, FAUXFAT_BLOCK_EWRAPPER, 0);
+        layout      = FAUXFAT_BLOCK_BARE;
+        first_block = 0u;
+        block_count = device->block_count;
+    }
+
+    if (probe.classification != FAUXFAT_VOLUME_FAUXFAT_VALID &&
+        probe.classification != FAUXFAT_VOLUME_FAUXFAT_CHANGED)
+        return fb_open_fail(opened, FAUXFAT_BLOCK_ENOTFAUXFAT, 0);
+    if (probe.fauxfat.partition_lba != first_block ||
+        probe.fauxfat.volume_blocks != block_count)
+        return fb_open_fail(opened, FAUXFAT_BLOCK_EPARTITION, 0);
+
+    fb_init_volume(opened, device, layout, first_block, block_count);
+    opened->classification = probe.classification;
+    opened->fauxfat        = probe.fauxfat;
+    if (layout == FAUXFAT_BLOCK_GPT)
+        opened->gpt = probe.gpt;
+
+    /* Open semantics do not depend on whether the caller asked for output.
+     * Run the bounded loose scan once to prove descriptor recoverability; the
+     * split reopen path avoids repeating the much heavier validation pass. */
+    rc = fauxfat_reopen_scan(&opened->volume_device, &opened->fauxfat,
+                             emit, emit_context, descriptor_count);
+    if (rc != FAUXFAT_OK)
+        return fb_open_fail(opened, rc, opened->backend_error);
+    return FAUXFAT_BLOCK_OK;
 }
 
 static int fb_format_profile_valid(const fauxfat_view *view,
@@ -299,17 +494,17 @@ int fauxfat_block_format(const fauxfat_view *view,
 
     if (layout == FAUXFAT_BLOCK_BARE) {
         if (device->flush)
-            return device->flush(device->io.context);
+            return fb_raw_flush(&target);
         return FAUXFAT_BLOCK_OK;
     }
 
-    rc = device->flush(device->io.context);
-    if (rc != 0)
+    rc = fb_raw_flush(&target);
+    if (rc != FAUXFAT_BLOCK_OK)
         return rc;
     memset(&gd, 0, sizeof(gd));
-    gd.read    = device->io.read;
-    gd.write   = device->io.write;
-    gd.flush   = device->flush;
-    gd.context = device->io.context;
+    gd.read    = fb_raw_read;
+    gd.write   = fb_raw_write;
+    gd.flush   = fb_raw_flush;
+    gd.context = &target;
     return fauxgpt_format(gpt, &gd);
 }

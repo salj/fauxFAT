@@ -329,6 +329,21 @@ rc = fauxfat_reopen(&device,
 
 `fauxfat_reopen()` derives only the supported fixed fauxFAT geometry. It does not attempt arbitrary exFAT discovery.
 
+Code which needs to apply policy before exposing recovered descriptors can use
+the split form instead:
+
+```c
+rc = fauxfat_reopen_probe(&device, &cls, &info);
+if (rc == FAUXFAT_OK &&
+    (info.flags & FAUXFAT_REOPEN_SCAN_READY) != 0)
+    rc = fauxfat_reopen_scan(&device, &info, emit_file, ctx, &count);
+```
+
+The probe performs geometry/identity/structural classification. The scan then
+walks the bounded root once using the recorded geometry; it does not rerun the
+full self-validation. `fauxfat_reopen()` remains the convenience wrapper which
+does both.
+
 This function is volume-relative. If the caller has a whole card/image which
 may be GPT-wrapped, prefer the integration API in `fauxfat_block.h` described
 below instead of manually guessing an LBA offset and handing it to
@@ -485,6 +500,25 @@ rc = fauxfat_block_open(&opened, &disk,
                         emit_file, ctx, &count);
 ```
 
+For diagnostics, repair decisions, or UI which needs to explain why open would
+refuse a target, inspect it first without applying product policy:
+
+```c
+fauxfat_block_probe_info probe;
+rc = fauxfat_block_probe(&probe, &disk);
+```
+
+`probe.kind` distinguishes bare media, coherent GPT, damaged GPT metadata, and
+two individually valid but conflicting GPT copies. `probe.gpt_probe` retains
+the primary and backup observations independently. A coherent GPT is still
+reported even when it has more than two active partitions or partition 1 is
+not fauxFAT; those are policy failures for `fauxfat_block_open()`, not failures
+to observe the disk. The block probe deliberately stops before the final loose
+descriptor scan. `fauxfat_block_open()` applies policy and then performs that
+bounded scan once, whether or not an emit callback is set, so
+open success does not depend on whether descriptor output happened to be
+requested.
+
 `FAUXFAT_BLOCK_AUTO` accepts either:
 
 - a bare fauxFAT volume beginning at physical LBA 0; or
@@ -551,8 +585,13 @@ requests.
 The integration-specific failures are `FAUXFAT_BLOCK_EWRAPPER` for malformed
 or wrong wrapper metadata, `FAUXFAT_BLOCK_EPARTITION` for a valid-enough GPT
 whose partition map is unacceptable, and `FAUXFAT_BLOCK_ENOTFAUXFAT` when the
-candidate volume lacks recognizable fauxFAT identity. Block/backend callback
-failures are still propagated unchanged.
+candidate volume lacks recognizable fauxFAT identity. Raw block callback
+failures are translated to `FAUXFAT_BLOCK_EIO`, so an SD/backend errno such as
+`-5`, `-6`, or `-7` cannot accidentally become GPT parser state. The original
+callback value is retained as `probe.backend_error` by
+`fauxfat_block_probe()` and as `opened.backend_error` for I/O through a
+successfully opened volume adapter. The lower-level `fauxfat` and `fauxgpt`
+APIs continue to propagate their callbacks unchanged.
 
 ## 17. Low-level whole-card GPT API
 
@@ -604,6 +643,14 @@ fauxgpt_device gd = {
 fauxgpt_info gi;
 rc = fauxgpt_open(&gi, &gd, card_blocks);
 ```
+
+`fauxgpt_probe()` is the observation primitive underneath `fauxgpt_open()`.
+It inspects the PMBR, primary copy, and backup copy independently and records
+markers, CRC-valid copies, array CRCs, and the bounded active-entry count.
+Structural damage or a primary/backup conflict remains visible in the probe
+result instead of being collapsed immediately into `FAUXGPT_ESTRUCTURE`.
+`fauxgpt_open()` then applies the ordinary one-coherent-map / at-most-two-entry
+policy to that observation.
 
 `fauxgpt_open()` validates the canonical header geometry, header CRCs, complete
 128-entry array CRCs, and active entry ranges. Either primary or backup GPT is

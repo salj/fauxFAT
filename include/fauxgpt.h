@@ -95,6 +95,31 @@ enum {
     FAUXGPT_INFO_PMBR_VALID    = 1u << 2
 };
 
+/* One independently inspected GPT header/entry-array copy. */
+typedef struct fauxgpt_copy_info {
+    fauxgpt_info info;
+    uint32_t partition_array_crc32;
+    unsigned flags;
+} fauxgpt_copy_info;
+
+enum {
+    FAUXGPT_COPY_MARKER   = 1u << 0,
+    FAUXGPT_COPY_VALID    = 1u << 1,
+    FAUXGPT_COPY_TOO_MANY = 1u << 2
+};
+
+/* Raw observation of the bounded GPT wrapper before open policy is applied. */
+typedef struct fauxgpt_probe_info {
+    fauxgpt_copy_info primary;
+    fauxgpt_copy_info backup;
+    unsigned flags;
+} fauxgpt_probe_info;
+
+enum {
+    FAUXGPT_PROBE_PMBR_MARKER = 1u << 0,
+    FAUXGPT_PROBE_PMBR_VALID  = 1u << 1
+};
+
 enum {
     FAUXGPT_OK        = 0,
     FAUXGPT_EINVAL    = -1,
@@ -112,6 +137,16 @@ enum {
 
 /* Validate a fixed GPT layout and precompute its entry-array CRC32. */
 int fauxgpt_init(fauxgpt_view *view, const fauxgpt_layout *layout);
+
+/*
+ * Inspect primary GPT, backup GPT, and the protective MBR independently.
+ * Structural damage is reported in the returned probe state, not as an error.
+ * The only failures are bad arguments/geometry or device callback failures.
+ * Device callback failures are propagated unchanged by this low-level API.
+ */
+int fauxgpt_probe(fauxgpt_probe_info *probe,
+                  const fauxgpt_device *device,
+                  uint64_t disk_blocks);
 
 /*
  * Read and validate the narrow on-disk GPT profile in constant memory.

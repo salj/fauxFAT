@@ -286,6 +286,18 @@ Before calling the GPT profile boring enough to ship, test at least:
 | Linux current | same | partition node visible; format/mount normally | same |
 | representative Android/AOSP-ish device | detect/mount | behavior with second unformatted Basic Data partition | detect/mount |
 
+The Windows side should have a native qualification utility built as a `.exe`
+with `zig cc`. Keep two deliberately separate modes: an explicit raw-device
+mode for real-media qualification, and a safer default VHDX mode. The VHDX
+path should create and attach a virtual disk using the Windows virtual-disk
+API, feed the resulting block device through `fauxfat_block_format()`, let the
+normal Windows filesystem stack mount and modify it, then reopen/verify the
+same virtual disk through `fauxfat_block_probe()` / `fauxfat_block_open()`.
+The container file itself is not a raw fauxFAT image, so verification must use
+the attached virtual-disk block device rather than pretending VHDX is just a
+fancy extension on a flat image. Humans have suffered enough from tools which
+confuse containers with payloads.
+
 For each host, also inspect whether it rewrites GPT names, attributes, partition GUIDs, entry ordering, or backup tables during ordinary filesystem use. After formatting partition 2, regenerate/repair GPT metadata and verify that every partition-2 sector remains untouched and the host filesystem still mounts. It should, but this is removable storage and optimism has already had enough turns at the controls.
 
 The same test should exercise common USB and built-in SD readers. The OS sees a block device either way, but removable-media policy and driver stacks have historically found opportunities to be special.

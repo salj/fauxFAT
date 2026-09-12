@@ -23,6 +23,30 @@ typedef enum fauxfat_block_layout {
     FAUXFAT_BLOCK_GPT  = 2
 } fauxfat_block_layout;
 
+typedef enum fauxfat_block_media_kind {
+    FAUXFAT_BLOCK_MEDIA_UNKNOWN = 0,
+    FAUXFAT_BLOCK_MEDIA_BARE,
+    FAUXFAT_BLOCK_MEDIA_GPT,
+    FAUXFAT_BLOCK_MEDIA_GPT_DAMAGED,
+    FAUXFAT_BLOCK_MEDIA_GPT_CONFLICT
+} fauxfat_block_media_kind;
+
+/*
+ * Non-writing observation of a physical target. Structural/policy problems
+ * live in this result rather than being collapsed into open() errors.
+ * backend_error is meaningful only when fauxfat_block_probe() returns EIO.
+ */
+typedef struct fauxfat_block_probe_info {
+    fauxfat_block_media_kind kind;
+    int backend_error;
+    fauxgpt_probe_info gpt_probe;
+    fauxgpt_info gpt; /* coherent copy when kind == GPT */
+    uint64_t volume_first_block;
+    uint64_t volume_blocks;
+    fauxfat_volume_class classification;
+    fauxfat_reopen_info fauxfat;
+} fauxfat_block_probe_info;
+
 /*
  * Result of opening a block device. This object owns a shallow copy of the
  * caller's raw callback table and backs volume_device.context, so do not move
@@ -37,6 +61,8 @@ typedef struct fauxfat_block_opened {
     fauxfat_volume_class classification;
     fauxfat_reopen_info fauxfat;
     fauxgpt_info gpt; /* zero for a bare volume */
+    /* Last raw device callback error translated to FAUXFAT_BLOCK_EIO. */
+    int backend_error;
 } fauxfat_block_opened;
 
 enum {
@@ -48,7 +74,9 @@ enum {
     /* GPT is valid enough to inspect, but its partitioning is not acceptable. */
     FAUXFAT_BLOCK_EPARTITION = -35,
     /* Candidate volume is not recognizably fauxFAT. */
-    FAUXFAT_BLOCK_ENOTFAUXFAT = -36
+    FAUXFAT_BLOCK_ENOTFAUXFAT = -36,
+    /* A raw read/write/zero/skip/flush callback failed. */
+    FAUXFAT_BLOCK_EIO = -37
 };
 
 enum {
@@ -63,6 +91,17 @@ enum {
      */
     FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA = 1u << 1
 };
+
+/*
+ * Inspect a physical target without applying product layout policy and without
+ * writing it. GPT primary/backup copies remain independently visible, and a
+ * coherent GPT may still report >2 active partitions or a non-fauxFAT p1.
+ *
+ * Structural damage is observation, not failure. Only bad API arguments,
+ * impossible device geometry, and actual I/O failures return non-zero.
+ */
+int fauxfat_block_probe(fauxfat_block_probe_info *probe,
+                        const fauxfat_block_device *device);
 
 /*
  * Open a raw block device as fauxFAT.

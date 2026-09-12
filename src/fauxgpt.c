@@ -72,14 +72,6 @@ static uint32_t fg_crc32(const void *data, size_t length)
     return ~fg_crc32_update(UINT32_MAX, data, length);
 }
 
-typedef struct fg_open_copy {
-    fauxgpt_info info;
-    uint32_t array_crc32;
-    int marker;
-    int valid;
-    int too_many;
-} fg_open_copy;
-
 static int fg_dev_read(const fauxgpt_device *device, uint64_t first_block,
                        size_t block_count, void *data)
 {
@@ -133,11 +125,12 @@ static int fg_partition_info_equal(const fauxgpt_partition_info *a,
            a->attributes == b->attributes;
 }
 
-static int fg_copy_equal(const fg_open_copy *a, const fg_open_copy *b)
+static int fg_copy_equal(const fauxgpt_copy_info *a,
+                         const fauxgpt_copy_info *b)
 {
     size_t i;
 
-    if (a->array_crc32 != b->array_crc32 ||
+    if (a->partition_array_crc32 != b->partition_array_crc32 ||
         a->info.disk_blocks != b->info.disk_blocks ||
         a->info.first_usable_lba != b->info.first_usable_lba ||
         a->info.last_usable_lba != b->info.last_usable_lba ||
@@ -175,7 +168,7 @@ static int fg_parse_entry(const uint8_t entry[FAUXGPT_ENTRY_SIZE],
 }
 
 static int fg_read_copy(const fauxgpt_device *device, uint64_t disk_blocks,
-                        int backup, fg_open_copy *copy)
+                        int backup, fauxgpt_copy_info *copy)
 {
     uint8_t header[FAUXGPT_BLOCK_SIZE];
     uint8_t crc_header[FAUXGPT_BLOCK_SIZE];
@@ -200,7 +193,7 @@ static int fg_read_copy(const fauxgpt_device *device, uint64_t disk_blocks,
         return rc;
     if (memcmp(header, "EFI PART", 8u) != 0)
         return FAUXGPT_OK;
-    copy->marker = 1;
+    copy->flags |= FAUXGPT_COPY_MARKER;
 
     if (fg_load32(header + 8u) != 0x00010000u ||
         fg_load32(header + 12u) != 92u || fg_load32(header + 20u) != 0u ||
@@ -244,7 +237,7 @@ static int fg_read_copy(const fauxgpt_device *device, uint64_t disk_blocks,
             if (fg_guid_zero(entry))
                 continue;
             if (index >= FAUXGPT_OPEN_MAX_PARTITIONS) {
-                copy->too_many = 1;
+                copy->flags |= FAUXGPT_COPY_TOO_MANY;
                 ++active;
                 continue;
             }
@@ -266,11 +259,11 @@ static int fg_read_copy(const fauxgpt_device *device, uint64_t disk_blocks,
         }
     }
 
-    copy->array_crc32 = ~crc;
-    if (copy->array_crc32 != stored_array_crc)
+    copy->partition_array_crc32 = ~crc;
+    if (copy->partition_array_crc32 != stored_array_crc)
         return FAUXGPT_OK;
     copy->info.partition_count = active;
-    copy->valid                = 1;
+    copy->flags |= FAUXGPT_COPY_VALID;
     return FAUXGPT_OK;
 }
 
@@ -434,57 +427,80 @@ int fauxgpt_init(fauxgpt_view *view, const fauxgpt_layout *layout)
     return FAUXGPT_OK;
 }
 
-int fauxgpt_open(fauxgpt_info *info,
-                 const fauxgpt_device *device,
-                 uint64_t disk_blocks)
+int fauxgpt_probe(fauxgpt_probe_info *probe,
+                  const fauxgpt_device *device,
+                  uint64_t disk_blocks)
 {
-    fg_open_copy primary;
-    fg_open_copy backup;
-    const fg_open_copy *chosen;
     uint8_t pmbr[FAUXGPT_BLOCK_SIZE];
-    int pmbr_marker;
-    int pmbr_valid;
     int rc;
 
-    if (!info || !device || !device->read)
+    if (!probe || !device || !device->read)
         return FAUXGPT_EINVAL;
-    memset(info, 0, sizeof(*info));
+    memset(probe, 0, sizeof(*probe));
     if (disk_blocks < 68u)
         return FAUXGPT_EGEOMETRY;
 
     rc = fg_dev_read(device, 0u, 1u, pmbr);
     if (rc != 0)
         return rc;
-    pmbr_marker = fg_pmbr_marker(pmbr);
-    pmbr_valid  = fg_pmbr_valid(pmbr, disk_blocks);
+    if (fg_pmbr_marker(pmbr))
+        probe->flags |= FAUXGPT_PROBE_PMBR_MARKER;
+    if (fg_pmbr_valid(pmbr, disk_blocks))
+        probe->flags |= FAUXGPT_PROBE_PMBR_VALID;
 
-    rc = fg_read_copy(device, disk_blocks, 0, &primary);
+    rc = fg_read_copy(device, disk_blocks, 0, &probe->primary);
     if (rc != 0)
         return rc;
-    rc = fg_read_copy(device, disk_blocks, 1, &backup);
+    rc = fg_read_copy(device, disk_blocks, 1, &probe->backup);
     if (rc != 0)
         return rc;
+    return FAUXGPT_OK;
+}
 
-    if (!primary.valid && !backup.valid) {
-        if (pmbr_marker || primary.marker || backup.marker)
+int fauxgpt_open(fauxgpt_info *info,
+                 const fauxgpt_device *device,
+                 uint64_t disk_blocks)
+{
+    fauxgpt_probe_info probe;
+    const fauxgpt_copy_info *chosen;
+    int primary_valid;
+    int backup_valid;
+    int rc;
+
+    if (!info || !device || !device->read)
+        return FAUXGPT_EINVAL;
+    memset(info, 0, sizeof(*info));
+
+    rc = fauxgpt_probe(&probe, device, disk_blocks);
+    if (rc != FAUXGPT_OK)
+        return rc;
+
+    primary_valid = (probe.primary.flags & FAUXGPT_COPY_VALID) != 0u;
+    backup_valid  = (probe.backup.flags & FAUXGPT_COPY_VALID) != 0u;
+
+    if (!primary_valid && !backup_valid) {
+        if ((probe.flags & FAUXGPT_PROBE_PMBR_MARKER) != 0u ||
+            (probe.primary.flags & FAUXGPT_COPY_MARKER) != 0u ||
+            (probe.backup.flags & FAUXGPT_COPY_MARKER) != 0u)
             return FAUXGPT_ESTRUCTURE;
         return FAUXGPT_ENOTGPT;
     }
-    if (primary.valid && backup.valid && !fg_copy_equal(&primary, &backup))
+    if (primary_valid && backup_valid &&
+        !fg_copy_equal(&probe.primary, &probe.backup))
         return FAUXGPT_ESTRUCTURE;
 
-    chosen = primary.valid ? &primary : &backup;
-    if (chosen->too_many || chosen->info.partition_count >
-                                FAUXGPT_OPEN_MAX_PARTITIONS)
+    chosen = primary_valid ? &probe.primary : &probe.backup;
+    if ((chosen->flags & FAUXGPT_COPY_TOO_MANY) != 0u ||
+        chosen->info.partition_count > FAUXGPT_OPEN_MAX_PARTITIONS)
         return FAUXGPT_EPARTITIONS;
 
     *info       = chosen->info;
     info->flags = 0u;
-    if (primary.valid)
+    if (primary_valid)
         info->flags |= FAUXGPT_INFO_PRIMARY_VALID;
-    if (backup.valid)
+    if (backup_valid)
         info->flags |= FAUXGPT_INFO_BACKUP_VALID;
-    if (pmbr_valid)
+    if ((probe.flags & FAUXGPT_PROBE_PMBR_VALID) != 0u)
         info->flags |= FAUXGPT_INFO_PMBR_VALID;
     return FAUXGPT_OK;
 }
