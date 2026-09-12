@@ -8,12 +8,22 @@
 extern "C" {
 #endif
 
+/*
+ * Optional media-generation fence. Return a stable token for the currently
+ * inserted/opened physical medium and change it whenever removal, insertion,
+ * reinitialization, or another event invalidates previously opened handles.
+ * Equality is the only required property; monotonicity is not required.
+ */
+typedef uint64_t (*fauxfat_block_generation_fn)(void *context);
+
 /* Physical 512-byte block device/image presented to the integration layer. */
 typedef struct fauxfat_block_device {
     uint64_t block_count;
     fauxfat_device io;
     /* Required for GPT formatting; optional for read/open and bare formatting. */
     fauxgpt_dev_flush_fn flush;
+    /* Optional. Called with io.context before/after raw I/O to detect swaps. */
+    fauxfat_block_generation_fn generation;
 } fauxfat_block_device;
 
 typedef enum fauxfat_block_layout {
@@ -39,6 +49,8 @@ typedef enum fauxfat_block_media_kind {
 typedef struct fauxfat_block_probe_info {
     fauxfat_block_media_kind kind;
     int backend_error;
+    /* Captured media-generation token when device.generation is available. */
+    uint64_t media_generation;
     fauxgpt_probe_info gpt_probe;
     fauxgpt_info gpt; /* coherent copy when kind == GPT */
     uint64_t volume_first_block;
@@ -63,6 +75,8 @@ typedef struct fauxfat_block_opened {
     fauxgpt_info gpt; /* zero for a bare volume */
     /* Last raw device callback error translated to FAUXFAT_BLOCK_EIO. */
     int backend_error;
+    /* Captured generation; volume callbacks fail ESTALE after replacement. */
+    uint64_t media_generation;
 } fauxfat_block_opened;
 
 enum {
@@ -78,7 +92,9 @@ enum {
     /* A raw read/write/zero/skip/flush callback failed. */
     FAUXFAT_BLOCK_EIO = -37,
     /* Geometry is acceptable, but stable fauxFAT/GPT identity differs. */
-    FAUXFAT_BLOCK_EIDENTITY = -38
+    FAUXFAT_BLOCK_EIDENTITY = -38,
+    /* Optional media generation changed during or after opening an operation. */
+    FAUXFAT_BLOCK_ESTALE = -39
 };
 
 enum {
@@ -101,7 +117,8 @@ enum {
  * coherent GPT may still report >2 active partitions or a non-fauxFAT p1.
  *
  * Structural damage is observation, not failure. Only bad API arguments,
- * impossible device geometry, and actual I/O failures return non-zero.
+ * impossible device geometry, actual I/O failures, or a generation change
+ * during the probe return non-zero.
  */
 int fauxfat_block_probe(fauxfat_block_probe_info *probe,
                         const fauxfat_block_device *device);
@@ -122,6 +139,11 @@ int fauxfat_block_probe(fauxfat_block_probe_info *probe,
  * GPT partition 1 must carry a recognizable fauxFAT OEM identity. A generic
  * exFAT volume is deliberately rejected even if the bounded exFAT scanner
  * could otherwise read it.
+ *
+ * When device.generation is available, open captures it before probing and the
+ * returned volume adapter checks the same token before and after every raw
+ * operation. A replacement/reinitialized medium therefore yields ESTALE
+ * rather than addressing the new medium through old partition geometry.
  */
 int fauxfat_block_open(fauxfat_block_opened *opened,
                        const fauxfat_block_device *device,

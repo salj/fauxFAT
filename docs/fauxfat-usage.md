@@ -491,6 +491,7 @@ fauxfat_block_device disk = {
         .context = card,
     },
     .flush = raw_flush,
+    .generation = card_generation, /* optional hotplug/media-replacement fence */
 };
 
 fauxfat_block_opened opened;
@@ -546,6 +547,25 @@ over the physical device and can be passed to `fauxfat_disk_file_read()` /
 that adapter is in use because its callback context points back to the opened
 object.
 
+Removable-media integrations should also provide `disk.generation`. The
+callback returns an arbitrary 64-bit token for the currently inserted/opened
+medium; change it on removal, insertion, controller reinitialization, or any
+other event which invalidates previously opened handles. Equality is the only
+contract, so a simple insertion-generation counter is enough. Probe/open,
+format, and GPT repair capture one token for the entire operation, and every
+raw read/write/zero/skip/flush through the block adapter checks it before and
+after touching the backend. A changed token returns
+`FAUXFAT_BLOCK_ESTALE`; an already-opened partition adapter therefore cannot
+quietly apply old GPT geometry to a replacement card. `probe.media_generation`
+and `opened.media_generation` expose the captured token for diagnostics.
+
+This fence is not a locking primitive. The storage integration still has to
+exclude USB MSC/host access and other writers while device-side open, repair,
+format, or writable handles are active. If media physically changes inside a
+backend write callback, the library can detect that only when the callback
+returns; preventing such a write from reaching replacement media is the block
+driver/hotplug state machine's job.
+
 ## 16. Publish or reformat a complete target
 
 Formatting uses the same integration layer, but AUTO is forbidden. Destructive
@@ -597,7 +617,8 @@ whose partition map is unacceptable, and `FAUXFAT_BLOCK_ENOTFAUXFAT` when the
 candidate volume lacks recognizable fauxFAT identity.
 `FAUXFAT_BLOCK_EIDENTITY` means the wrapper/geometry is acceptable but one of
 the stable ownership identifiers differs from the requested format target.
-Raw block callback
+`FAUXFAT_BLOCK_ESTALE` means the optional media-generation token changed
+during the operation or after an opened adapter was created. Raw block callback
 failures are translated to `FAUXFAT_BLOCK_EIO`, so an SD/backend errno such as
 `-5`, `-6`, or `-7` cannot accidentally become GPT parser state. The original
 callback value is retained as `probe.backend_error` by

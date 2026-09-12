@@ -19,6 +19,9 @@ typedef struct memdev {
     int fail_zero_code;
     int fail_skip_code;
     int fail_flush_code;
+    uint64_t generation;
+    uint64_t bump_generation_on_read_call;
+    uint64_t bump_generation_on_write_call;
 } memdev;
 
 static int mem_read(void *context, uint64_t first_block,
@@ -34,6 +37,9 @@ static int mem_read(void *context, uint64_t first_block,
         return -101;
     memcpy(data, m->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE),
            block_count * FAUXFAT_BLOCK_SIZE);
+    if (m->bump_generation_on_read_call != 0u &&
+        m->read_calls == m->bump_generation_on_read_call)
+        ++m->generation;
     return 0;
 }
 
@@ -50,6 +56,9 @@ static int mem_write(void *context, uint64_t first_block,
         return -102;
     memcpy(m->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE), data,
            block_count * FAUXFAT_BLOCK_SIZE);
+    if (m->bump_generation_on_write_call != 0u &&
+        m->write_calls == m->bump_generation_on_write_call)
+        ++m->generation;
     return 0;
 }
 
@@ -86,6 +95,12 @@ static int mem_flush(void *context)
         return m->fail_flush_code;
     ++m->flushes;
     return 0;
+}
+
+static uint64_t mem_generation(void *context)
+{
+    memdev *m = (memdev *)context;
+    return m->generation;
 }
 
 static void fill_guid(uint8_t guid[16], uint8_t seed)
@@ -851,6 +866,98 @@ static void test_gpt_wrapper_repair(void)
     free(media.data);
 }
 
+static void test_media_generation_fencing(void)
+{
+    fauxfat_config cfg;
+    fauxfat_view view;
+    fauxfat_block_device dev;
+    fauxfat_block_probe_info probe;
+    fauxfat_block_opened opened;
+    memdev media;
+    uint8_t block[FAUXFAT_BLOCK_SIZE];
+    uint64_t reads_before;
+    uint64_t writes_before;
+    uint64_t zeros_before;
+    size_t bytes;
+
+    init_fauxfat(&cfg, &view, 0u);
+    bytes = (size_t)(view.volume_blocks * FAUXFAT_BLOCK_SIZE);
+    memset(&media, 0, sizeof(media));
+    media.blocks     = view.volume_blocks;
+    media.generation = 1u;
+    media.data       = (uint8_t *)calloc(1u, bytes);
+    assert(media.data != NULL);
+
+    memset(&dev, 0, sizeof(dev));
+    dev.block_count = media.blocks;
+    dev.io.read     = mem_read;
+    dev.io.write    = mem_write;
+    dev.io.zero     = mem_zero;
+    dev.io.skip     = mem_skip;
+    dev.io.context  = &media;
+    dev.flush       = mem_flush;
+    dev.generation  = mem_generation;
+
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_BARE, NULL, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_OK);
+
+    assert(fauxfat_block_probe(&probe, &dev) == FAUXFAT_BLOCK_OK);
+    assert(probe.media_generation == 1u);
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_BARE, NULL,
+                              NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
+    assert(opened.media_generation == 1u);
+
+    /* An already-opened partition adapter must not touch replacement media. */
+    ++media.generation;
+    reads_before  = media.read_calls;
+    writes_before = media.write_calls;
+    memset(block, 0, sizeof(block));
+    assert(opened.volume_device.read(opened.volume_device.context, 0u, 1u,
+                                     block) == FAUXFAT_BLOCK_ESTALE);
+    assert(media.read_calls == reads_before);
+    assert(opened.volume_device.write(opened.volume_device.context, 0u, 1u,
+                                      block) == FAUXFAT_BLOCK_ESTALE);
+    assert(media.write_calls == writes_before);
+
+    /* A swap during a read invalidates the entire observation, not merely the
+     * next operation. The post-read generation check catches this case. */
+    media.bump_generation_on_read_call = media.read_calls + 1u;
+    assert(fauxfat_block_probe(&probe, &dev) == FAUXFAT_BLOCK_ESTALE);
+    assert(probe.media_generation == 2u);
+    media.bump_generation_on_read_call = 0u;
+
+    /* Safe formatting uses one captured generation across its read-only
+     * preflight and mutation phase. A replacement during preflight performs
+     * no writes or zeroing. */
+    reads_before                       = media.read_calls;
+    writes_before                      = media.write_calls;
+    zeros_before                       = media.zero_calls;
+    media.bump_generation_on_read_call = reads_before + 1u;
+    assert(fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_BARE, NULL,
+                                NULL, NULL, 0u) == FAUXFAT_BLOCK_ESTALE);
+    assert(media.write_calls == writes_before);
+    assert(media.zero_calls == zeros_before);
+    media.bump_generation_on_read_call = 0u;
+
+    /* A replacement which occurs inside a backend write can only be detected
+     * after that callback returns. It poisons the handle immediately; no
+     * subsequent write through the old adapter reaches the backend. */
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_BARE, NULL,
+                              NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
+    writes_before                       = media.write_calls;
+    media.bump_generation_on_write_call = writes_before + 1u;
+    assert(opened.volume_device.write(opened.volume_device.context, 0u, 1u,
+                                      block) == FAUXFAT_BLOCK_ESTALE);
+    assert(media.write_calls == writes_before + 1u);
+    assert(opened.volume_device.write(opened.volume_device.context, 1u, 1u,
+                                      block) == FAUXFAT_BLOCK_ESTALE);
+    assert(media.write_calls == writes_before + 1u);
+
+    free(media.data);
+}
+
 static void test_mutating_callback_error_translation(void)
 {
     fauxfat_config cfg;
@@ -911,6 +1018,7 @@ int main(void)
     test_probe_damage_conflict_and_io_isolation();
     test_bare_open_and_format();
     test_gpt_wrapper_repair();
+    test_media_generation_fencing();
     test_mutating_callback_error_translation();
     puts("fauxfat block tests: ok");
     return 0;
