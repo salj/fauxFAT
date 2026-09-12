@@ -12,9 +12,10 @@ A fauxFAT volume shall have these properties:
 2. A fixed set of host-visible files exists in fixed root-directory slots. Each file is a contiguous `NoFatChain` extent.
 3. An ordinary host may overwrite bytes inside an existing file without changing allocation metadata.
 4. The root directory has no free directory entries and cannot grow.
-5. Project-private and reserved ranges have no directory entry at all. They are represented to exFAT as bad clusters.
-6. Structural state is checksummed in the OEM Parameters sectors. Any structural mutation outside the explicit host-mutable fields is incompatible.
-7. On incompatible mutation the firmware does not repair arbitrary exFAT. It discards/rebuilds the façade from authoritative private state.
+5. Project-private and reserved ranges are blocked from ordinary file allocation by canonical `0xFFFFFFF7` FAT markers. Ranges whose identity must survive a façade rebuild additionally carry a fauxFAT opaque descriptor entry set in the root.
+6. An opaque descriptor is an ordinary hidden zero-length File set followed by fauxFAT Vendor Extension and Vendor Allocation secondaries; the logical private-file name is stored in vendor data while the Vendor Allocation points at the preserved contiguous range.
+7. Structural state is checksummed in the OEM Parameters sectors. Any structural mutation outside the explicit host-mutable fields is incompatible.
+8. On incompatible mutation the firmware does not repair arbitrary exFAT. It preserves only payload ranges it can positively describe, then rebuilds the façade from authoritative private state.
 
 This is an exFAT-shaped block scratch pad, not a general writable filesystem.
 
@@ -236,13 +237,13 @@ FAT[cluster] = 0xFFFFFFF7   // exFAT bad-cluster marker
 AllocationBitmap[cluster] = 1
 ```
 
-There is no directory entry for such a range.
+The bad-cluster marker is fauxFAT's physical blocker and structural range classifier. A range may additionally have an opaque descriptor entry set (section 10.5). The descriptor does not make the range host-writable; it gives firmware a standards-defined, bounded way to recover a logical name and the associated `FirstCluster/DataLength` after parsing a damaged-but-understandable façade.
 
-This is the core fauxFAT reservation trick. exFAT itself treats `0xFFFFFFF7` as a bad cluster, and the Allocation Bitmap marks it unavailable. Firmware is knowingly lying about media health and may use those physical clusters for littlefs, A/B inactive copies, version stores, raw databases, or future reserve space.
+exFAT treats `0xFFFFFFF7` as a bad cluster, while the Allocation Bitmap marks it unavailable. Firmware is knowingly lying about media health and may use those physical clusters for littlefs, A/B inactive copies, version stores, raw databases, or future reserve space.
 
-`VolumeFlags.MediaFailure` remains zero. In exFAT, zero is valid when known failures have already been represented as bad clusters in the FAT.
+For a fauxFAT opaque descriptor the Vendor Allocation secondary sets `NoFatChain=1`, so a generic exFAT implementation shall not interpret the corresponding FAT entries as a chain. fauxFAT nevertheless keeps `0xFFFFFFF7` there as its independent blocker/classification marker.
 
-This avoids depending on a deletable anchor file or on inventing a manufacturer-defined primary directory-entry type. It also means generic disk diagnostics may report absurd quantities of bad space. Such diagnostics are not part of the supported write protocol; if they rewrite the map, the OEM seal fails.
+`VolumeFlags.MediaFailure` remains zero. In exFAT, zero is valid when known failures have already been represented as bad clusters in the FAT. Generic disk diagnostics may report absurd quantities of bad space. Such diagnostics are not part of the supported write protocol; if they rewrite the map, the OEM seal fails.
 
 ### 6.4 FAT padding
 
@@ -261,9 +262,9 @@ Its root entry is type `0x81`, `BitmapFlags = 0`, with `FirstCluster = 2` and `D
 
 The bitmap's clusters are FAT-chained contiguously from cluster 2.
 
-Every meaningful bitmap bit is `1`. There are no free clusters in a mounted fauxFAT volume. Unused high bits in the final byte and bytes after `BitmapBytes` in the final cluster are zero.
+Every meaningful bitmap bit is `1`. There are no free clusters in a mounted fauxFAT volume. Unused high bits in the final byte are reserved bits inside the Allocation Bitmap and are initialized to zero. Bytes after `BitmapBytes` in the final allocated bitmap cluster are outside the bitmap's `DataLength`; the synthetic view may return zero there, but fauxFAT assigns those cluster-slack bytes no structural meaning and an on-disk verifier ignores them.
 
-The bitmap therefore never changes during ordinary host operation or during fauxFAT range reclassification. A bitmap change is always structural corruption/incompatibility.
+The defined bitmap bytes therefore never change during ordinary host operation or during fauxFAT range reclassification. A change to a meaningful allocation bit or to the reserved high bits inside `DataLength` is structural corruption/incompatibility.
 
 ## 8. Up-case Table and root cluster placement
 
@@ -297,7 +298,7 @@ FFFF 0065                   U+007B..U+00DF identity
 FFFF FF00                   U+0100..U+FFFF identity
 ```
 
-This covers the complete 16-bit Unicode range while doing useful case folding only for the character repertoire fauxFAT permits. Characters whose Unicode uppercase form is outside ISO-8859-1, notably `U+00FF`, remain identity mappings. The result is 128 bytes and has exFAT `TableChecksum = 0xA872CEE1`. Bytes 128..65535 in the cluster are zero. `FAT[UpcaseCluster] = 0xFFFFFFFF`.
+This covers the complete 16-bit Unicode range while doing useful case folding only for the character repertoire fauxFAT permits. Characters whose Unicode uppercase form is outside ISO-8859-1, notably `U+00FF`, remain identity mappings. The result is 128 bytes and has exFAT `TableChecksum = 0xA872CEE1`. The remaining bytes in the allocated cluster are outside the Up-case Table's `DataLength`; the synthetic view emits zero there, but a sparse/on-disk formatter may leave that cluster slack undefined and the verifier ignores it. `FAT[UpcaseCluster] = 0xFFFFFFFF`.
 
 The root occupies exactly one cluster. `FAT[RootCluster] = 0xFFFFFFFF`.
 
@@ -307,18 +308,23 @@ The root cluster contains exactly 2048 entries of 32 bytes each. No entry is unu
 
 Canonical ordering:
 
-```
+```text
 entry 0        Allocation Bitmap (0x81)
 entry 1        Up-case Table (0x82)
 entry 2        Volume Label (0x83)
 entry 3        Volume GUID (0xA0)
-entries 4..    681 fixed 3-entry file slots
-final entry    padding
+then           public file sets, 3 entries each
+then           opaque descriptor sets, 5 entries each
+remainder      one-entry 0xA1 padding records
 ```
 
-`(2048 - 4) / 3 = 681` complete short-name file slots with one directory entry left over.
+The root-entry budget is therefore:
 
-A product may use fewer than 681 files. An unused file slot is still three occupied padding entries. Host software therefore has no directory slot it may legally claim.
+```text
+4 + 3 * public_file_count + 5 * opaque_descriptor_count <= 2048
+```
+
+With no opaque descriptors this retains the previous maximum of 681 short public files. With no public files the theoretical opaque-descriptor maximum is 408. Real products use vastly fewer of either, because sanity occasionally gets a vote.
 
 ### 9.1 Volume Label
 
@@ -332,9 +338,9 @@ Keeping this GUID stable across façade regeneration encourages the host to rega
 
 ### 9.3 Padding entry
 
-Every directory entry not currently used by a real file set is a one-entry TexFAT Padding record:
+Every directory entry not currently used by a real entry set is a one-entry TexFAT Padding record:
 
-```
+```text
 byte 0      0xA1
 byte 1      0x00        SecondaryCount
 bytes 2..3  0x0508 LE   SetChecksum for the canonical all-zero body
@@ -343,15 +349,17 @@ bytes 4..31 0x00
 
 The base exFAT 1.00 specification says `0xA1` TexFAT Padding must be treated like an unrecognized benign primary entry and must not be moved. fauxFAT uses it only as namespace padding, never as an allocation owner.
 
-Three consecutive padding entries form one inactive file slot. Firmware may turn an inactive slot into a file set only while the host does not own the volume.
+Firmware may replace a run of padding entries with one public or opaque-descriptor set only while the host does not own the volume.
 
-## 10. Host-visible file entry set
+## 10. File and opaque-descriptor entry sets
 
-fauxFAT v1 restricts host-visible names to 1..15 **ISO-8859-1 bytes**. Each byte is decoded directly to the same-numbered Unicode code point and written as one UTF-16LE code unit. exFAT-forbidden characters (`U+0000..U+001F`, `"`, `*`, `/`, `:`, `<`, `>`, `?`, `\\`, `|`) are rejected, as are the special names `.` and `..`.
+fauxFAT v1 restricts logical names to 1..15 **ISO-8859-1 bytes**. Each byte is decoded directly to the same-numbered Unicode code point. exFAT-forbidden characters (`U+0000..U+001F`, `"`, `*`, `/`, `:`, `<`, `>`, `?`, `\\`, `|`) are rejected, as are `.` and `..`.
 
-There is deliberately no UTF-8 decoder, Unicode normalization, surrogate handling, or general Unicode case machinery. Because one ISO-8859-1 byte always becomes one UTF-16 code unit, every supported name still fits one File Name entry and every file consumes exactly three directory entries.
+There is deliberately no UTF-8 decoder, Unicode normalization, surrogate handling, or general Unicode case machinery.
 
-### 10.1 File entry, type `0x85`
+### 10.1 Public File entry, type `0x85`
+
+A public file uses exactly the normal three-entry set `File + Stream Extension + File Name`.
 
 | Offset | Size | Canonical content |
 |---:|---:|---|
@@ -372,13 +380,11 @@ There is deliberately no UTF-8 decoder, Unicode normalization, surrogate handlin
 
 Visible writable files have no ReadOnly, Hidden, System, or Directory bits. Archive may be set or cleared by the host and is treated as volatile.
 
-The formatter takes one code-facing `time_t mtime` per file, interpreted as UTC Unix epoch seconds. The supplied RP2040 arm-none-eabi newlib-nano defines `time_t` as 64-bit, so this covers the entire exFAT timestamp range without a separate date type. fauxFAT accepts `1980-01-01T00:00:00Z` through `2107-12-31T23:59:59Z` and rejects values outside that interval.
+The formatter takes one code-facing `time_t mtime` per file, interpreted as UTC Unix epoch seconds. fauxFAT accepts `1980-01-01T00:00:00Z` through `2107-12-31T23:59:59Z` and rejects values outside that interval.
 
-At manufacture time create, last-modified, and last-access timestamps all receive this value. UTC offset bytes are `0x80`, meaning a valid zero-minute UTC offset. exFAT's packed timestamp stores seconds in two-second units; for create and modify timestamps fauxFAT writes `10msIncrement = 100` for an odd Unix second and `0` for an even second, preserving whole-second precision. Last-access has no 10ms field and therefore has the normal exFAT two-second granularity.
+At manufacture time create, last-modified, and last-access timestamps all receive this value. UTC offset bytes are `0x80`. exFAT's packed timestamp stores seconds in two-second units; create/modify `10msIncrement` is `100` for an odd Unix second and `0` for an even second.
 
-Create time is structural for fauxFAT. Last-modified and last-access metadata are host-volatile.
-
-### 10.2 Stream Extension, type `0xC0`
+### 10.2 Public Stream Extension, type `0xC0`
 
 | Offset | Size | Content |
 |---:|---:|---|
@@ -393,26 +399,117 @@ Create time is structural for fauxFAT. Last-modified and last-access metadata ar
 | 20 | 4 | FirstCluster |
 | 24 | 8 | DataLength |
 
-`DataLength` is the fixed host-visible capacity, not the current logical payload length. It never changes during a host session. The stream owns exactly `ceil(DataLength / 65536)` clusters, and that count **must equal** the size of the assigned contiguous extent. There may not be unowned slack clusters hidden after the logical end of a file. Large files should therefore normally use cluster-multiple `DataLength` values.
-
-`ValidDataLength` is manufactured equal to `DataLength` so an in-place overwrite never needs to extend the valid range. The extent must therefore contain initialized bytes before first exposure.
+The stream owns exactly `ceil(DataLength / 65536)` contiguous clusters. `ValidDataLength` is manufactured equal to `DataLength` so an in-place overwrite never needs to extend it. Cluster slack after `DataLength` is undefined presentation data and is not included in content preservation.
 
 ### 10.3 File Name, type `0xC1`
 
-```
+```text
 byte 0      0xC1
 byte 1      0x00
-bytes 2..   UTF-16LE file name, up to 15 code units
+bytes 2..   UTF-16LE name, up to 15 code units
 unused name positions = 0x0000
 ```
 
-`NameHash` is the normal exFAT 16-bit rotate/add hash after applying the fauxFAT Up-case Table. Duplicate-name rejection uses the same folding rules, so e.g. `caf\xE9.bin` and `CAF\xC9.BIN` collide.
+`NameHash` uses the fauxFAT Up-case Table. Public names must be unique under that folding.
 
-### 10.4 EntrySetChecksum
+### 10.4 Public EntrySetChecksum
 
-`SetChecksum` uses the normal exFAT rotate/add checksum over all 96 bytes of the three-entry set, excluding bytes 2 and 3 of the File entry.
+`SetChecksum` uses the normal exFAT rotate/add checksum over all 96 bytes of the public three-entry set, excluding bytes 2 and 3 of the File entry.
 
-A host is expected to rewrite this checksum when it changes timestamps or the Archive bit. fauxFAT validates the checksum before accepting the entry set.
+### 10.5 Opaque range descriptor
+
+A private range which must be recoverable by a bounded parse has a five-entry root set:
+
+```text
+File (0x85)
+Stream Extension (0xC0)
+File Name (0xC1)
+Vendor Extension (0xE0)
+Vendor Allocation (0xE1)
+```
+
+The first three entries describe an inert zero-length hidden descriptor file. The last two describe the private allocation. Generic exFAT implementations which do not recognize the fauxFAT vendor GUIDs must treat those vendor entries as unrecognized benign secondaries and must not modify their associated allocation during ordinary operation.
+
+The descriptor File entry has:
+
+```text
+SecondaryCount = 4
+FileAttributes = ReadOnly | Hidden | System = 0x0007
+```
+
+Timestamps use the same `time_t` encoding as public files.
+
+Its Stream Extension is deliberately allocation-free:
+
+```text
+GeneralSecondaryFlags = 0x01        AllocationPossible=1, NoFatChain=0
+ValidDataLength       = 0
+FirstCluster          = 0
+DataLength            = 0
+```
+
+The real exFAT namespace name is an internal deterministic stub:
+
+```text
+$FF00000000
+$FF00000001
+...
+```
+
+The eight hex digits are the descriptor ordinal in canonical root order. This name exists only to make the surrounding File entry set valid. It is not the logical private-file name.
+
+#### 10.5.1 fauxFAT opaque-name Vendor Extension
+
+Entry type `0xE0`, with on-disk GUID:
+
+```text
+{E2A67221-0B24-41FE-A8AD-A8303DFAA843}
+on-disk bytes: 21 72 A6 E2 24 0B FE 41 A8 AD A8 30 3D FA A8 43
+```
+
+`GeneralSecondaryFlags = 0`. Its 14-byte `VendorDefined` payload is:
+
+```text
+byte 0      logical-name length, 1..15
+bytes 1..13 logical-name bytes 0..12, ISO-8859-1, zero-padded
+```
+
+The GUID identifies this exact descriptor version, so the payload wastes no separate version byte.
+
+#### 10.5.2 fauxFAT opaque Vendor Allocation
+
+Entry type `0xE1`, with on-disk GUID:
+
+```text
+{940DBDEA-CEF9-4CAA-8555-0F60E05BA93C}
+on-disk bytes: EA BD 0D 94 F9 CE AA 4C 85 55 0F 60 E0 5B A9 3C
+```
+
+Fields:
+
+```text
+GeneralSecondaryFlags = 0x03        AllocationPossible | NoFatChain
+VendorDefined[0]      = logical-name byte 13, or 0
+VendorDefined[1]      = logical-name byte 14, or 0
+FirstCluster          = first cluster of the private contiguous range
+DataLength            = complete private allocation length
+```
+
+`DataLength` is non-zero and cluster-aligned in fauxFAT v1. The corresponding Allocation Bitmap bits remain one. fauxFAT additionally keeps every FAT entry in the range at `0xFFFFFFF7`; because the Vendor Allocation is `NoFatChain`, those FAT entries are not interpreted as a chain by generic implementations.
+
+The 15-byte logical name is therefore reconstructed as:
+
+```text
+VendorExtension.VendorDefined[1..13]
++ VendorAllocation.VendorDefined[0..1]
+truncated to VendorExtension.VendorDefined[0]
+```
+
+This indirection is intentional. A visible staging file and one or more opaque A/B alternatives may all carry the same *logical* name without creating duplicate exFAT namespace names.
+
+The five-entry `SetChecksum` covers all 160 bytes. The descriptor itself is part of the structural seal.
+
+Deleting the hidden descriptor File set is structural damage. The exFAT specification says deletion of a File entry set containing an unrecognized benign secondary also frees that secondary's associated allocation. fauxFAT therefore does not pretend this descriptor is a security boundary. Under the supported mount/read/in-place-write cycle it should remain untouched; if it does not, strict validation fails. Recovery preserves an opaque payload only when a valid descriptor, authoritative private state, or some other explicitly trusted mapping still describes its range.
 
 ## 11. Structural seal computation
 
@@ -520,7 +617,7 @@ A staged A/B object can use two fixed raw extents:
 
 ```
 visible staging slot       FAT = 0, named file entry exists
-current/private slot       FAT = 0xFFFFFFF7, no directory entry
+current/private slot       FAT = 0xFFFFFFF7, opaque descriptor may name the range
 ```
 
 After validation firmware may swap their roles with one structural update. The optional dual-view exFAT trick may later make this swap cheaper, but it is not part of fauxFAT v1.
@@ -529,7 +626,7 @@ A continuously versioned configuration object can simultaneously use:
 
 ```
 small visible edit file    FAT = 0, named file entry exists
-private version store      FAT = 0xFFFFFFF7, no directory entry
+private version store      FAT = 0xFFFFFFF7, opaque descriptor may name the range
 ```
 
 The version store format is outside fauxFAT. fauxFAT only reserves its physical range from the host.
@@ -542,7 +639,6 @@ The following metadata changes are accepted after validating the File entry-set 
 
 ```
 Main Boot Sector `VolumeFlags.VolumeDirty` toggle
-Main Boot Sector `PercentInUse`: 100 <-> 0xff
 Backup Boot Sector `VolumeFlags` and `PercentInUse`: stale, ignored except for valid-range checks
 FileAttributes.Archive
 LastModifiedTimestamp
@@ -552,6 +648,8 @@ LastModifiedUtcOffset
 LastAccessedUtcOffset
 corresponding File SetChecksum
 ```
+
+Main Boot `PercentInUse` remains exactly `100`: the fauxFAT Allocation Bitmap is saturated and ordinary in-place file writes neither allocate nor free clusters. exFAT revision 1.00 defines valid `PercentInUse` values as 0..100; `0xff` is not part of this profile.
 
 Everything else is incompatible, including:
 
@@ -564,6 +662,7 @@ NoFatChain changes
 name changes
 new/deleted/moved directory entries
 padding changes
+opaque descriptor File/Vendor Extension/Vendor Allocation changes outside the timestamp/archive mask
 root-chain growth
 up-case changes
 boot geometry changes
@@ -572,24 +671,26 @@ NumberOfFats != 1
 TexFAT state
 ```
 
-An incompatible volume is never interpreted more deeply in an attempt to infer intent. Firmware returns to authoritative private state and regenerates fauxFAT.
+Failure of this strict mutation contract means the presentation is no longer accepted as intact fauxFAT. Product recovery returns to authoritative private state and regenerates the façade. An optional loose scanner may still enumerate simple contiguous root files for diagnostics or salvage, but it never upgrades a strict failure into trusted fauxFAT state.
 
 ## 15. Validation order after host use
 
-Firmware performs this bounded validation only:
+Strict validation performs this bounded sequence:
 
 1. validate Main and Backup Boot Checksums independently; treat Backup `VolumeFlags` and `PercentInUse` as stale;
 2. require exact fauxFAT v1 geometry and one FAT;
 3. validate the Allocation Bitmap and Up-case root entries;
-4. verify the standard Up-case checksum;
+4. verify the fauxFAT Up-case checksum/content;
 5. verify the root is exactly one cluster and FAT-chained EOC;
-6. verify every root entry is one of the expected system entries, file slots, or canonical `0xA1` padding;
-7. verify each active file set checksum and permit only the host-mutable fields listed above;
+6. verify every root entry is one of the expected system entries, public file sets, fauxFAT opaque descriptor sets, or canonical `0xA1` padding;
+7. verify each public/opaque File set checksum and permit only the host-mutable timestamp/archive fields listed above;
 8. recompute FAT CRC, bitmap CRC, canonical root CRC, and map SHA-256;
 9. compare those values to OEM Parameters;
 10. only then inspect candidate file payloads.
 
-There is no general path lookup, cluster allocator, directory repair, orphan recovery, free-space reconstruction, arbitrary FAT-chain traversal, TexFAT handling, intent-log interpretation, or journal replay. If some future host behavior would require any of those, fauxFAT rejects the image instead of learning another filesystem feature.
+The optional loose scanner is a separate acceptance level. It may scan the same bounded one-cluster root, skip valid-but-unsupported entries, and return only regular root files whose Stream Extension directly proves a contiguous `NoFatChain` allocation. It aborts on malformed/ambiguous structures and never walks a FAT chain or descends into directories. A volume which still satisfies the strict fauxFAT seal is reported as fauxFAT-valid even when reached through the loose API; recognizable fauxFAT with a failed structural seal is reported as changed, not valid.
+
+There is no general path lookup, cluster allocator, directory repair, orphan recovery, free-space reconstruction, arbitrary FAT-chain traversal, TexFAT handling, intent-log interpretation, or journal replay. If some future host behavior would require any of those for strict acceptance, fauxFAT rejects the image instead of learning another filesystem feature.
 
 ## 16. Important qualification points
 
@@ -602,4 +703,4 @@ The format is intentionally legal-but-hostile. Before treating it as product beh
 - Linux exFAT if cards may be handled there;
 - `chkdsk` only to document how it damages/reclassifies the deliberately fake bad clusters. `chkdsk` is not an accepted writer.
 
-The central empirical question is whether desktop exFAT implementations leave the manufactured bad-cluster ranges and `0xA1` root padding alone during ordinary mount/write/unmount. The base specification says they should. Product qualification gets the final vote, because storage software enjoys interpretive dance.
+The central empirical question is whether desktop exFAT implementations leave the manufactured bad-cluster ranges, fauxFAT Vendor Extension/Vendor Allocation descriptor sets, and `0xA1` root padding alone during ordinary mount/write/unmount. The base compatibility rules say unknown benign vendor secondaries and their allocations should survive that cycle. Product qualification gets the final vote, because storage software enjoys interpretive dance.

@@ -13,6 +13,7 @@ extern "C" {
 #define FAUXFAT_CLUSTER_SIZE       65536u
 #define FAUXFAT_BLOCKS_PER_CLUSTER 128u
 #define FAUXFAT_MAX_FILES          681u
+#define FAUXFAT_MAX_OPAQUE_FILES   408u
 #define FAUXFAT_NAME_MAX           15u
 
 /* One host-visible file. File data itself is owned by the callback backend. */
@@ -29,6 +30,26 @@ typedef struct fauxfat_file {
      */
     time_t mtime;
 } fauxfat_file;
+
+/*
+ * One opaque/private allocation which remains present in the raw block view
+ * but is not exposed as ordinary file data.  fauxFAT describes it on disk
+ * using a hidden zero-length File entry set with fauxFAT Vendor Extension +
+ * Vendor Allocation secondaries.  The logical name is stored in the vendor
+ * records, not in the host-visible namespace, so A/B alternatives may use the
+ * same logical name.
+ *
+ * size is the complete preserved allocation and must be a non-zero multiple
+ * of FAUXFAT_CLUSTER_SIZE.  Raw block reads are served through fd/read(); raw
+ * writes never translate into this range.
+ */
+typedef struct fauxfat_opaque_file {
+    /* 1..15 ISO-8859-1 bytes, same character restrictions as fauxfat_file. */
+    const char *name;
+    int fd;
+    uint64_t size;
+    time_t mtime;
+} fauxfat_opaque_file;
 
 /*
  * File payload I/O. offset and length are always bounded by the corresponding
@@ -52,11 +73,21 @@ typedef int (*fauxfat_write_fn)(void *context,
                                 size_t length);
 
 typedef struct fauxfat_config {
-    /* Files are packed contiguously in this exact array order. */
+    /*
+     * Public files are packed first in array order.  Opaque/private ranges
+     * follow, also in array order.  The upcoming formatter/parser refactor
+     * will generalize this to explicit physical ranges; this packing rule is
+     * retained for the synthetic view API.
+     */
     const fauxfat_file *files;
     size_t file_count;
+    const fauxfat_opaque_file *opaque_files;
+    size_t opaque_file_count;
 
-    /* Payload storage backend. Required when file_count != 0. */
+    /*
+     * Payload storage backend. read is required when either table is nonempty;
+     * write is required only for host-visible files.
+     */
     fauxfat_read_fn read;
     fauxfat_write_fn write;
     void *io_context;
@@ -108,6 +139,25 @@ typedef struct fauxfat_write_mapping {
     size_t length;
 } fauxfat_write_mapping;
 
+/*
+ * Direct physical descriptor used by the synthetic view now and by the
+ * bounded on-disk parser later.  It is intentionally not a filesystem object
+ * model: it says only what contiguous range a recognized logical file owns.
+ */
+typedef enum fauxfat_disk_file_kind {
+    FAUXFAT_DISK_FILE_PUBLIC = 0,
+    FAUXFAT_DISK_FILE_OPAQUE = 1
+} fauxfat_disk_file_kind;
+
+typedef struct fauxfat_disk_file {
+    char name[FAUXFAT_NAME_MAX + 1u];
+    fauxfat_disk_file_kind kind;
+    uint64_t first_block;       /* volume-relative first 512-byte block */
+    uint64_t data_length;       /* logical bytes described by the entry */
+    uint64_t allocation_blocks; /* complete contiguous physical allocation */
+    time_t mtime;
+} fauxfat_disk_file;
+
 enum {
     FAUXFAT_OK        = 0,
     FAUXFAT_EINVAL    = -1,
@@ -122,6 +172,12 @@ int fauxfat_init(fauxfat_view *view, const fauxfat_config *config);
 
 /* Number of 512-byte blocks in the manufactured exFAT volume. */
 uint64_t fauxfat_block_count(const fauxfat_view *view);
+
+/* Public descriptors first, then opaque descriptors, matching canonical root order. */
+size_t fauxfat_disk_file_count(const fauxfat_view *view);
+int fauxfat_describe_disk_file(const fauxfat_view *view,
+                               size_t index,
+                               fauxfat_disk_file *out);
 
 /*
  * Render one volume-relative 512-byte block. partition_lba is metadata only;

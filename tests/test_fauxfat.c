@@ -143,6 +143,7 @@ int main(void)
 {
     static uint8_t solver[2u * FAUXFAT_CLUSTER_SIZE];
     static uint8_t config_data[FAUXFAT_CLUSTER_SIZE];
+    static uint8_t opaque_data[FAUXFAT_CLUSTER_SIZE];
     static const uint8_t guid[16] = {
         0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde,
         0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
@@ -163,6 +164,7 @@ int main(void)
 
     fill_pattern(solver, sizeof(solver), 0x31u);
     fill_pattern(config_data, sizeof(config_data), 0xa7u);
+    fill_pattern(opaque_data, sizeof(opaque_data), 0xd3u);
 
     memset(&io, 0, sizeof(io));
     io.backing[0].fd   = 10;
@@ -199,6 +201,15 @@ int main(void)
     assert(view.cluster_heap_block == 256u);
     assert(view.volume_blocks == 1024u);
     assert(fauxfat_block_count(&view) == 1024u);
+    assert(fauxfat_disk_file_count(&view) == 2u);
+    {
+        fauxfat_disk_file d;
+        assert(fauxfat_describe_disk_file(&view, 0u, &d) == FAUXFAT_OK);
+        assert(d.kind == FAUXFAT_DISK_FILE_PUBLIC);
+        assert(strcmp(d.name, "SOLVER.DB") == 0);
+        assert(d.data_length == sizeof(solver));
+        assert(d.allocation_blocks == 2u * FAUXFAT_BLOCKS_PER_CLUSTER);
+    }
 
     assert(fauxfat_read_block(&view, 0, b) == FAUXFAT_OK);
     assert(b[0] == 0xeb && b[1] == 0x76 && b[2] == 0x90);
@@ -515,6 +526,132 @@ int main(void)
             }
             assert(memcmp(before, short_data + 1024u, sizeof(before)) == 0);
         }
+    }
+
+    /*
+     * Opaque/private allocations get an indirect, host-hidden descriptor:
+     * zero-length File stream + vendor metadata + Vendor Allocation.  The
+     * logical name lives in the vendor records, so it may intentionally match
+     * a public A/B alternative without becoming a duplicate exFAT filename.
+     */
+    {
+        fauxfat_opaque_file opaque[] = {
+            { "SOLVER.DB", 13, sizeof(opaque_data), (time_t)1735787045 }
+        };
+
+        fauxfat_config ocfg = cfg;
+        fauxfat_view ov;
+        uint64_t oroot;
+        uint64_t oblock;
+        fauxfat_write_mapping m;
+        static const uint8_t meta_guid[16] = {
+            0x21, 0x72, 0xa6, 0xe2, 0x24, 0x0b, 0xfe, 0x41,
+            0xa8, 0xad, 0xa8, 0x30, 0x3d, 0xfa, 0xa8, 0x43
+        };
+        static const uint8_t alloc_guid[16] = {
+            0xea, 0xbd, 0x0d, 0x94, 0xf9, 0xce, 0xaa, 0x4c,
+            0x85, 0x55, 0x0f, 0x60, 0xe0, 0x5b, 0xa9, 0x3c
+        };
+
+        io.backing[3].fd   = 13;
+        io.backing[3].data = opaque_data;
+        io.backing[3].size = sizeof(opaque_data);
+        io.backing_count   = 4u;
+
+        ocfg.opaque_files      = opaque;
+        ocfg.opaque_file_count = 1u;
+        assert(fauxfat_init(&ov, &ocfg) == FAUXFAT_OK);
+        assert(ov.cluster_count == 7u);
+        assert(ov.volume_blocks == 1152u);
+
+        /* Public data clusters 5..7 remain canonical zero-FAT NoFatChain. */
+        assert(fauxfat_read_block(&ov, 128u, b) == FAUXFAT_OK);
+        assert(load32(b + 20u) == 0u);
+        assert(load32(b + 24u) == 0u);
+        assert(load32(b + 28u) == 0u);
+        assert(load32(b + 32u) == 0xfffffff7u); /* opaque cluster 8 */
+
+        oroot = ov.cluster_heap_block +
+                (uint64_t)(ov.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        assert(fauxfat_read_block(&ov, oroot, b) == FAUXFAT_OK);
+
+        /* Two public 3-entry sets occupy entries 4..9. Opaque set is 10..14. */
+        assert(b[320u] == 0x85u);
+        assert(b[321u] == 4u);
+        assert(load16(b + 324u) == 0x0007u); /* R|H|S */
+        assert(b[352u] == 0xc0u);
+        assert(b[353u] == 0x01u);
+        assert(load64(b + 352u + 8u) == 0u);
+        assert(load32(b + 352u + 20u) == 0u);
+        assert(load64(b + 352u + 24u) == 0u);
+        assert(b[384u] == 0xc1u);
+        assert(load16(b + 386u) == '$');
+        assert(load16(b + 388u) == 'F');
+        assert(load16(b + 390u) == 'F');
+
+        assert(b[416u] == 0xe0u);
+        assert(b[417u] == 0u);
+        assert(memcmp(b + 418u, meta_guid, sizeof(meta_guid)) == 0);
+        assert(b[434u] == 9u);
+        assert(memcmp(b + 435u, "SOLVER.DB", 9u) == 0);
+
+        assert(b[448u] == 0xe1u);
+        assert(b[449u] == 0x03u);
+        assert(memcmp(b + 450u, alloc_guid, sizeof(alloc_guid)) == 0);
+        assert(load32(b + 468u) == 8u);
+        assert(load64(b + 472u) == sizeof(opaque_data));
+        assert(b[480u] == 0xa1u); /* descriptor is followed by occupied padding */
+
+        oblock = ov.cluster_heap_block +
+                 (uint64_t)(8u - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        assert(fauxfat_read_block(&ov, oblock + 9u, b) == FAUXFAT_OK);
+        assert(memcmp(b, opaque_data + 9u * 512u, 512u) == 0);
+        assert(io.last_fd == 13);
+        assert(io.last_offset == 9u * 512u);
+        assert(io.last_length == 512u);
+
+        /* The raw bytes exist, but the host block-write translator cannot hit them. */
+        assert(fauxfat_translate_write(&ov, oblock, &m) == FAUXFAT_EUNMAPPED);
+
+        {
+            fauxfat_disk_file d;
+            assert(fauxfat_disk_file_count(&ov) == 3u);
+            assert(fauxfat_describe_disk_file(&ov, 2u, &d) == FAUXFAT_OK);
+            assert(d.kind == FAUXFAT_DISK_FILE_OPAQUE);
+            assert(strcmp(d.name, "SOLVER.DB") == 0);
+            assert(d.first_block == oblock);
+            assert(d.data_length == sizeof(opaque_data));
+            assert(d.allocation_blocks == FAUXFAT_BLOCKS_PER_CLUSTER);
+            assert(fauxfat_describe_disk_file(&ov, 3u, &d) == FAUXFAT_ERANGE);
+        }
+    }
+
+    /* Maximum-length logical opaque names spill their last two bytes into
+     * Vendor Allocation.VendorDefined; no second name-extension entry needed. */
+    {
+        fauxfat_opaque_file opaque = {
+            "ABCDEFGHIJKLMNO", 13, sizeof(opaque_data), (time_t)1735787045
+        };
+
+        fauxfat_config ocfg = cfg;
+        fauxfat_view ov;
+        uint64_t oroot;
+
+        ocfg.files             = NULL;
+        ocfg.file_count        = 0u;
+        ocfg.write             = NULL; /* opaque-only view is read-only */
+        ocfg.opaque_files      = &opaque;
+        ocfg.opaque_file_count = 1u;
+        assert(fauxfat_init(&ov, &ocfg) == FAUXFAT_OK);
+        oroot = ov.cluster_heap_block +
+                (uint64_t)(ov.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        assert(fauxfat_read_block(&ov, oroot, b) == FAUXFAT_OK);
+        assert(b[224u] == 0xe0u); /* entry 7: Vendor Extension */
+        assert(b[242u] == 15u);
+        assert(memcmp(b + 243u, "ABCDEFGHIJKLM", 13u) == 0);
+        assert(b[256u] == 0xe1u); /* entry 8: Vendor Allocation */
+        assert(b[274u] == 'N');
+        assert(b[275u] == 'O');
     }
 
     /* exFAT cannot encode dates before 1980 or after 2107. */
