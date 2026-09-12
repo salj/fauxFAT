@@ -1,0 +1,30 @@
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+AllowShortFunctionsOnASingleLine: None
+BasedOnStyle: LLVM
+BraceWrapping:
+  AfterFunction: true
+  AfterControlStatement: Never
+  AfterStruct: false
+  AfterClass: false
+  AfterEnum: false
+  AfterUnion: false
+  AfterNamespace: false
+  BeforeElse: false
+  BeforeCatch: false
+BreakBeforeBinaryOperators: None
+BreakBeforeBraces: Custom
+ColumnLimit: 0
+Cpp11BracedListStyle: false
+DerivePointerAlignment: false
+IndentWidth: 4
+PointerAlignment: Right
+SeparateDefinitionBlocks: Always
+SortIncludes: false
+UseTab: Never
