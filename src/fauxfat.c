@@ -4,8 +4,7 @@
 #include <string.h>
 
 #define FF_FAT_OFFSET_BLOCKS 128u
-#define FF_UPCASE_BYTES      5836u
-#define FF_UPCASE_CHECKSUM   0xe619d30du
+#define FF_UPCASE_BYTES      128u
 #define FF_ROOT_ENTRIES      2048u
 #define FF_FILE_SLOT_FIRST   4u
 #define FF_FILE_SLOT_COUNT   681u
@@ -20,10 +19,6 @@
 #define FF_ENTRY_PAD    0xa1u
 #define FF_ENTRY_STREAM 0xc0u
 #define FF_ENTRY_NAME   0xc1u
-
-static const uint8_t ff_upcase_table[FF_UPCASE_BYTES] = {
-#include "fauxfat_upcase.inc"
-};
 
 static const uint8_t ff_oem_map_guid[16] = {
     0xe7, 0xe6, 0x5b, 0x99, 0x45, 0x34, 0xdc, 0x46,
@@ -70,6 +65,78 @@ static uint32_t ff_align_up_u32(uint32_t v, uint32_t align)
     return (v + align - 1u) & ~(align - 1u);
 }
 
+/*
+ * fauxFAT deliberately defines a tiny custom exFAT up-case table.
+ *
+ * The first 128 mappings are mandated by exFAT.  For ISO-8859-1 we also
+ * fold the lower-case Latin-1 letters whose upper-case form is itself in
+ * ISO-8859-1.  Everything from U+0100 through U+FFFF is identity-mapped.
+ * The exFAT compression marker (FFFF,count) makes the complete Unicode
+ * table only 128 bytes on disk.
+ */
+static uint16_t ff_upcase_latin1(uint16_t ch)
+{
+    if (ch >= (uint16_t)'a' && ch <= (uint16_t)'z')
+        return (uint16_t)(ch - ((uint16_t)'a' - (uint16_t)'A'));
+    if ((ch >= 0x00e0u && ch <= 0x00f6u) ||
+        (ch >= 0x00f8u && ch <= 0x00feu))
+        return (uint16_t)(ch - 0x20u);
+    return ch;
+}
+
+/* Return one 16-bit word from the compressed 128-byte up-case table. */
+static uint16_t ff_upcase_word(unsigned word)
+{
+    if (word == 0u)
+        return 0xffffu;
+    if (word == 1u)
+        return 0x0061u; /* U+0000..U+0060 identity */
+
+    if (word >= 2u && word < 28u)
+        return (uint16_t)(0x0041u + (word - 2u)); /* a..z -> A..Z */
+
+    if (word == 28u)
+        return 0xffffu;
+    if (word == 29u)
+        return 0x0065u; /* U+007B..U+00DF identity */
+
+    if (word >= 30u && word < 62u)
+        return ff_upcase_latin1((uint16_t)(0x00e0u + (word - 30u)));
+
+    if (word == 62u)
+        return 0xffffu;
+    return 0xff00u; /* U+0100..U+FFFF identity */
+}
+
+static uint8_t ff_upcase_byte(size_t offset)
+{
+    uint16_t word = ff_upcase_word((unsigned)(offset >> 1));
+    return (uint8_t)(offset & 1u ? word >> 8 : word);
+}
+
+static void ff_make_upcase_block(uint32_t block_in_cluster, uint8_t out[512])
+{
+    uint64_t first = (uint64_t)block_in_cluster * 512u;
+    size_t i;
+
+    memset(out, 0, 512);
+    if (first >= FF_UPCASE_BYTES)
+        return;
+
+    for (i = 0; i < 512u && first + i < FF_UPCASE_BYTES; ++i)
+        out[i] = ff_upcase_byte((size_t)first + i);
+}
+
+static uint32_t ff_upcase_checksum(void)
+{
+    uint32_t sum = 0;
+    size_t i;
+
+    for (i = 0; i < FF_UPCASE_BYTES; ++i)
+        sum = ff_ror32(sum) + ff_upcase_byte(i);
+    return sum;
+}
+
 static int ff_guid_is_zero(const uint8_t guid[16])
 {
     unsigned i;
@@ -89,17 +156,36 @@ static int ff_name_valid(const char *s, size_t *len_out)
 
     while (s[n]) {
         unsigned char c = (unsigned char)s[n];
-        int ok          = (c >= 'A' && c <= 'Z') ||
-                 (c >= '0' && c <= '9') ||
-                 c == '_' || c == '-' || c == '.';
-        if (!ok || n == FAUXFAT_NAME_MAX)
+        int forbidden   = c < 0x20u || c == '"' || c == '*' || c == '/' ||
+                        c == ':' || c == '<' || c == '>' || c == '?' ||
+                        c == '\\' || c == '|';
+        if (forbidden || n == FAUXFAT_NAME_MAX)
             return 0;
         ++n;
     }
 
+    if ((n == 1u && s[0] == '.') ||
+        (n == 2u && s[0] == '.' && s[1] == '.'))
+        return 0;
+
     if (len_out)
         *len_out = n;
     return 1;
+}
+
+static int ff_name_equal_folded(const char *a, const char *b)
+{
+    size_t i = 0;
+
+    for (;;) {
+        uint8_t ca = (uint8_t)a[i];
+        uint8_t cb = (uint8_t)b[i];
+        if (ff_upcase_latin1(ca) != ff_upcase_latin1(cb))
+            return 0;
+        if (ca == 0u)
+            return 1;
+        ++i;
+    }
 }
 
 static int ff_label_valid(const char *s, size_t *len_out)
@@ -126,8 +212,9 @@ static uint16_t ff_name_hash(const char *name)
     uint16_t h = 0;
 
     while (*name) {
-        h = (uint16_t)(ff_ror16(h) + (uint8_t)*name++);
-        h = ff_ror16(h); /* high UTF-16LE byte is zero */
+        uint16_t ch = ff_upcase_latin1((uint8_t)*name++);
+        h           = (uint16_t)(ff_ror16(h) + (uint8_t)ch);
+        h           = (uint16_t)(ff_ror16(h) + (uint8_t)(ch >> 8));
     }
     return h;
 }
@@ -444,7 +531,7 @@ static void ff_make_root_entry(const fauxfat_view *v,
 
     if (entry_index == 1u) {
         out[0] = FF_ENTRY_UPCASE;
-        ff_store32(out + 4, FF_UPCASE_CHECKSUM);
+        ff_store32(out + 4, v->upcase_checksum);
         ff_store32(out + 20, v->upcase_cluster);
         ff_store64(out + 24, FF_UPCASE_BYTES);
         return;
@@ -724,7 +811,7 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
             f->size > (uint64_t)SIZE_MAX)
             return FAUXFAT_EINVAL;
         for (j = 0; j < i; ++j) {
-            if (strcmp(f->name, cfg->files[j].name) == 0)
+            if (ff_name_equal_folded(f->name, cfg->files[j].name))
                 return FAUXFAT_EINVAL;
         }
         if (ff_file_clusters(f) > UINT32_MAX ||
@@ -763,6 +850,7 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
     v->volume_blocks      = (uint64_t)v->cluster_heap_block +
                        (uint64_t)v->cluster_count * FAUXFAT_BLOCKS_PER_CLUSTER;
 
+    v->upcase_checksum = ff_upcase_checksum();
     ff_compute_component_hashes(v);
     v->boot_checksum = ff_compute_boot_checksum(v);
     return FAUXFAT_OK;
@@ -830,14 +918,7 @@ int fauxfat_read_block(const fauxfat_view *v,
     }
 
     if (cluster == v->upcase_cluster) {
-        uint64_t off = (uint64_t)block_in_cluster * 512u;
-        size_t n     = 0;
-        memset(out, 0, 512);
-        if (off < FF_UPCASE_BYTES) {
-            uint64_t left = FF_UPCASE_BYTES - off;
-            n             = left > 512u ? 512u : (size_t)left;
-            memcpy(out, ff_upcase_table + (size_t)off, n);
-        }
+        ff_make_upcase_block(block_in_cluster, out);
         return FAUXFAT_OK;
     }
 

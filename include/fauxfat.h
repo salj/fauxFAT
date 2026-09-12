@@ -20,6 +20,7 @@ extern "C" {
  * clusters; bytes in the final cluster beyond EOF are rendered as zero.
  */
 typedef struct fauxfat_file {
+    /* 1..15 ISO-8859-1 bytes, excluding exFAT-forbidden characters. */
     const char *name;
     uint8_t *data;
     uint64_t size;
@@ -59,6 +60,7 @@ typedef struct fauxfat_view {
     uint32_t fat_crc32c;
     uint32_t bitmap_crc32c;
     uint32_t root_crc32c;
+    uint32_t upcase_checksum;
     uint8_t map_sha256[32];
     uint32_t boot_checksum;
 } fauxfat_view;

@@ -31,8 +31,9 @@ SectorsPerClusterShift    7
 NumberOfFats              1
 FileSystemRevision        0x0100
 root directory length     exactly 1 cluster
-up-case table             recommended exFAT table, 5836 bytes
-up-case checksum          0xE619D30D
+filename character set    ISO-8859-1 mapped directly to Unicode U+0000..U+00FF
+up-case table             fauxFAT custom compressed table, 128 bytes
+up-case checksum          0xA872CEE1
 ```
 
 The containing GPT partition should use the Microsoft Basic Data GUID. GPT is not part of the fauxFAT volume format. `PartitionOffset` is the media LBA at which this exFAT partition starts.
@@ -277,12 +278,26 @@ DataFirstCluster = RootCluster + 1
 The Up-case Table occupies one cluster. Its root entry is type `0x82` with:
 
 ```
-TableChecksum = 0xE619D30D
+TableChecksum = 0xA872CEE1
 FirstCluster  = UpcaseCluster
-DataLength    = 5836
+DataLength    = 128
 ```
 
-The table contents are exactly the recommended compressed exFAT 1.00 Up-case Table. Bytes 5836..65535 in the cluster are zero. `FAT[UpcaseCluster] = 0xFFFFFFFF`.
+fauxFAT uses a custom compressed Up-case Table rather than carrying the 5836-byte recommended Unicode table. exFAT permits a formatter-defined table so long as it covers U+0000..U+FFFF, and every reader is required to understand the compressed representation.
+
+The fauxFAT table is generated algorithmically as 64 little-endian 16-bit words:
+
+```
+FFFF 0061                   U+0000..U+0060 identity
+0041 0042 ... 005A          U+0061..U+007A -> A..Z
+FFFF 0065                   U+007B..U+00DF identity
+00C0 00C1 ...               U+00E0..U+00FF ISO-8859-1 folding
+                             (E0..F6 and F8..FE subtract 0x20;
+                              F7 and FF remain identity)
+FFFF FF00                   U+0100..U+FFFF identity
+```
+
+This covers the complete 16-bit Unicode range while doing useful case folding only for the character repertoire fauxFAT permits. Characters whose Unicode uppercase form is outside ISO-8859-1, notably `U+00FF`, remain identity mappings. The result is 128 bytes and has exFAT `TableChecksum = 0xA872CEE1`. Bytes 128..65535 in the cluster are zero. `FAT[UpcaseCluster] = 0xFFFFFFFF`.
 
 The root occupies exactly one cluster. `FAT[RootCluster] = 0xFFFFFFFF`.
 
@@ -332,13 +347,9 @@ Three consecutive padding entries form one inactive file slot. Firmware may turn
 
 ## 10. Host-visible file entry set
 
-fauxFAT v1 restricts host-visible names to 1..15 uppercase ASCII characters from:
+fauxFAT v1 restricts host-visible names to 1..15 **ISO-8859-1 bytes**. Each byte is decoded directly to the same-numbered Unicode code point and written as one UTF-16LE code unit. exFAT-forbidden characters (`U+0000..U+001F`, `"`, `*`, `/`, `:`, `<`, `>`, `?`, `\\`, `|`) are rejected, as are the special names `.` and `..`.
 
-```
-A-Z 0-9 _ - .
-```
-
-Thus every file consumes exactly three directory entries.
+There is deliberately no UTF-8 decoder, Unicode normalization, surrogate handling, or general Unicode case machinery. Because one ISO-8859-1 byte always becomes one UTF-16 code unit, every supported name still fits one File Name entry and every file consumes exactly three directory entries.
 
 ### 10.1 File entry, type `0x85`
 
@@ -391,7 +402,7 @@ bytes 2..   UTF-16LE file name, up to 15 code units
 unused name positions = 0x0000
 ```
 
-`NameHash` is the normal exFAT 16-bit rotate/add hash over the uppercase UTF-16LE name.
+`NameHash` is the normal exFAT 16-bit rotate/add hash after applying the fauxFAT Up-case Table. Duplicate-name rejection uses the same folding rules, so e.g. `caf\xE9.bin` and `CAF\xC9.BIN` collide.
 
 ### 10.4 EntrySetChecksum
 

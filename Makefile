@@ -14,7 +14,7 @@ all: tests/test_fauxfat
 format:
 	$(CLANG_FORMAT) -i $(FORMAT_FILES)
 
-tests/test_fauxfat: src/fauxfat.c src/fauxfat_upcase.inc include/fauxfat.h tests/test_fauxfat.c
+tests/test_fauxfat: src/fauxfat.c include/fauxfat.h tests/test_fauxfat.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/fauxfat.c tests/test_fauxfat.c -o $@
 
 test: tests/test_fauxfat

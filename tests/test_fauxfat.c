@@ -53,7 +53,7 @@ static uint32_t upcase_checksum(const fauxfat_view *v)
     uint32_t sum          = 0;
     uint64_t upcase_block = v->cluster_heap_block +
                             (uint64_t)(v->upcase_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
-    size_t remaining = 5836u;
+    size_t remaining = 128u;
     uint32_t block   = 0;
 
     while (remaining) {
@@ -172,13 +172,43 @@ int main(void)
     for (i = 1; i < 512; ++i)
         assert(b[i] == 0u);
 
-    assert(upcase_checksum(&view) == 0xe619d30du);
+    assert(upcase_checksum(&view) == 0xa872cee1u);
+    assert(view.upcase_checksum == 0xa872cee1u);
+
+    /* fauxFAT's custom compressed table covers all UTF-16 code units while
+     * only implementing useful case folding for ASCII and ISO-8859-1. */
+    {
+        uint64_t upcase_block = view.cluster_heap_block +
+                                (uint64_t)(view.upcase_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        static const uint16_t expected_prefix[] = {
+            0xffffu, 0x0061u,
+            0x0041u, 0x0042u, 0x0043u, 0x0044u, 0x0045u, 0x0046u,
+            0x0047u, 0x0048u, 0x0049u, 0x004au, 0x004bu, 0x004cu,
+            0x004du, 0x004eu, 0x004fu, 0x0050u, 0x0051u, 0x0052u,
+            0x0053u, 0x0054u, 0x0055u, 0x0056u, 0x0057u, 0x0058u,
+            0x0059u, 0x005au, 0xffffu, 0x0065u
+        };
+        size_t j;
+
+        assert(fauxfat_read_block(&view, upcase_block, b) == FAUXFAT_OK);
+        for (j = 0; j < sizeof(expected_prefix) / sizeof(expected_prefix[0]); ++j)
+            assert(load16(b + 2u * j) == expected_prefix[j]);
+        assert(load16(b + 2u * 30u) == 0x00c0u); /* à -> À */
+        assert(load16(b + 2u * 53u) == 0x00f7u); /* division sign unchanged */
+        assert(load16(b + 2u * 61u) == 0x00ffu); /* ÿ stays Latin-1 */
+        assert(load16(b + 2u * 62u) == 0xffffu);
+        assert(load16(b + 2u * 63u) == 0xff00u); /* U+0100..FFFF identity */
+        for (j = 128u; j < 512u; ++j)
+            assert(b[j] == 0u);
+    }
 
     root_block = view.cluster_heap_block +
                  (uint64_t)(view.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
     assert(fauxfat_read_block(&view, root_block, b) == FAUXFAT_OK);
     assert(b[0] == 0x81u);
     assert(b[32] == 0x82u);
+    assert(load32(b + 32u + 4u) == 0xa872cee1u);
+    assert(load64(b + 32u + 24u) == 128u);
     assert(b[64] == 0x83u);
     assert(b[96] == 0xa0u);
 
@@ -254,9 +284,34 @@ int main(void)
 
     assert(fauxfat_read_block(&view, view.volume_blocks, b) == FAUXFAT_ERANGE);
 
-    /* v1 refuses names or capacities which would mutate the manufactured map. */
+    /* File names are ISO-8859-1 bytes rendered directly as UTF-16 code units. */
     {
-        fauxfat_file bad      = { "lower.bin", config_data, sizeof(config_data) };
+        fauxfat_file latin      = { "caf\xe9.bin", config_data, sizeof(config_data) };
+        fauxfat_config latincfg = cfg;
+        fauxfat_view latinview;
+        uint64_t latin_root;
+
+        latincfg.files      = &latin;
+        latincfg.file_count = 1;
+        assert(fauxfat_init(&latinview, &latincfg) == FAUXFAT_OK);
+        latin_root = latinview.cluster_heap_block +
+                     (uint64_t)(latinview.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        assert(fauxfat_read_block(&latinview, latin_root, b) == FAUXFAT_OK);
+        assert(load16(b + 192u + 2u + 6u) == 0x00e9u);
+    }
+    {
+        fauxfat_file collision[] = {
+            { "caf\xe9.bin", solver, sizeof(solver) },
+            { "CAF\xc9.BIN", config_data, sizeof(config_data) }
+        };
+
+        fauxfat_config badcfg = cfg;
+        badcfg.files          = collision;
+        badcfg.file_count     = 2;
+        assert(fauxfat_init(&view, &badcfg) == FAUXFAT_EINVAL);
+    }
+    {
+        fauxfat_file bad      = { "BAD/NAME", config_data, sizeof(config_data) };
         fauxfat_config badcfg = cfg;
         badcfg.files          = &bad;
         badcfg.file_count     = 1;
