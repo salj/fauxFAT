@@ -399,27 +399,20 @@ int fauxfat_block_open(fauxfat_block_opened *opened,
     return FAUXFAT_BLOCK_OK;
 }
 
-static int fb_format_profile_valid(const fauxfat_view *view,
-                                   const fauxfat_block_device *device,
-                                   fauxfat_block_layout layout,
-                                   const fauxgpt_view *gpt)
+static int fb_gpt_profile_valid(const fauxfat_view *view,
+                                const fauxfat_block_device *device,
+                                const fauxgpt_view *gpt)
 {
     uint64_t volume_blocks;
     size_t i;
 
-    if (!view || !view->config || !device || !device->io.write ||
-        !device->io.zero || device->block_count == 0u)
-        return 0;
-    volume_blocks = fauxfat_block_count(view);
-
-    if (layout == FAUXFAT_BLOCK_BARE)
-        return !gpt && view->config->partition_lba == 0u &&
-               volume_blocks == device->block_count;
-    if (layout != FAUXFAT_BLOCK_GPT || !gpt || !gpt->layout ||
-        !device->flush || gpt->layout->disk_blocks != device->block_count ||
+    if (!view || !view->config || !device || !gpt || !gpt->layout ||
+        device->block_count == 0u ||
+        gpt->layout->disk_blocks != device->block_count ||
         gpt->layout->partition_count < 1u ||
         gpt->layout->partition_count > FAUXGPT_OPEN_MAX_PARTITIONS)
         return 0;
+    volume_blocks = fauxfat_block_count(view);
 
     for (i = 0u; i < gpt->layout->partition_count; ++i) {
         const fauxgpt_partition *p = &gpt->layout->partitions[i];
@@ -430,6 +423,26 @@ static int fb_format_profile_valid(const fauxfat_view *view,
     return gpt->layout->partitions[0].first_lba ==
                view->config->partition_lba &&
            gpt->layout->partitions[0].block_count == volume_blocks;
+}
+
+static int fb_format_profile_valid(const fauxfat_view *view,
+                                   const fauxfat_block_device *device,
+                                   fauxfat_block_layout layout,
+                                   const fauxgpt_view *gpt)
+{
+    uint64_t volume_blocks;
+
+    if (!view || !view->config || !device || !device->io.write ||
+        !device->io.zero || device->block_count == 0u)
+        return 0;
+    volume_blocks = fauxfat_block_count(view);
+
+    if (layout == FAUXFAT_BLOCK_BARE)
+        return !gpt && view->config->partition_lba == 0u &&
+               volume_blocks == device->block_count;
+    if (layout != FAUXFAT_BLOCK_GPT || !device->flush)
+        return 0;
+    return fb_gpt_profile_valid(view, device, gpt);
 }
 
 static int fb_fauxfat_identity_matches(const fauxfat_reopen_info *actual,
@@ -522,4 +535,85 @@ int fauxfat_block_format(const fauxfat_view *view,
     gd.flush   = fb_raw_flush;
     gd.context = &target;
     return fauxgpt_format(gpt, &gd);
+}
+
+int fauxfat_block_repair_gpt(const fauxfat_view *expected_volume,
+                             const fauxfat_block_device *device,
+                             const fauxgpt_view *expected_gpt)
+{
+    const fauxgpt_layout *layout;
+    const fauxgpt_partition *p1;
+    fauxfat_block_probe_info volume_probe;
+    fb_probe_window window;
+    fauxfat_block_opened target;
+    fauxgpt_device gd;
+    fauxgpt_probe_info gpt_probe;
+    const fauxgpt_copy_info *copies[2];
+    size_t i;
+    int primary_valid;
+    int backup_valid;
+    int rc;
+
+    if (!expected_volume || !expected_volume->config || !device ||
+        !device->io.read || !device->io.write || !device->flush ||
+        !fb_gpt_profile_valid(expected_volume, device, expected_gpt))
+        return FAUXFAT_BLOCK_EINVAL;
+
+    layout = expected_gpt->layout;
+    p1     = &layout->partitions[0];
+
+    /* Do not trust GPT to locate the authority we are about to repair. */
+    memset(&volume_probe, 0, sizeof(volume_probe));
+    memset(&window, 0, sizeof(window));
+    window.device      = device;
+    window.block_count = device->block_count;
+    rc                 = fb_probe_volume(&volume_probe, p1->first_lba, p1->block_count,
+                                         &window);
+    if (rc != FAUXFAT_BLOCK_OK)
+        return rc;
+    if (volume_probe.classification != FAUXFAT_VOLUME_FAUXFAT_VALID &&
+        volume_probe.classification != FAUXFAT_VOLUME_FAUXFAT_CHANGED)
+        return FAUXFAT_BLOCK_ENOTFAUXFAT;
+    if (volume_probe.fauxfat.partition_lba != p1->first_lba ||
+        volume_probe.fauxfat.volume_blocks != p1->block_count)
+        return FAUXFAT_BLOCK_EPARTITION;
+    if (!fb_fauxfat_identity_matches(&volume_probe.fauxfat, expected_volume))
+        return FAUXFAT_BLOCK_EIDENTITY;
+
+    fb_init_volume(&target, device, FAUXFAT_BLOCK_GPT,
+                   p1->first_lba, p1->block_count);
+    memset(&gd, 0, sizeof(gd));
+    gd.read    = fb_raw_read;
+    gd.write   = fb_raw_write;
+    gd.flush   = fb_raw_flush;
+    gd.context = &target;
+
+    memset(&gpt_probe, 0, sizeof(gpt_probe));
+    rc = fauxgpt_probe(&gpt_probe, &gd, device->block_count);
+    if (rc != FAUXGPT_OK)
+        return rc;
+
+    primary_valid = (gpt_probe.primary.flags & FAUXGPT_COPY_VALID) != 0u;
+    backup_valid  = (gpt_probe.backup.flags & FAUXGPT_COPY_VALID) != 0u;
+    if (primary_valid && backup_valid &&
+        !fb_gpt_copies_equal(&gpt_probe.primary, &gpt_probe.backup))
+        return FAUXFAT_BLOCK_EWRAPPER;
+
+    copies[0] = &gpt_probe.primary;
+    copies[1] = &gpt_probe.backup;
+    for (i = 0u; i < 2u; ++i) {
+        const fauxgpt_copy_info *copy = copies[i];
+
+        if ((copy->flags & FAUXGPT_COPY_VALID) == 0u)
+            continue;
+        if ((copy->flags & FAUXGPT_COPY_TOO_MANY) != 0u ||
+            copy->info.partition_count > FAUXGPT_OPEN_MAX_PARTITIONS ||
+            !fauxgpt_geometry_matches(&copy->info, layout))
+            return FAUXFAT_BLOCK_EPARTITION;
+        if (!fauxgpt_identity_matches(&copy->info, layout))
+            return FAUXFAT_BLOCK_EIDENTITY;
+    }
+
+    /* Both copies may be unusable: partition 1 already proved authority. */
+    return fauxgpt_format(expected_gpt, &gd);
 }

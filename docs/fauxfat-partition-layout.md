@@ -242,10 +242,21 @@ A bounded validator is now part of `fauxgpt`:
 - optionally compare disk size, partition count/type/range/attributes against
   an authoritative expected layout.
 
-The validator does not repair in place. `fauxfat_block_format()` uses the
-authoritative layout to republish GPT after materializing partition 1. If only
-one GPT copy or the PMBR was damaged, an otherwise accepted reformat naturally
-repairs it.
+`fauxfat_block_repair_gpt()` is the non-destructive wrapper-repair path. It
+probes partition 1 directly at the authoritative expected LBA instead of
+trusting the GPT it is about to repair, and requires exact fauxFAT
+`PartitionOffset`, `VolumeLength`, Volume GUID, and volume serial. Every
+individually valid GPT copy must also match the expected geometry and stable
+disk/partition GUID identity. Two valid but disagreeing GPT copies are refused
+as ambiguous rather than merged.
+
+If both GPT copies are unusable, proven fauxFAT identity at the exact expected
+partition-1 range is sufficient authority to regenerate the protective MBR and
+both GPT copies. The repair operation writes only GPT metadata using the normal
+backup-first ordering. It does not rewrite fauxFAT first and never writes either
+partition body. There is deliberately no destructive flag on this API; callers
+which want to replace foreign or conflicting media use the explicit formatting
+path instead.
 
 The whole-device safety layer deliberately treats a GPT whose first partition
 lacks recognizable fauxFAT identity as foreign user data even when it contains

@@ -157,6 +157,23 @@ int fauxfat_block_format(const fauxfat_view *view,
                          void *preserve_context,
                          unsigned flags);
 
+/*
+ * Rebuild only GPT wrapper metadata from an authoritative expected layout.
+ * This operation is intrinsically non-destructive: it never writes either
+ * partition body and has no DESTROY_USER_DATA escape hatch.
+ *
+ * Before any write, partition entry 0 is probed directly at the expected LBA
+ * (without trusting on-disk GPT) and must prove the requested fauxFAT stable
+ * identity and exact PartitionOffset/VolumeLength. Every individually valid
+ * GPT copy must also match the requested geometry and stable GPT identity.
+ * Two valid but disagreeing GPT copies are treated as ambiguous and refused.
+ * If both GPT copies are unusable, a proven partition-1 fauxFAT identity is
+ * sufficient authority to reconstruct the wrapper.
+ */
+int fauxfat_block_repair_gpt(const fauxfat_view *expected_volume,
+                             const fauxfat_block_device *device,
+                             const fauxgpt_view *expected_gpt);
+
 #ifdef __cplusplus
 }
 #endif

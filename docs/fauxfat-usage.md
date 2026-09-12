@@ -605,7 +605,31 @@ callback value is retained as `probe.backend_error` by
 successfully opened volume adapter. The lower-level `fauxfat` and `fauxgpt`
 APIs continue to propagate their callbacks unchanged.
 
-## 17. Low-level whole-card GPT API
+## 17. Repair only the GPT wrapper
+
+When the product already knows the intended GPT layout and partition-1
+fauxFAT identity, repair the wrapper without reformatting the volume:
+
+```c
+rc = fauxfat_block_repair_gpt(&view, &disk, &gpt);
+```
+
+This call first probes the expected partition-1 range directly, without using
+on-disk GPT to locate it. The candidate must be recognizable fauxFAT at exactly
+the requested `PartitionOffset` and `VolumeLength`, with the requested Volume
+GUID and volume serial. It then inspects both GPT copies independently. Every
+valid copy must match the requested partition geometry and stable GPT disk /
+partition GUIDs. Two valid copies which disagree are refused as ambiguous.
+
+If both GPT copies are damaged or missing, exact partition-1 identity is enough
+to reconstruct the protective MBR and both GPT copies. The operation writes
+only GPT metadata, backup first, and never calls the fauxFAT formatter or
+writes either partition body. There is no `DESTROY_USER_DATA` option on this
+API. Foreign geometry or identity must be handled by the explicit destructive
+formatting path instead of quietly smuggling repartitioning in under the word
+"repair".
+
+## 18. Low-level whole-card GPT API
 
 `include/fauxgpt.h` is deliberately separate from fauxFAT. It renders only the protective MBR, primary/backup GPT entry arrays, and primary/backup headers. It never reads or writes a partition body.
 

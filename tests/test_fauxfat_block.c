@@ -612,6 +612,245 @@ static void test_bare_open_and_format(void)
     free(media.data);
 }
 
+static void test_gpt_wrapper_repair(void)
+{
+    fauxfat_config cfg;
+    fauxfat_view view;
+    fauxgpt_partition parts[2];
+    fauxgpt_layout layout;
+    fauxgpt_view gpt;
+    fauxfat_block_device dev;
+    fauxfat_block_opened opened;
+    memdev media;
+    uint8_t *body_snapshot;
+    uint64_t p1_first = 2048u;
+    uint64_t disk_blocks;
+    uint64_t body_blocks;
+    size_t body_bytes;
+    size_t bytes;
+
+    init_fauxfat(&cfg, &view, p1_first);
+    disk_blocks = p1_first + view.volume_blocks + 8192u + 34u;
+    setup_gpt(parts, &layout, &gpt, disk_blocks, p1_first,
+              view.volume_blocks);
+
+    bytes = (size_t)(disk_blocks * FAUXFAT_BLOCK_SIZE);
+    memset(&media, 0, sizeof(media));
+    media.blocks = disk_blocks;
+    media.data   = (uint8_t *)calloc(1u, bytes);
+    assert(media.data != NULL);
+
+    memset(&dev, 0, sizeof(dev));
+    dev.block_count = disk_blocks;
+    dev.io.read     = mem_read;
+    dev.io.write    = mem_write;
+    dev.io.zero     = mem_zero;
+    dev.io.skip     = mem_skip;
+    dev.io.context  = &media;
+    dev.flush       = mem_flush;
+
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_OK);
+
+    /* Give the user partition some nonzero dirt and snapshot every usable
+     * partition-body byte. Repair is allowed to rewrite wrapper metadata only. */
+    media.data[(parts[1].first_lba + 17u) * FAUXFAT_BLOCK_SIZE + 9u] = 0xa5u;
+    body_blocks                                                      = gpt.last_usable_lba - p1_first + 1u;
+    body_bytes                                                       = (size_t)(body_blocks * FAUXFAT_BLOCK_SIZE);
+    body_snapshot                                                    = (uint8_t *)malloc(body_bytes);
+    assert(body_snapshot != NULL);
+    memcpy(body_snapshot,
+           media.data + (size_t)(p1_first * FAUXFAT_BLOCK_SIZE),
+           body_bytes);
+
+    /* Repair has no use for the sparse formatter's zero callback. */
+    dev.io.zero = NULL;
+
+    /* One bad copy, or only the PMBR, is ordinary wrapper repair. */
+    media.data[FAUXGPT_PRIMARY_HEADER_LBA * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) == FAUXFAT_BLOCK_OK);
+    assert(memcmp(body_snapshot,
+                  media.data + (size_t)(p1_first * FAUXFAT_BLOCK_SIZE),
+                  body_bytes) == 0);
+
+    media.data[gpt.backup_header_lba * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) == FAUXFAT_BLOCK_OK);
+    assert(memcmp(body_snapshot,
+                  media.data + (size_t)(p1_first * FAUXFAT_BLOCK_SIZE),
+                  body_bytes) == 0);
+
+    media.data[510u] = 0u;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) == FAUXFAT_BLOCK_OK);
+    assert(memcmp(body_snapshot,
+                  media.data + (size_t)(p1_first * FAUXFAT_BLOCK_SIZE),
+                  body_bytes) == 0);
+
+    /* Even with both GPT headers and PMBR unusable, exact p1 identity at the
+     * authoritative expected LBA is enough to reconstruct only the wrapper. */
+    media.data[510u] = 0u;
+    media.data[FAUXGPT_PRIMARY_HEADER_LBA * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
+    media.data[gpt.backup_header_lba * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) == FAUXFAT_BLOCK_OK);
+    assert(memcmp(body_snapshot,
+                  media.data + (size_t)(p1_first * FAUXFAT_BLOCK_SIZE),
+                  body_bytes) == 0);
+    assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_GPT, &layout,
+                              NULL, NULL, NULL) == FAUXFAT_BLOCK_OK);
+    assert((opened.gpt.flags & FAUXGPT_INFO_PRIMARY_VALID) != 0u);
+    assert((opened.gpt.flags & FAUXGPT_INFO_BACKUP_VALID) != 0u);
+    assert((opened.gpt.flags & FAUXGPT_INFO_PMBR_VALID) != 0u);
+
+    /* A valid but different map is not "repairable" without destructive
+     * authorization through the formatting API. */
+    {
+        fauxgpt_partition alt_parts[2];
+        fauxgpt_layout alt_layout;
+        fauxgpt_view alt_gpt;
+        fauxgpt_device gd;
+        uint64_t writes_before;
+
+        memcpy(alt_parts, parts, sizeof(alt_parts));
+        alt_parts[1].first_lba += 1u;
+        alt_parts[1].block_count -= 1u;
+        alt_layout            = layout;
+        alt_layout.partitions = alt_parts;
+        assert(fauxgpt_init(&alt_gpt, &alt_layout) == FAUXGPT_OK);
+        memset(&gd, 0, sizeof(gd));
+        gd.write   = mem_write;
+        gd.flush   = mem_flush;
+        gd.context = &media;
+        assert(fauxgpt_format(&alt_gpt, &gd) == FAUXGPT_OK);
+
+        writes_before = media.write_calls;
+        assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+               FAUXFAT_BLOCK_EPARTITION);
+        assert(media.write_calls == writes_before);
+        assert(fauxgpt_format(&gpt, &gd) == FAUXGPT_OK);
+    }
+
+    /* Stable GPT identity is just as authoritative as geometry here. */
+    {
+        fauxgpt_layout alt_layout = layout;
+        fauxgpt_view alt_gpt;
+        fauxgpt_device gd;
+        uint64_t writes_before;
+
+        fill_guid(alt_layout.disk_guid, 0xc1u);
+        assert(fauxgpt_init(&alt_gpt, &alt_layout) == FAUXGPT_OK);
+        memset(&gd, 0, sizeof(gd));
+        gd.write   = mem_write;
+        gd.flush   = mem_flush;
+        gd.context = &media;
+        assert(fauxgpt_format(&alt_gpt, &gd) == FAUXGPT_OK);
+
+        writes_before = media.write_calls;
+        assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+               FAUXFAT_BLOCK_EIDENTITY);
+        assert(media.write_calls == writes_before);
+        assert(fauxgpt_format(&gpt, &gd) == FAUXGPT_OK);
+    }
+
+    /* Two CRC-valid GPT copies which disagree are ambiguity, even when one is
+     * exactly the expected layout. Do not invent merge policy here. */
+    {
+        fauxgpt_partition alt_parts[2];
+        fauxgpt_layout alt_layout;
+        fauxgpt_view alt_gpt;
+        fauxgpt_device gd;
+        uint8_t block[FAUXGPT_BLOCK_SIZE];
+        uint64_t lba;
+        uint64_t writes_before;
+
+        memcpy(alt_parts, parts, sizeof(alt_parts));
+        alt_parts[1].first_lba += 1u;
+        alt_parts[1].block_count -= 1u;
+        alt_layout            = layout;
+        alt_layout.partitions = alt_parts;
+        assert(fauxgpt_init(&alt_gpt, &alt_layout) == FAUXGPT_OK);
+        for (lba = alt_gpt.backup_array_lba;
+             lba <= alt_gpt.backup_header_lba; ++lba) {
+            assert(fauxgpt_render_block(&alt_gpt, lba, block) == FAUXGPT_OK);
+            memcpy(media.data + (size_t)(lba * FAUXFAT_BLOCK_SIZE), block,
+                   FAUXFAT_BLOCK_SIZE);
+        }
+
+        writes_before = media.write_calls;
+        assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+               FAUXFAT_BLOCK_EWRAPPER);
+        assert(media.write_calls == writes_before);
+
+        memset(&gd, 0, sizeof(gd));
+        gd.write   = mem_write;
+        gd.flush   = mem_flush;
+        gd.context = &media;
+        assert(fauxgpt_format(&gpt, &gd) == FAUXGPT_OK);
+    }
+
+    /* Wrapper reconstruction is not an ownership bypass. */
+    {
+        fauxfat_config foreign_cfg = cfg;
+        fauxfat_view foreign_view;
+        uint64_t writes_before;
+
+        fill_guid(foreign_cfg.volume_guid, 0xe1u);
+        assert(fauxfat_init(&foreign_view, &foreign_cfg) == FAUXFAT_OK);
+        dev.io.zero = mem_zero;
+        assert(fauxfat_block_format(
+                   &foreign_view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+        dev.io.zero = NULL;
+
+        writes_before = media.write_calls;
+        assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+               FAUXFAT_BLOCK_EIDENTITY);
+        assert(media.write_calls == writes_before);
+
+        dev.io.zero = mem_zero;
+        assert(fauxfat_block_format(
+                   &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+                   FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+               FAUXFAT_BLOCK_OK);
+        dev.io.zero = NULL;
+    }
+
+    /* Generic exFAT-looking p1 is still user data, not repair authority. */
+    media.data[(p1_first + 9u) * FAUXFAT_BLOCK_SIZE]  = 0u;
+    media.data[(p1_first + 21u) * FAUXFAT_BLOCK_SIZE] = 0u;
+    {
+        uint64_t writes_before = media.write_calls;
+        assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+               FAUXFAT_BLOCK_ENOTFAUXFAT);
+        assert(media.write_calls == writes_before);
+    }
+
+    /* Restore p1, then prove raw backend failures cannot alias policy errors. */
+    dev.io.zero = mem_zero;
+    assert(fauxfat_block_format(
+               &view, &dev, FAUXFAT_BLOCK_GPT, &gpt, NULL, NULL,
+               FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA) ==
+           FAUXFAT_BLOCK_OK);
+    dev.io.zero = NULL;
+
+    media.read_calls     = 0u;
+    media.fail_read_call = 1u;
+    media.fail_read_code = FAUXGPT_ESTRUCTURE;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+           FAUXFAT_BLOCK_EIO);
+    media.fail_read_call = 0u;
+    media.fail_read_code = 0;
+
+    media.fail_write_code = FAUXGPT_EPARTITIONS;
+    assert(fauxfat_block_repair_gpt(&view, &dev, &gpt) ==
+           FAUXFAT_BLOCK_EIO);
+    media.fail_write_code = 0;
+
+    free(body_snapshot);
+    free(media.data);
+}
+
 static void test_mutating_callback_error_translation(void)
 {
     fauxfat_config cfg;
@@ -671,6 +910,7 @@ int main(void)
     test_gpt_open_format_and_guards();
     test_probe_damage_conflict_and_io_isolation();
     test_bare_open_and_format();
+    test_gpt_wrapper_repair();
     test_mutating_callback_error_translation();
     puts("fauxfat block tests: ok");
     return 0;
