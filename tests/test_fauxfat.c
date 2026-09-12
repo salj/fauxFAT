@@ -171,6 +171,8 @@ typedef struct test_device {
     unsigned undefined_skips;
     unsigned preserve_skips;
     uint64_t preserve_blocks;
+    uint64_t fail_read_block;
+    int fail_read_code;
 } test_device;
 
 static int view_dev_read(void *context, uint64_t first_block,
@@ -188,6 +190,10 @@ static int dev_read(void *context, uint64_t first_block,
 
     assert(first_block <= d->blocks);
     assert((uint64_t)block_count <= d->blocks - first_block);
+    if (d->fail_read_code != 0 &&
+        d->fail_read_block >= first_block &&
+        d->fail_read_block - first_block < block_count)
+        return d->fail_read_code;
     assert(bytes <= SIZE_MAX);
     memcpy(data, d->data + (size_t)(first_block * FAUXFAT_BLOCK_SIZE),
            (size_t)bytes);
@@ -969,6 +975,110 @@ int main(void)
 
             /* Leave the test image canonical for any later checks. */
             memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+        }
+
+        /*
+         * Whole-volume strict validation deliberately ignores payload and
+         * undefined slack, but checks every structural byte after masking the
+         * small exFAT host-mutable set.
+         */
+        {
+            fauxfat_volume_class vc;
+            uint64_t root_block = fv.cluster_heap_block +
+                                  (uint64_t)(fv.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+            uint8_t *root         = media.data + root_block * FAUXFAT_BLOCK_SIZE;
+            uint64_t upcase_first = fv.cluster_heap_block +
+                                    (uint64_t)(fv.upcase_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+            uint32_t pub_cluster = 2u + (uint32_t)((pubd.first_block - fv.cluster_heap_block) /
+                                                   FAUXFAT_BLOCKS_PER_CLUSTER);
+            uint64_t fat_byte    = (uint64_t)pub_cluster * 4u;
+            uint64_t fat_block   = 128u + fat_byte / FAUXFAT_BLOCK_SIZE;
+            size_t fat_off       = (size_t)(fat_byte % FAUXFAT_BLOCK_SIZE);
+            uint8_t saved;
+            uint8_t saved_public[96];
+
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+
+            /* Main VolumeDirty is current volatile state. */
+            media.data[106u] = 0x02u;
+            media.data[107u] = 0u;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+            media.data[106u] = 0u;
+
+            /* Backup volatile state is stale and need not match Main. */
+            media.data[12u * FAUXFAT_BLOCK_SIZE + 106u] = 0x0eu;
+            media.data[12u * FAUXFAT_BLOCK_SIZE + 107u] = 0u;
+            media.data[12u * FAUXFAT_BLOCK_SIZE + 112u] = 42u;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+            media.data[12u * FAUXFAT_BLOCK_SIZE + 106u] = 0u;
+            media.data[12u * FAUXFAT_BLOCK_SIZE + 112u] = 100u;
+
+            /* The allowed File mutations canonicalize back to the seal. */
+            memcpy(saved_public, root + 4u * 32u, sizeof(saved_public));
+            store16(root + 4u * 32u + 4u, 0x0020u);
+            root[4u * 32u + 12u] ^= 0x01u;
+            root[4u * 32u + 21u] = 17u;
+            root[4u * 32u + 23u] = 0u;
+            root[4u * 32u + 24u] = 0x80u;
+            store16(root + 4u * 32u + 2u,
+                    entry_set_checksum(root + 4u * 32u, 96u));
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+            memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+
+            /* A structurally valid but unauthorized creation-time change is
+             * still a changed fauxFAT image, even with a repaired native set checksum. */
+            root[4u * 32u + 8u] ^= 0x01u;
+            store16(root + 4u * 32u + 2u,
+                    entry_set_checksum(root + 4u * 32u, 96u));
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+
+            /* Each separately sealed structural component is checked directly. */
+            saved = media.data[fat_block * FAUXFAT_BLOCK_SIZE + fat_off];
+            media.data[fat_block * FAUXFAT_BLOCK_SIZE + fat_off] ^= 0x01u;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            media.data[fat_block * FAUXFAT_BLOCK_SIZE + fat_off] = saved;
+
+            saved = media.data[fv.cluster_heap_block * FAUXFAT_BLOCK_SIZE];
+            media.data[fv.cluster_heap_block * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            media.data[fv.cluster_heap_block * FAUXFAT_BLOCK_SIZE] = saved;
+
+            saved = media.data[upcase_first * FAUXFAT_BLOCK_SIZE];
+            media.data[upcase_first * FAUXFAT_BLOCK_SIZE] ^= 0x01u;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            media.data[upcase_first * FAUXFAT_BLOCK_SIZE] = saved;
+
+            /* Main PercentInUse does not get the Backup's stale-state waiver. */
+            saved            = media.data[112u];
+            media.data[112u] = 99u;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+            media.data[112u] = saved;
+
+            /* Destroying the fauxFAT OEM identity downgrades to INVALID. */
+            saved = media.data[9u * FAUXFAT_BLOCK_SIZE];
+            media.data[9u * FAUXFAT_BLOCK_SIZE] ^= 0x80u;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_INVALID);
+            media.data[9u * FAUXFAT_BLOCK_SIZE] = saved;
+
+            /* Storage errors remain storage errors, not structural classifications. */
+            media.fail_read_block = 128u;
+            media.fail_read_code  = -333;
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == -333);
+            media.fail_read_code = 0;
+
+            assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
+            assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
         }
 
         assert(fauxfat_format(&fv, &dev, NULL, NULL, 2u) == FAUXFAT_EINVAL);

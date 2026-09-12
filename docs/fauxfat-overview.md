@@ -293,7 +293,7 @@ int preserve(void *ctx, const fauxfat_disk_file *wanted);
 
 Return greater than zero to preserve the complete allocation, zero to initialize it normally, or a negative value to abort formatting.
 
-This is the intended repair path as the remaining whole-volume verifier is completed:
+This is the intended repair path; strict whole-volume verification is now implemented, while loose salvage/reopen is still being filled in:
 
 ```text
 parse / validate existing volume
@@ -307,7 +307,7 @@ No payload relocation is implied by reformatting. If a desired object moved or c
 
 ## 9. Validation and reopen model
 
-The strict one-cluster root parser is implemented; whole-volume classification and the loose scanner are still pending. The completed verifier will expose two validation levels.
+Strict whole-volume validation against a trusted `fauxfat_view` is implemented. The loose scanner and schema-free reopen path are still pending.
 
 With trusted geometry already in a `fauxfat_view`, the implemented bounded pass is:
 
@@ -316,6 +316,17 @@ fauxfat_parse_root_strict(&view, &device, emit_file, ctx, &count);
 ```
 
 It reads the fixed root a block at a time, emits `fauxfat_disk_file` descriptors directly, accepts only the documented Archive/modify/access metadata churn, and rejects malformed checksums, duplicate public names, opaque-stub collisions, noncanonical entry ordering, overlaps, and out-of-range extents. It does not inspect or follow file FAT chains. This is a root-grammar pass, not yet proof that the boot/FAT/bitmap/OEM seal agrees with it.
+
+Whole-volume strict validation is:
+
+```c
+fauxfat_volume_class cls;
+fauxfat_validate_strict(&view, &device, &cls);
+```
+
+It validates both boot regions and their native exFAT checksums, exact fixed geometry, the fauxFAT OEM records, exact upcase bytes, meaningful saturated bitmap bytes, the strict root grammar, and the complete meaningful FAT map. It recomputes the XXH32 component/map fingerprints from the device and compares them with the OEM seal and the expected view. Payload bytes and explicitly undefined alignment/slack are never read.
+
+Main `VolumeDirty`, stale Backup Boot volatile fields, and the documented File Archive/modify/access fields are canonicalized away. Everything else remains structural. A recognizable fauxFAT OEM identity with a strict mismatch reports `FAUXFAT_CHANGED`; loss of the identity reports `INVALID`. Device read errors are still ordinary errors, not classifications.
 
 Strict validation asks whether the volume is still the fauxFAT structure we manufactured, allowing only metadata changes expected from a normal compliant mount and in-place write cycle. It verifies fixed geometry, boot checksums, the exact upcase table, the saturated bitmap, root layout, public and opaque descriptor sets, FAT classification, exFAT entry checksums, and the OEM XXH32 seals.
 
@@ -380,19 +391,19 @@ Implemented now:
 - bounded public-file write translation;
 - physical descriptor enumeration from a synthetic view;
 - strict bounded parsing of the fixed one-cluster root into the same descriptors;
+- whole-volume strict validation against a trusted view, including both boot checksums, FAT/bitmap/upcase/root checks, OEM identity, and recomputed XXH32 seals;
 - single structural XXH32 seal plus component XXH32 fingerprints;
 - sparse/in-place formatter with generated/zero/undefined/preserve range semantics;
 - Unix `time_t` input for file timestamps.
 
 Planned, not implemented yet:
 
-- boot/upcase/bitmap/FAT/OEM whole-volume verifier and classification;
 - loose/best-effort root scanner;
 - reopening recovered descriptors as caller-backed file descriptors;
 - explicit physical placement instead of the current packed layout;
 - optional dual-view A/B presentation optimization.
 
-That boundary is important. The current library can manufacture and serve fauxFAT and can strictly parse the root when supplied trusted geometry. It cannot yet take an arbitrary card, derive/verify that geometry and the OEM seal, prove the whole on-disk fauxFAT survived host use, and reopen it as a complete validated volume.
+That boundary is important. The current library can manufacture and serve fauxFAT and can prove that an on-disk volume still matches a trusted manufactured view. It cannot yet take an arbitrary card with no schema/view in hand, derive a reusable view from disk, salvage bounded foreign/simple exFAT objects, or bind recovered descriptors directly to application fds.
 
 ## 12. Design rules worth preserving
 

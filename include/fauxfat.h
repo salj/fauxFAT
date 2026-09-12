@@ -169,6 +169,19 @@ typedef int (*fauxfat_file_emit_fn)(void *context,
                                     const fauxfat_disk_file *file);
 
 /*
+ * Whole-volume structural classification. Strict validation currently
+ * produces INVALID, FAUXFAT_CHANGED, or FAUXFAT_VALID. BEST_EFFORT is
+ * reserved for the bounded loose scanner so callers can share one result
+ * type without inventing another enum later.
+ */
+typedef enum fauxfat_volume_class {
+    FAUXFAT_VOLUME_INVALID = 0,
+    FAUXFAT_VOLUME_EXFAT_BEST_EFFORT,
+    FAUXFAT_VOLUME_FAUXFAT_CHANGED,
+    FAUXFAT_VOLUME_FAUXFAT_VALID
+} fauxfat_volume_class;
+
+/*
  * Raw block-device side of sparse formatting and (later) validation.
  * Addresses are volume-relative 512-byte blocks, matching fauxfat_read_block.
  */
@@ -329,6 +342,26 @@ int fauxfat_parse_root_strict(const fauxfat_view *view,
                               fauxfat_file_emit_fn emit,
                               void *emit_context,
                               size_t *descriptor_count);
+
+/*
+ * Validate the complete deterministic fauxFAT presentation against `view`.
+ * This checks both boot regions and their native checksums, fauxFAT OEM
+ * identity/seals, the exact up-case table, saturated allocation bitmap,
+ * bounded strict root grammar, and the complete meaningful FAT map. Payload
+ * bytes and deliberately undefined alignment/slack bytes are never read.
+ *
+ * The normal host mutation allowance is canonicalized before comparison:
+ * Main VolumeDirty, stale Backup VolumeFlags/PercentInUse, and the documented
+ * File Archive/modify/access timestamp fields may differ while all native
+ * exFAT checksums remain valid.
+ *
+ * Structural mismatch is reported through `classification`, not as an I/O
+ * error: the function returns FAUXFAT_OK and sets INVALID or
+ * FAUXFAT_CHANGED. Device callback failures are propagated unchanged.
+ */
+int fauxfat_validate_strict(const fauxfat_view *view,
+                            const fauxfat_device *device,
+                            fauxfat_volume_class *classification);
 
 #ifdef __cplusplus
 }

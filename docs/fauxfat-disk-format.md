@@ -111,7 +111,7 @@ The main sector at volume sector 0 and backup sector at volume sector 12 use the
 | 109 | 1 | `7` |
 | 110 | 1 | `1` |
 | 111 | 1 | `0x80` |
-| 112 | 1 | `100`, or host-written `0xff` accepted |
+| 112 | 1 | `100` |
 | 113 | 7 | zero |
 | 120 | 390 | `0xF4` |
 | 510 | 2 | `55 AA` |
@@ -120,7 +120,7 @@ Only the **Main** Boot Sector carries current host-volatile state:
 
 ```
 VolumeFlags.VolumeDirty
-PercentInUse, accepted only as 100 or 0xff
+PercentInUse, which remains exactly 100 in the Main Boot Sector
 ```
 
 The Backup Boot Sector copies these bytes at manufacture time, but exFAT explicitly defines its `VolumeFlags` and `PercentInUse` as stale. fauxFAT validates the backup values only for field-range validity and otherwise ignores them; they are never compared with the current Main values.
