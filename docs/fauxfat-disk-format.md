@@ -314,7 +314,7 @@ entry 0        Allocation Bitmap (0x81)
 entry 1        Up-case Table (0x82)
 entry 2        Volume Label (0x83)
 entry 3        Volume GUID (0xA0)
-then           public file sets, 3 entries each
+then           public file sets, 5 entries each
 then           opaque descriptor sets, 5 entries each
 remainder      one-entry 0xA1 padding records
 ```
@@ -322,10 +322,10 @@ remainder      one-entry 0xA1 padding records
 The root-entry budget is therefore:
 
 ```text
-4 + 3 * public_file_count + 5 * opaque_descriptor_count <= 2048
+4 + 5 * public_file_count + 5 * opaque_descriptor_count <= 2048
 ```
 
-With no opaque descriptors this retains the previous maximum of 681 short public files. With no public files the theoretical opaque-descriptor maximum is 408. Real products use vastly fewer of either, because sanity occasionally gets a vote.
+The theoretical maximum is therefore 408 file/descriptor sets in any mixture. Real products use vastly fewer, so spending two extra benign records on stable public-file identity is considerably cheaper than teaching recovery code to guess what a host rename meant.
 
 ### 9.1 Volume Label
 
@@ -360,12 +360,22 @@ There is deliberately no UTF-8 decoder, Unicode normalization, surrogate handlin
 
 ### 10.1 Public File entry, type `0x85`
 
-A public file uses exactly the normal three-entry set `File + Stream Extension + File Name`.
+A public file uses five entries:
+
+```text
+File (0x85)
+Stream Extension (0xC0)
+File Name (0xC1)
+fauxFAT Original Name 0 (Vendor Extension, 0xE0)
+fauxFAT Original Name 1 (Vendor Extension, 0xE0)
+```
+
+The first three are the ordinary exFAT namespace object. The two benign Vendor Extension records preserve the manufactured logical name even if a host renames the namespace entry.
 
 | Offset | Size | Canonical content |
 |---:|---:|---|
 | 0 | 1 | `0x85` |
-| 1 | 1 | `2` secondary entries |
+| 1 | 1 | `4` secondary entries |
 | 2 | 2 | normal exFAT EntrySetChecksum |
 | 4 | 2 | file attributes |
 | 6 | 2 | zero |
@@ -413,11 +423,49 @@ unused name positions = 0x0000
 
 `NameHash` uses the fauxFAT Up-case Table. Public names must be unique under that folding.
 
-### 10.4 Public EntrySetChecksum
+### 10.4 Public original-name Vendor Extensions
 
-`SetChecksum` uses the normal exFAT rotate/add checksum over all 96 bytes of the public three-entry set, excluding bytes 2 and 3 of the File entry.
+Both records are benign Vendor Extension secondaries with `GeneralSecondaryFlags = 0`.
 
-### 10.5 Opaque range descriptor
+Original-name record 0 uses GUID:
+
+```text
+{AE13C765-278B-4B2F-9D4E-7426B0C61891}
+on-disk bytes: 65 C7 13 AE 8B 27 2F 4B 9D 4E 74 26 B0 C6 18 91
+```
+
+Its 14-byte `VendorDefined` payload is:
+
+```text
+byte 0      original-name length, 1..15
+bytes 1..13 original-name bytes 0..12, zero padded
+```
+
+Original-name record 1 uses GUID:
+
+```text
+{58B14A0E-899C-4734-B3E1-5A717D0A2FCC}
+on-disk bytes: 0E 4A B1 58 9C 89 34 47 B3 E1 5A 71 7D 0A 2F CC
+```
+
+Its payload is:
+
+```text
+byte 0      original-name byte 13, or zero
+byte 1      original-name byte 14, or zero
+byte 2      repeated original-name length
+bytes 3..13 zero
+```
+
+The repeated length cheaply rejects mismatched/torn vendor records. Zero cannot occur in a legal fauxFAT name, so zero padding is unambiguous.
+
+On parse, a recognized fauxFAT public descriptor exposes this persisted logical name. If the live File Name differs, the descriptor is marked `FAUXFAT_DISK_FILE_NAME_CHANGED`. A rename remains a structural change for whole-volume strict validation; persisting the original name merely makes salvage/reformat deterministic.
+
+### 10.5 Public EntrySetChecksum
+
+`SetChecksum` uses the normal exFAT rotate/add checksum over all 160 bytes of the five-entry public set, excluding bytes 2 and 3 of the File entry.
+
+### 10.6 Opaque range descriptor
 
 A private range which must be recoverable by a bounded parse has a five-entry root set:
 
@@ -459,7 +507,7 @@ $FF00000001
 
 The eight hex digits are the descriptor ordinal in canonical root order. This name exists only to make the surrounding File entry set valid. It is not the logical private-file name.
 
-#### 10.5.1 fauxFAT opaque-name Vendor Extension
+#### 10.6.1 fauxFAT opaque-name Vendor Extension
 
 Entry type `0xE0`, with on-disk GUID:
 
@@ -477,7 +525,7 @@ bytes 1..13 logical-name bytes 0..12, ISO-8859-1, zero-padded
 
 The GUID identifies this exact descriptor version, so the payload wastes no separate version byte.
 
-#### 10.5.2 fauxFAT opaque Vendor Allocation
+#### 10.6.2 fauxFAT opaque Vendor Allocation
 
 Entry type `0xE1`, with on-disk GUID:
 
@@ -603,13 +651,13 @@ To create another small predefined file from the tail while the card is private:
 1. choose a contiguous tail range currently marked `0xFFFFFFF7`;
 2. change only those FAT entries to `0x00000000`;
 3. keep all Allocation Bitmap bits at `1`;
-4. replace one three-entry padding slot with a valid `0x85/0xC0/0xC1` file set pointing at that range;
+4. replace five padding entries with the canonical public `File/Stream/Name/VendorName0/VendorName1` set pointing at that range;
 5. increment the structural epoch;
 6. recompute FAT/root/bitmap/upcase XXH32 component fingerprints and the map fingerprint;
 7. update both OEM sectors and both boot checksums;
 8. validate the rebuilt façade before exposing it.
 
-To retire that file, reverse the operation: convert its extent back to `0xFFFFFFF7`, turn its three root entries back into padding, and reseal.
+To retire that file, reverse the operation: convert its extent back to `0xFFFFFFF7`, turn its five root entries back into padding, and reseal.
 
 The same operation may shorten the high end of a large bulk extent and hand the released clusters to new tail files. No Allocation Bitmap change is required because all clusters remain unavailable throughout.
 

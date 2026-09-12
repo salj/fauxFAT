@@ -343,10 +343,10 @@ int main(void)
     assert(view.cluster_heap_block == 256u);
     assert(view.volume_blocks == 1024u);
     /* Fixed fauxFAT-private XXH32 test vector, checked against libxxhash. */
-    assert(view.map_xxh32 == 0xe1067e84u);
+    assert(view.map_xxh32 == 0xedb7c56au);
     assert(view.fat_xxh32 == 0xd0470b77u);
     assert(view.bitmap_xxh32 == 0x080118f4u);
-    assert(view.root_xxh32 == 0x00831099u);
+    assert(view.root_xxh32 == 0xa1daab59u);
     assert(view.upcase_xxh32 == 0x70b6935bu);
     assert(fauxfat_block_count(&view) == 1024u);
     assert(fauxfat_disk_file_count(&view) == 2u);
@@ -457,8 +457,24 @@ int main(void)
 
     /* First file set starts at root entry 4, i.e. byte 128. */
     assert(b[128] == 0x85u);
+    assert(b[129] == 4u);
     assert(b[160] == 0xc0u);
     assert(b[192] == 0xc1u);
+    assert(b[224] == 0xe0u);
+    assert(b[256] == 0xe0u);
+    {
+        static const uint8_t public_name_guid0[16] = {
+            0x65, 0xc7, 0x13, 0xae, 0x8b, 0x27, 0x2f, 0x4b,
+            0x9d, 0x4e, 0x74, 0x26, 0xb0, 0xc6, 0x18, 0x91
+        };
+        static const uint8_t public_name_guid1[16] = {
+            0x0e, 0x4a, 0xb1, 0x58, 0x9c, 0x89, 0x34, 0x47,
+            0xb3, 0xe1, 0x5a, 0x71, 0x7d, 0x0a, 0x2f, 0xcc
+        };
+
+        assert(memcmp(b + 226u, public_name_guid0, 16u) == 0);
+        assert(memcmp(b + 258u, public_name_guid1, 16u) == 0);
+    }
     assert(load32(b + 128u + 8u) == 0x5a221882u);
     assert(load32(b + 128u + 12u) == 0x5a221882u);
     assert(load32(b + 128u + 16u) == 0x5a221882u);
@@ -472,11 +488,16 @@ int main(void)
     assert(load32(b + 160 + 20) == 5u);
     assert(load64(b + 160 + 24) == sizeof(solver));
 
-    /* Second file begins at entry 7, and entry 10 is the next padded slot. */
-    assert(b[224] == 0x85u);
-    assert(load32(b + 256 + 20) == 7u);
-    assert(b[320] == 0xa1u);
-    assert(load16(b + 322) == 0x0508u);
+    /* Persisted original name is independent of the visible namespace name. */
+    assert(b[224u + 18u] == 9u);
+    assert(memcmp(b + 224u + 19u, "SOLVER.DB", 9u) == 0);
+    assert(b[256u + 20u] == 9u);
+
+    /* Second file begins at entry 9, and entry 14 is the next padded slot. */
+    assert(b[288] == 0x85u);
+    assert(load32(b + 320 + 20) == 7u);
+    assert(b[448] == 0xa1u);
+    assert(load16(b + 450) == 0x0508u);
     assert(fauxfat_read_block(&view, root_block + 127u, b) == FAUXFAT_OK);
     assert(b[480] == 0xa1u); /* final root entry: no end marker, no free slot */
 
@@ -726,34 +747,40 @@ int main(void)
 
         oroot = ov.cluster_heap_block +
                 (uint64_t)(ov.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
-        assert(fauxfat_read_block(&ov, oroot, b) == FAUXFAT_OK);
+        {
+            uint8_t root2[1024];
+            uint8_t *op;
 
-        /* Two public 3-entry sets occupy entries 4..9. Opaque set is 10..14. */
-        assert(b[320u] == 0x85u);
-        assert(b[321u] == 4u);
-        assert(load16(b + 324u) == 0x0007u); /* R|H|S */
-        assert(b[352u] == 0xc0u);
-        assert(b[353u] == 0x01u);
-        assert(load64(b + 352u + 8u) == 0u);
-        assert(load32(b + 352u + 20u) == 0u);
-        assert(load64(b + 352u + 24u) == 0u);
-        assert(b[384u] == 0xc1u);
-        assert(load16(b + 386u) == '$');
-        assert(load16(b + 388u) == 'F');
-        assert(load16(b + 390u) == 'F');
+            assert(fauxfat_read_blocks(&ov, oroot, 2u, root2) == FAUXFAT_OK);
 
-        assert(b[416u] == 0xe0u);
-        assert(b[417u] == 0u);
-        assert(memcmp(b + 418u, meta_guid, sizeof(meta_guid)) == 0);
-        assert(b[434u] == 9u);
-        assert(memcmp(b + 435u, "SOLVER.DB", 9u) == 0);
+            /* Two public 5-entry sets occupy entries 4..13. Opaque is 14..18. */
+            op = root2 + 14u * 32u;
+            assert(op[0] == 0x85u);
+            assert(op[1] == 4u);
+            assert(load16(op + 4u) == 0x0007u); /* R|H|S */
+            assert(op[32u] == 0xc0u);
+            assert(op[33u] == 0x01u);
+            assert(load64(op + 32u + 8u) == 0u);
+            assert(load32(op + 32u + 20u) == 0u);
+            assert(load64(op + 32u + 24u) == 0u);
+            assert(op[64u] == 0xc1u);
+            assert(load16(op + 66u) == '$');
+            assert(load16(op + 68u) == 'F');
+            assert(load16(op + 70u) == 'F');
 
-        assert(b[448u] == 0xe1u);
-        assert(b[449u] == 0x03u);
-        assert(memcmp(b + 450u, alloc_guid, sizeof(alloc_guid)) == 0);
-        assert(load32(b + 468u) == 8u);
-        assert(load64(b + 472u) == sizeof(opaque_data));
-        assert(b[480u] == 0xa1u); /* descriptor is followed by occupied padding */
+            assert(op[96u] == 0xe0u);
+            assert(op[97u] == 0u);
+            assert(memcmp(op + 98u, meta_guid, sizeof(meta_guid)) == 0);
+            assert(op[114u] == 9u);
+            assert(memcmp(op + 115u, "SOLVER.DB", 9u) == 0);
+
+            assert(op[128u] == 0xe1u);
+            assert(op[129u] == 0x03u);
+            assert(memcmp(op + 130u, alloc_guid, sizeof(alloc_guid)) == 0);
+            assert(load32(op + 148u) == 8u);
+            assert(load64(op + 152u) == sizeof(opaque_data));
+            assert(root2[19u * 32u] == 0xa1u);
+        }
 
         oblock = ov.cluster_heap_block +
                  (uint64_t)(8u - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
@@ -917,7 +944,7 @@ int main(void)
             uint64_t root_block = fv.cluster_heap_block +
                                   (uint64_t)(fv.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
             uint8_t *root = media.data + root_block * FAUXFAT_BLOCK_SIZE;
-            uint8_t saved_public[96];
+            uint8_t saved_public[160];
 
             memset(&got, 0, sizeof(got));
             assert(fauxfat_parse_root_strict(&fv, &dev, collect_file, &got,
@@ -929,10 +956,100 @@ int main(void)
             assert(got.file[0].data_length == pubd.data_length);
             assert(got.file[0].allocation_blocks == pubd.allocation_blocks);
             assert(got.file[0].mtime == short_file.mtime);
+            assert(got.file[0].flags == 0u);
             assert(got.file[1].kind == FAUXFAT_DISK_FILE_OPAQUE);
             assert(strcmp(got.file[1].name, "SECRET.BIN") == 0);
             assert(got.file[1].first_block == opqd.first_block);
             assert(got.file[1].allocation_blocks == opqd.allocation_blocks);
+            assert(got.file[1].flags == 0u);
+            memcpy(saved_public, root + 4u * 32u, sizeof(saved_public));
+
+            /*
+             * A host namespace rename does not erase the manufactured logical
+             * identity.  NameHash is case-folded, so a case-only rename lets
+             * us exercise this without inventing a second copy of the hash
+             * algorithm in the test.
+             */
+            {
+                fauxfat_volume_class vc;
+                unsigned j;
+
+                for (j = 0u; j < 9u; ++j) {
+                    uint8_t *lo = root + 6u * 32u + 2u + 2u * j;
+                    if (*lo >= 'A' && *lo <= 'Z')
+                        *lo = (uint8_t)(*lo - 'A' + 'a');
+                }
+                store16(root + 4u * 32u + 2u,
+                        entry_set_checksum(root + 4u * 32u, 160u));
+
+                memset(&got, 0, sizeof(got));
+                assert(fauxfat_parse_root_strict(&fv, &dev, collect_file, &got,
+                                                 &count) == FAUXFAT_OK);
+                assert(strcmp(got.file[0].name, "SHORT.BIN") == 0);
+                assert((got.file[0].flags & FAUXFAT_DISK_FILE_NAME_CHANGED) != 0u);
+
+                memset(&got, 0, sizeof(got));
+                assert(fauxfat_scan_loose(&fv, &dev, collect_file, &got,
+                                          &count, &vc) == FAUXFAT_OK);
+                assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+                assert(count == 2u && got.count == 2u);
+                assert(strcmp(got.file[0].name, "SHORT.BIN") == 0);
+                assert((got.file[0].flags & FAUXFAT_DISK_FILE_NAME_CHANGED) != 0u);
+
+                memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+            }
+
+            /* Loose scan of the canonical image reports full fauxFAT validity. */
+            {
+                fauxfat_volume_class vc;
+                memset(&got, 0, sizeof(got));
+                assert(fauxfat_scan_loose(&fv, &dev, collect_file, &got,
+                                          &count, &vc) == FAUXFAT_OK);
+                assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+                assert(count == 2u && got.count == 2u);
+            }
+
+            /*
+             * Best effort also understands an ordinary three-entry contiguous
+             * NoFatChain file.  Remove fauxFAT's two origin-name vendor records
+             * and turn those slots back into benign padding.
+             */
+            {
+                fauxfat_volume_class vc;
+                uint8_t *set = root + 4u * 32u;
+
+                set[1] = 2u;
+                memset(set + 96u, 0, 64u);
+                set[96u] = 0xa1u;
+                store16(set + 98u, 0x0508u);
+                set[128u] = 0xa1u;
+                store16(set + 130u, 0x0508u);
+                store16(set + 2u, entry_set_checksum(set, 96u));
+
+                memset(&got, 0, sizeof(got));
+                assert(fauxfat_scan_loose(&fv, &dev, collect_file, &got,
+                                          &count, &vc) == FAUXFAT_OK);
+                assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
+                assert(count == 2u && got.count == 2u);
+                assert(strcmp(got.file[0].name, "SHORT.BIN") == 0);
+                assert(got.file[0].flags == 0u);
+
+                /* A fragmented ordinary file is valid-but-unsupported: skip it. */
+                set[32u + 1u] = 0x01u;
+                store16(set + 2u, entry_set_checksum(set, 96u));
+                memset(&got, 0, sizeof(got));
+                assert(fauxfat_scan_loose(&fv, &dev, collect_file, &got,
+                                          &count, &vc) == FAUXFAT_OK);
+                assert(count == 1u && got.count == 1u);
+                assert(got.file[0].kind == FAUXFAT_DISK_FILE_OPAQUE);
+
+                /* But a malformed set is ambiguity, not something to shrug at. */
+                set[2u] ^= 0x40u;
+                assert(fauxfat_scan_loose(&fv, &dev, NULL, NULL,
+                                          NULL, &vc) == FAUXFAT_ESTRUCTURE);
+
+                memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
+            }
 
             /* The parser callback is a streaming sink, so caller errors pass through. */
             memset(&got, 0, sizeof(got));
@@ -949,7 +1066,7 @@ int main(void)
             root[4u * 32u + 23u] = 0u;
             root[4u * 32u + 24u] = 0x80u;
             store16(root + 4u * 32u + 2u,
-                    entry_set_checksum(root + 4u * 32u, 96u));
+                    entry_set_checksum(root + 4u * 32u, 160u));
             memset(&got, 0, sizeof(got));
             assert(fauxfat_parse_root_strict(&fv, &dev, collect_file, &got,
                                              &count) == FAUXFAT_OK);
@@ -963,7 +1080,7 @@ int main(void)
             root[5u * 32u + 22u] = 0u;
             root[5u * 32u + 23u] = 0u;
             store16(root + 4u * 32u + 2u,
-                    entry_set_checksum(root + 4u * 32u, 96u));
+                    entry_set_checksum(root + 4u * 32u, 160u));
             assert(fauxfat_parse_root_strict(&fv, &dev, NULL, NULL, NULL) ==
                    FAUXFAT_ESTRUCTURE);
 
@@ -995,7 +1112,7 @@ int main(void)
             uint64_t fat_block   = 128u + fat_byte / FAUXFAT_BLOCK_SIZE;
             size_t fat_off       = (size_t)(fat_byte % FAUXFAT_BLOCK_SIZE);
             uint8_t saved;
-            uint8_t saved_public[96];
+            uint8_t saved_public[160];
 
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
@@ -1024,7 +1141,7 @@ int main(void)
             root[4u * 32u + 23u] = 0u;
             root[4u * 32u + 24u] = 0x80u;
             store16(root + 4u * 32u + 2u,
-                    entry_set_checksum(root + 4u * 32u, 96u));
+                    entry_set_checksum(root + 4u * 32u, 160u));
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
             memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
@@ -1033,7 +1150,7 @@ int main(void)
              * still a changed fauxFAT image, even with a repaired native set checksum. */
             root[4u * 32u + 8u] ^= 0x01u;
             store16(root + 4u * 32u + 2u,
-                    entry_set_checksum(root + 4u * 32u, 96u));
+                    entry_set_checksum(root + 4u * 32u, 160u));
             assert(fauxfat_validate_strict(&fv, &dev, &vc) == FAUXFAT_OK);
             assert(vc == FAUXFAT_VOLUME_FAUXFAT_CHANGED);
             memcpy(root + 4u * 32u, saved_public, sizeof(saved_public));
@@ -1127,6 +1244,47 @@ int main(void)
             assert(got.file[0].kind == FAUXFAT_DISK_FILE_OPAQUE);
             assert(strcmp(got.file[0].name, "ABCDEFGHIJKLMNO") == 0);
         }
+    }
+
+    /* Public logical names use the same 15-byte ceiling, split across the two
+     * benign original-name Vendor Extension records. */
+    {
+        fauxfat_file long_file = {
+            "ABCDEFGHIJKLMNO", 11, sizeof(config_data), (time_t)1735787045
+        };
+
+        fauxfat_config lcfg = cfg;
+        fauxfat_view lv;
+        uint64_t lroot;
+        fauxfat_device parse_dev;
+        emit_test got;
+        size_t count = 0u;
+
+        lcfg.files             = &long_file;
+        lcfg.file_count        = 1u;
+        lcfg.opaque_files      = NULL;
+        lcfg.opaque_file_count = 0u;
+        assert(fauxfat_init(&lv, &lcfg) == FAUXFAT_OK);
+        lroot = lv.cluster_heap_block +
+                (uint64_t)(lv.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        assert(fauxfat_read_block(&lv, lroot, b) == FAUXFAT_OK);
+        assert(b[224u] == 0xe0u);
+        assert(b[242u] == 15u);
+        assert(memcmp(b + 243u, "ABCDEFGHIJKLM", 13u) == 0);
+        assert(b[256u] == 0xe0u);
+        assert(b[274u] == 'N');
+        assert(b[275u] == 'O');
+        assert(b[276u] == 15u);
+
+        memset(&parse_dev, 0, sizeof(parse_dev));
+        parse_dev.read    = view_dev_read;
+        parse_dev.context = &lv;
+        memset(&got, 0, sizeof(got));
+        assert(fauxfat_parse_root_strict(&lv, &parse_dev, collect_file,
+                                         &got, &count) == FAUXFAT_OK);
+        assert(count == 1u && got.count == 1u);
+        assert(strcmp(got.file[0].name, "ABCDEFGHIJKLMNO") == 0);
+        assert(got.file[0].flags == 0u);
     }
 
     /* exFAT cannot encode dates before 1980 or after 2107. */

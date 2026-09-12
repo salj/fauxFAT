@@ -65,13 +65,17 @@ cluster heap:
 
 Public file clusters have FAT value `0` because `NoFatChain` files do not use those entries as a chain. Opaque ranges use `0xFFFFFFF7`. Filesystem metadata clusters use normal fixed EOC/chain values.
 
-A public file uses the ordinary three-entry exFAT set:
+A public file uses the ordinary exFAT namespace entries plus two benign fauxFAT identity records:
 
 ```text
 File
 Stream Extension, NoFatChain=1
 File Name
+Vendor Extension, original-name bytes 0..12
+Vendor Extension, original-name bytes 13..14 + length check
 ```
+
+The two vendor records preserve the manufactured logical name. If a host performs a legal rename, parsers still return the original name and set `FAUXFAT_DISK_FILE_NAME_CHANGED`; whole-volume strict validation still reports the façade as changed. This keeps application-facing identity stable without pretending namespace mutation was authorized.
 
 An opaque range which must be rediscoverable uses a hidden inert file set plus fauxFAT vendor records:
 
@@ -236,12 +240,15 @@ The public interchange type for a recognized contiguous allocation is:
 typedef struct fauxfat_disk_file {
     char name[FAUXFAT_NAME_MAX + 1];
     fauxfat_disk_file_kind kind;
+    uint32_t flags;
     uint64_t first_block;
     uint64_t data_length;
     uint64_t allocation_blocks;
     time_t mtime;
 } fauxfat_disk_file;
 ```
+
+For recognized fauxFAT public files, `name` is the persisted manufactured logical name rather than blindly trusting the mutable namespace entry. `FAUXFAT_DISK_FILE_NAME_CHANGED` reports that the visible exFAT name no longer matches it.
 
 For the current synthetic view:
 
@@ -293,7 +300,7 @@ int preserve(void *ctx, const fauxfat_disk_file *wanted);
 
 Return greater than zero to preserve the complete allocation, zero to initialize it normally, or a negative value to abort formatting.
 
-This is the intended repair path; strict whole-volume verification is now implemented, while loose salvage/reopen is still being filled in:
+This is the intended repair path; strict whole-volume verification and bounded loose salvage are implemented, while schema-free reopen is still being filled in:
 
 ```text
 parse / validate existing volume
@@ -307,7 +314,7 @@ No payload relocation is implied by reformatting. If a desired object moved or c
 
 ## 9. Validation and reopen model
 
-Strict whole-volume validation against a trusted `fauxfat_view` is implemented. The loose scanner and schema-free reopen path are still pending.
+Strict whole-volume validation against a trusted `fauxfat_view` and a bounded loose scanner are implemented. Schema-free reopen is still pending.
 
 With trusted geometry already in a `fauxfat_view`, the implemented bounded pass is:
 
@@ -331,6 +338,14 @@ Main `VolumeDirty`, stale Backup Boot volatile fields, and the documented File A
 Strict validation asks whether the volume is still the fauxFAT structure we manufactured, allowing only metadata changes expected from a normal compliant mount and in-place write cycle. It verifies fixed geometry, boot checksums, the exact upcase table, the saturated bitmap, root layout, public and opaque descriptor sets, FAT classification, exFAT entry checksums, and the OEM XXH32 seals.
 
 Loose validation is a bounded salvage mode. It may return simple root files whose Stream Extension proves they are contiguous `NoFatChain` files, and exact fauxFAT opaque descriptors. It may skip valid objects it does not support. It aborts rather than guessing when the structure is malformed or ambiguous.
+
+The implemented entry point is:
+
+```c
+fauxfat_scan_loose(&view, &device, emit_file, ctx, &count, &cls);
+```
+
+It currently uses the trusted view for geometry, then performs the bounded root scan. Exact fauxFAT public files recover their persisted manufactured name from the two benign vendor records; a live namespace rename sets `FAUXFAT_DISK_FILE_NAME_CHANGED` while leaving `desc.name` stable. Ordinary three-entry contiguous root files are also emitted. Directories, fragmented files, and otherwise well-bounded unsupported File sets are skipped. Bad set checksums, orphan secondaries, impossible counts, overlap/order ambiguity, or unknown critical primaries abort the scan.
 
 The intended classifications are:
 
@@ -384,6 +399,7 @@ Implemented now:
 
 - deterministic exFAT v1 geometry and metadata generation;
 - public contiguous files;
+- persisted original/logical names for public files using two benign Vendor Extension records;
 - opaque/private contiguous descriptors and ranges;
 - 128-byte ISO-8859-1-oriented exFAT upcase table;
 - callback-backed payload reads and writes;
@@ -392,13 +408,13 @@ Implemented now:
 - physical descriptor enumeration from a synthetic view;
 - strict bounded parsing of the fixed one-cluster root into the same descriptors;
 - whole-volume strict validation against a trusted view, including both boot checksums, FAT/bitmap/upcase/root checks, OEM identity, and recomputed XXH32 seals;
+- bounded loose root scanning with original-name recovery and rename flagging;
 - single structural XXH32 seal plus component XXH32 fingerprints;
 - sparse/in-place formatter with generated/zero/undefined/preserve range semantics;
 - Unix `time_t` input for file timestamps.
 
 Planned, not implemented yet:
 
-- loose/best-effort root scanner;
 - reopening recovered descriptors as caller-backed file descriptors;
 - explicit physical placement instead of the current packed layout;
 - optional dual-view A/B presentation optimization.

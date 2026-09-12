@@ -7,7 +7,7 @@
 #define FF_UPCASE_BYTES       128u
 #define FF_ROOT_ENTRIES       2048u
 #define FF_FILE_SLOT_FIRST    4u
-#define FF_PUBLIC_ENTRY_COUNT 3u
+#define FF_PUBLIC_ENTRY_COUNT 5u
 #define FF_OPAQUE_ENTRY_COUNT 5u
 #define FF_FAT_EOC            0xffffffffu
 #define FF_MAX_CLUSTER_COUNT  0xfffffff5u
@@ -34,6 +34,10 @@
 #define FF_ENTRY_NAME         0xc1u
 #define FF_ENTRY_VENDOR_EXT   0xe0u
 #define FF_ENTRY_VENDOR_ALLOC 0xe1u
+
+#define FF_ENTRY_IN_USE    0x80u
+#define FF_ENTRY_SECONDARY 0x40u
+#define FF_ENTRY_BENIGN    0x20u
 
 #define FF_ATTR_READONLY  0x0001u
 #define FF_ATTR_HIDDEN    0x0002u
@@ -62,6 +66,22 @@ static const uint8_t ff_opaque_meta_guid[16] = {
 static const uint8_t ff_opaque_alloc_guid[16] = {
     0xea, 0xbd, 0x0d, 0x94, 0xf9, 0xce, 0xaa, 0x4c,
     0x85, 0x55, 0x0f, 0x60, 0xe0, 0x5b, 0xa9, 0x3c
+};
+
+/*
+ * Public files keep their manufactured logical name in two benign Vendor
+ * Extension records.  This is deliberately redundant with the namespace
+ * name: the namespace may be renamed by a host, while recovery still exposes
+ * the stable logical name to firmware.
+ */
+static const uint8_t ff_public_name_guid0[16] = {
+    0x65, 0xc7, 0x13, 0xae, 0x8b, 0x27, 0x2f, 0x4b,
+    0x9d, 0x4e, 0x74, 0x26, 0xb0, 0xc6, 0x18, 0x91
+};
+
+static const uint8_t ff_public_name_guid1[16] = {
+    0x0e, 0x4a, 0xb1, 0x58, 0x9c, 0x89, 0x34, 0x47,
+    0xb3, 0xe1, 0x5a, 0x71, 0x7d, 0x0a, 0x2f, 0xcc
 };
 
 static void ff_store16(uint8_t *p, uint16_t v)
@@ -762,20 +782,22 @@ static void ff_store_file_times(uint8_t file_ent[32], time_t mtime)
 
 static void ff_make_public_file_set(const fauxfat_view *v,
                                     size_t file_index,
-                                    uint8_t set[96])
+                                    uint8_t set[160])
 {
     const fauxfat_file *f = &v->config->files[file_index];
     uint8_t *file_ent     = set;
     uint8_t *stream_ent   = set + 32;
     uint8_t *name_ent     = set + 64;
+    uint8_t *vendor0      = set + 96;
+    uint8_t *vendor1      = set + 128;
     size_t name_len       = 0;
     size_t i;
 
     (void)ff_name_valid(f->name, &name_len);
-    memset(set, 0, 96);
+    memset(set, 0, 160);
 
     file_ent[0] = FF_ENTRY_FILE;
-    file_ent[1] = 2u;
+    file_ent[1] = 4u;
     ff_store_file_times(file_ent, f->mtime);
 
     stream_ent[0] = FF_ENTRY_STREAM;
@@ -790,7 +812,28 @@ static void ff_make_public_file_set(const fauxfat_view *v,
     for (i = 0; i < name_len; ++i)
         ff_store16(name_ent + 2u + 2u * i, (uint8_t)f->name[i]);
 
-    ff_store16(file_ent + 2, ff_entry_set_checksum(set, 96));
+    /*
+     * Persist the logical/original name independently of the host namespace.
+     * The first record carries length + bytes 0..12; the second carries bytes
+     * 13..14 and repeats the length for a cheap torn/corrupt-record check.
+     */
+    vendor0[0] = FF_ENTRY_VENDOR_EXT;
+    vendor0[1] = 0u;
+    memcpy(vendor0 + 2, ff_public_name_guid0, 16u);
+    vendor0[18] = (uint8_t)name_len;
+    for (i = 0; i < name_len && i < 13u; ++i)
+        vendor0[19u + i] = (uint8_t)f->name[i];
+
+    vendor1[0] = FF_ENTRY_VENDOR_EXT;
+    vendor1[1] = 0u;
+    memcpy(vendor1 + 2, ff_public_name_guid1, 16u);
+    if (name_len > 13u)
+        vendor1[18] = (uint8_t)f->name[13];
+    if (name_len > 14u)
+        vendor1[19] = (uint8_t)f->name[14];
+    vendor1[20] = (uint8_t)name_len;
+
+    ff_store16(file_ent + 2, ff_entry_set_checksum(set, 160));
 }
 
 static void ff_opaque_stub_name(size_t opaque_index,
@@ -922,7 +965,7 @@ static void ff_make_root_entry(const fauxfat_view *v,
         uint32_t rel    = entry_index - public_first;
         size_t slot     = rel / FF_PUBLIC_ENTRY_COUNT;
         unsigned member = rel % FF_PUBLIC_ENTRY_COUNT;
-        uint8_t set[96];
+        uint8_t set[160];
 
         ff_make_public_file_set(v, slot, set);
         memcpy(out, set + member * 32u, 32);
@@ -1876,7 +1919,7 @@ static int ff_public_file_entry_valid(const uint8_t e[32], time_t *mtime)
 {
     uint16_t attrs;
 
-    if (e[0] != FF_ENTRY_FILE || e[1] != 2u)
+    if (e[0] != FF_ENTRY_FILE || e[1] != 4u)
         return 0;
     attrs = ff_load16(e + 4);
     if ((attrs & (uint16_t)~FF_ATTR_ARCHIVE) != 0u)
@@ -1978,14 +2021,56 @@ static int ff_extent_to_descriptor(const fauxfat_view *v,
     return 1;
 }
 
+static int ff_decode_public_origin(const uint8_t vendor0[32],
+                                   const uint8_t vendor1[32],
+                                   char out[FAUXFAT_NAME_MAX + 1u])
+{
+    uint8_t len;
+    unsigned i;
+
+    if (vendor0[0] != FF_ENTRY_VENDOR_EXT || vendor0[1] != 0u ||
+        memcmp(vendor0 + 2u, ff_public_name_guid0, 16u) != 0 ||
+        vendor1[0] != FF_ENTRY_VENDOR_EXT || vendor1[1] != 0u ||
+        memcmp(vendor1 + 2u, ff_public_name_guid1, 16u) != 0)
+        return 0;
+
+    len = vendor0[18];
+    if (len == 0u || len > FAUXFAT_NAME_MAX || vendor1[20] != len ||
+        !ff_all_zero(vendor1 + 21u, 11u))
+        return 0;
+
+    for (i = 0u; i < 13u; ++i) {
+        uint8_t ch = vendor0[19u + i];
+        if (i < len)
+            out[i] = (char)ch;
+        else if (ch != 0u)
+            return 0;
+    }
+
+    if (len > 13u)
+        out[13] = (char)vendor1[18];
+    else if (vendor1[18] != 0u)
+        return 0;
+    if (len > 14u)
+        out[14] = (char)vendor1[19];
+    else if (vendor1[19] != 0u)
+        return 0;
+
+    out[len] = '\0';
+    return ff_name_valid(out, NULL);
+}
+
 static int ff_parse_public_set(const fauxfat_view *v,
-                               const uint8_t set[96],
+                               const uint8_t set[160],
                                fauxfat_disk_file *d,
                                uint64_t *end_cluster)
 {
     const uint8_t *file_ent = set;
     const uint8_t *stream   = set + 32u;
     const uint8_t *name_ent = set + 64u;
+    const uint8_t *vendor0  = set + 96u;
+    const uint8_t *vendor1  = set + 128u;
+    char visible_name[FAUXFAT_NAME_MAX + 1u];
     uint64_t data_length;
     uint8_t name_len;
 
@@ -1993,7 +2078,7 @@ static int ff_parse_public_set(const fauxfat_view *v,
     d->kind = FAUXFAT_DISK_FILE_PUBLIC;
 
     if (!ff_public_file_entry_valid(file_ent, &d->mtime) ||
-        ff_load16(file_ent + 2) != ff_entry_set_checksum(set, 96u))
+        ff_load16(file_ent + 2) != ff_entry_set_checksum(set, 160u))
         return 0;
 
     if (stream[0] != FF_ENTRY_STREAM || stream[1] != 0x03u ||
@@ -2001,9 +2086,12 @@ static int ff_parse_public_set(const fauxfat_view *v,
         !ff_all_zero(stream + 16, 4u))
         return 0;
     name_len = stream[3];
-    if (!ff_decode_name_entry(name_ent, name_len, d->name) ||
-        ff_load16(stream + 4) != ff_name_hash(d->name))
+    if (!ff_decode_name_entry(name_ent, name_len, visible_name) ||
+        ff_load16(stream + 4) != ff_name_hash(visible_name) ||
+        !ff_decode_public_origin(vendor0, vendor1, d->name))
         return 0;
+    if (strcmp(visible_name, d->name) != 0)
+        d->flags |= FAUXFAT_DISK_FILE_NAME_CHANGED;
 
     data_length = ff_load64(stream + 24);
     if (ff_load64(stream + 8) != data_length ||
@@ -2083,6 +2171,126 @@ static int ff_parse_opaque_set(const fauxfat_view *v,
     return 1;
 }
 
+static int ff_opaque_stub_valid(const char *name)
+{
+    unsigned i;
+
+    if (!name || strlen(name) != 11u || name[0] != '$' ||
+        name[1] != 'F' || name[2] != 'F')
+        return 0;
+    for (i = 3u; i < 11u; ++i) {
+        char c = name[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return 1;
+}
+
+static int ff_parse_opaque_set_loose(const fauxfat_view *v,
+                                     const uint8_t set[160],
+                                     fauxfat_disk_file *d,
+                                     uint64_t *end_cluster)
+{
+    const uint8_t *file_ent     = set;
+    const uint8_t *stream       = set + 32u;
+    const uint8_t *name_ent     = set + 64u;
+    const uint8_t *vendor_ext   = set + 96u;
+    const uint8_t *vendor_alloc = set + 128u;
+    char stub[FAUXFAT_NAME_MAX + 1u];
+    uint8_t logical_len;
+    unsigned i;
+
+    memset(d, 0, sizeof(*d));
+    d->kind = FAUXFAT_DISK_FILE_OPAQUE;
+
+    if (!ff_opaque_file_entry_valid(file_ent, &d->mtime) ||
+        ff_load16(file_ent + 2u) != ff_entry_set_checksum(set, 160u))
+        return 0;
+    if (stream[0] != FF_ENTRY_STREAM || stream[1] != 0x01u ||
+        stream[2] != 0u || !ff_all_zero(stream + 6u, 14u) ||
+        !ff_all_zero(stream + 20u, 12u) || stream[3] != 11u ||
+        !ff_decode_name_entry(name_ent, stream[3], stub) ||
+        !ff_opaque_stub_valid(stub) ||
+        ff_load16(stream + 4u) != ff_name_hash(stub))
+        return 0;
+
+    if (vendor_ext[0] != FF_ENTRY_VENDOR_EXT || vendor_ext[1] != 0u ||
+        memcmp(vendor_ext + 2u, ff_opaque_meta_guid, 16u) != 0)
+        return 0;
+    logical_len = vendor_ext[18];
+    if (logical_len == 0u || logical_len > FAUXFAT_NAME_MAX)
+        return 0;
+    for (i = 0u; i < 13u; ++i) {
+        uint8_t ch = vendor_ext[19u + i];
+        if (i < logical_len)
+            d->name[i] = (char)ch;
+        else if (ch != 0u)
+            return 0;
+    }
+
+    if (vendor_alloc[0] != FF_ENTRY_VENDOR_ALLOC || vendor_alloc[1] != 0x03u ||
+        memcmp(vendor_alloc + 2u, ff_opaque_alloc_guid, 16u) != 0)
+        return 0;
+    if (logical_len > 13u)
+        d->name[13] = (char)vendor_alloc[18];
+    else if (vendor_alloc[18] != 0u)
+        return 0;
+    if (logical_len > 14u)
+        d->name[14] = (char)vendor_alloc[19];
+    else if (vendor_alloc[19] != 0u)
+        return 0;
+    d->name[logical_len] = '\0';
+    if (!ff_name_valid(d->name, NULL))
+        return 0;
+
+    return ff_extent_to_descriptor(v, ff_load32(vendor_alloc + 20u),
+                                   ff_load64(vendor_alloc + 24u), 1,
+                                   d, end_cluster);
+}
+
+static int ff_parse_regular_set_loose(const fauxfat_view *v,
+                                      const uint8_t set[96],
+                                      fauxfat_disk_file *d,
+                                      uint64_t *end_cluster)
+{
+    const uint8_t *file_ent = set;
+    const uint8_t *stream   = set + 32u;
+    const uint8_t *name_ent = set + 64u;
+    uint16_t attrs;
+    uint64_t valid_length;
+    uint64_t data_length;
+
+    memset(d, 0, sizeof(*d));
+    d->kind = FAUXFAT_DISK_FILE_PUBLIC;
+
+    if (file_ent[0] != FF_ENTRY_FILE || file_ent[1] != 2u ||
+        ff_load16(file_ent + 2u) != ff_entry_set_checksum(set, 96u))
+        return 0;
+    attrs = ff_load16(file_ent + 4u);
+    if ((attrs & FF_ATTR_DIRECTORY) != 0u ||
+        (attrs & (uint16_t)~(FF_ATTR_READONLY | FF_ATTR_HIDDEN |
+                             FF_ATTR_SYSTEM | FF_ATTR_ARCHIVE)) != 0u)
+        return 0;
+    if (stream[0] != FF_ENTRY_STREAM || stream[1] != 0x03u ||
+        stream[2] != 0u || !ff_all_zero(stream + 6u, 2u) ||
+        !ff_all_zero(stream + 16u, 4u) ||
+        !ff_decode_name_entry(name_ent, stream[3], d->name) ||
+        ff_load16(stream + 4u) != ff_name_hash(d->name))
+        return 0;
+
+    valid_length = ff_load64(stream + 8u);
+    data_length  = ff_load64(stream + 24u);
+    if (data_length == 0u || valid_length > data_length ||
+        !ff_extent_to_descriptor(v, ff_load32(stream + 20u), data_length,
+                                 0, d, end_cluster))
+        return 0;
+
+    if (!ff_exfat_timestamp_decode(ff_load32(file_ent + 12u), file_ent[21],
+                                   0, &d->mtime))
+        d->mtime = (time_t)0;
+    return 1;
+}
+
 static int ff_validate_root_system_entries(const fauxfat_view *v,
                                            ff_root_reader *r)
 {
@@ -2148,6 +2356,7 @@ static int ff_root_public_name_exists(const fauxfat_device *device,
                                       uint64_t root_first_block,
                                       uint32_t public_end_entry,
                                       const char *name,
+                                      int logical,
                                       int *found)
 {
     ff_root_reader r;
@@ -2160,14 +2369,14 @@ static int ff_root_public_name_exists(const fauxfat_device *device,
 
     for (entry = FF_FILE_SLOT_FIRST; entry < public_end_entry;
          entry += FF_PUBLIC_ENTRY_COUNT) {
-        uint8_t set[96];
+        uint8_t set[160];
         char other[FAUXFAT_NAME_MAX + 1u];
         int rc = ff_root_set(&r, entry, FF_PUBLIC_ENTRY_COUNT, set);
         if (rc != FAUXFAT_OK)
             return rc;
-        if (set[0] != FF_ENTRY_FILE || set[1] != 2u ||
+        if (set[0] != FF_ENTRY_FILE || set[1] != 4u ||
             set[32] != FF_ENTRY_STREAM ||
-            !ff_decode_name_entry(set + 64u, set[35], other))
+            !(logical ? ff_decode_public_origin(set + 96u, set + 128u, other) : ff_decode_name_entry(set + 64u, set[35], other)))
             return FAUXFAT_ESTRUCTURE;
         if (ff_name_equal_folded(name, other)) {
             *found = 1;
@@ -2237,83 +2446,95 @@ int fauxfat_parse_root_strict(const fauxfat_view *v,
         if (phase == FF_ROOT_PADDING || first[0] != FF_ENTRY_FILE)
             return FAUXFAT_ESTRUCTURE;
 
-        if (first[1] == 2u) {
-            uint8_t set[96];
-            fauxfat_disk_file d;
-            uint64_t end_cluster;
-            int seen;
-
-            if (phase != FF_ROOT_PUBLIC || entry > FF_ROOT_ENTRIES - 3u)
-                return FAUXFAT_ESTRUCTURE;
-            rc = ff_root_set(&r, entry, 3u, set);
-            if (rc != FAUXFAT_OK)
-                return rc;
-            if (!ff_parse_public_set(v, set, &d, &end_cluster) ||
-                end_cluster <= previous_end_cluster ||
-                ff_load32(set + 32u + 20u) < previous_end_cluster)
-                return FAUXFAT_ESTRUCTURE;
-
-            rc = ff_root_public_name_exists(device, root_first_block,
-                                            entry, d.name, &seen);
-            if (rc != FAUXFAT_OK)
-                return rc;
-            if (seen)
-                return FAUXFAT_ESTRUCTURE;
-
-            previous_end_cluster = end_cluster;
-            if (emit) {
-                rc = emit(emit_context, descriptor_index, &d);
-                if (rc != 0)
-                    return rc;
-            }
-            ++descriptor_index;
-            ++public_count;
-            entry += 3u;
-            continue;
-        }
-
         if (first[1] == 4u) {
             uint8_t set[160];
             fauxfat_disk_file d;
             uint64_t end_cluster;
-            char stub[FAUXFAT_NAME_MAX + 1u];
-            int collision;
+            char visible[FAUXFAT_NAME_MAX + 1u];
+            int seen_logical;
+            int seen_visible;
 
-            if (entry > FF_ROOT_ENTRIES - 5u)
+            if (entry > FF_ROOT_ENTRIES - FF_PUBLIC_ENTRY_COUNT)
                 return FAUXFAT_ESTRUCTURE;
-            if (phase == FF_ROOT_PUBLIC) {
-                phase            = FF_ROOT_OPAQUE;
-                public_end_entry = entry;
-            }
-            if (phase != FF_ROOT_OPAQUE)
-                return FAUXFAT_ESTRUCTURE;
-
-            rc = ff_root_set(&r, entry, 5u, set);
+            rc = ff_root_set(&r, entry, FF_PUBLIC_ENTRY_COUNT, set);
             if (rc != FAUXFAT_OK)
                 return rc;
-            if (!ff_parse_opaque_set(v, set, opaque_count, &d, &end_cluster) ||
-                end_cluster <= previous_end_cluster ||
-                ff_load32(set + 128u + 20u) < previous_end_cluster)
-                return FAUXFAT_ESTRUCTURE;
 
-            ff_opaque_stub_name(opaque_count, stub);
-            rc = ff_root_public_name_exists(device, root_first_block,
-                                            public_end_entry, stub, &collision);
-            if (rc != FAUXFAT_OK)
-                return rc;
-            if (collision)
-                return FAUXFAT_ESTRUCTURE;
+            if (set[128u] == FF_ENTRY_VENDOR_EXT &&
+                memcmp(set + 130u, ff_public_name_guid1, 16u) == 0) {
+                if (phase != FF_ROOT_PUBLIC ||
+                    !ff_parse_public_set(v, set, &d, &end_cluster) ||
+                    !ff_decode_name_entry(set + 64u, set[35], visible) ||
+                    end_cluster <= previous_end_cluster ||
+                    ff_load32(set + 32u + 20u) < previous_end_cluster)
+                    return FAUXFAT_ESTRUCTURE;
 
-            previous_end_cluster = end_cluster;
-            if (emit) {
-                rc = emit(emit_context, descriptor_index, &d);
-                if (rc != 0)
+                rc = ff_root_public_name_exists(device, root_first_block,
+                                                entry, d.name, 1,
+                                                &seen_logical);
+                if (rc != FAUXFAT_OK)
                     return rc;
+                rc = ff_root_public_name_exists(device, root_first_block,
+                                                entry, visible, 0,
+                                                &seen_visible);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+                if (seen_logical || seen_visible)
+                    return FAUXFAT_ESTRUCTURE;
+
+                previous_end_cluster = end_cluster;
+                if (emit) {
+                    rc = emit(emit_context, descriptor_index, &d);
+                    if (rc != 0)
+                        return rc;
+                }
+                ++descriptor_index;
+                ++public_count;
+                entry += FF_PUBLIC_ENTRY_COUNT;
+                continue;
             }
-            ++descriptor_index;
-            ++opaque_count;
-            entry += 5u;
-            continue;
+
+            /* The only other four-secondary fauxFAT set is an opaque one. */
+            if (set[128u] != FF_ENTRY_VENDOR_ALLOC ||
+                memcmp(set + 130u, ff_opaque_alloc_guid, 16u) != 0)
+                return FAUXFAT_ESTRUCTURE;
+
+            {
+                char stub[FAUXFAT_NAME_MAX + 1u];
+                int collision;
+
+                if (phase == FF_ROOT_PUBLIC) {
+                    phase            = FF_ROOT_OPAQUE;
+                    public_end_entry = entry;
+                }
+                if (phase != FF_ROOT_OPAQUE)
+                    return FAUXFAT_ESTRUCTURE;
+
+                if (!ff_parse_opaque_set(v, set, opaque_count, &d, &end_cluster) ||
+                    end_cluster <= previous_end_cluster ||
+                    ff_load32(set + 128u + 20u) < previous_end_cluster)
+                    return FAUXFAT_ESTRUCTURE;
+
+                ff_opaque_stub_name(opaque_count, stub);
+                rc = ff_root_public_name_exists(device, root_first_block,
+                                                public_end_entry, stub, 0,
+                                                &collision);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+                if (collision)
+                    return FAUXFAT_ESTRUCTURE;
+
+                previous_end_cluster = end_cluster;
+                if (emit) {
+                    rc = emit(emit_context, descriptor_index, &d);
+                    if (rc != 0)
+                        return rc;
+                }
+                ++descriptor_index;
+                ++opaque_count;
+                entry += FF_OPAQUE_ENTRY_COUNT;
+                continue;
+            }
         }
 
         return FAUXFAT_ESTRUCTURE;
@@ -2710,5 +2931,210 @@ int fauxfat_validate_strict(const fauxfat_view *v,
         return FAUXFAT_OK;
 
     *classification = FAUXFAT_VOLUME_FAUXFAT_VALID;
+    return FAUXFAT_OK;
+}
+
+static int ff_emit_loose_descriptor(fauxfat_file_emit_fn emit,
+                                    void *emit_context,
+                                    unsigned *descriptor_index,
+                                    uint64_t *previous_end_cluster,
+                                    uint64_t end_cluster,
+                                    uint32_t first_cluster,
+                                    const fauxfat_disk_file *d)
+{
+    int rc;
+
+    if (end_cluster <= (uint64_t)first_cluster ||
+        (uint64_t)first_cluster < *previous_end_cluster)
+        return FAUXFAT_ESTRUCTURE;
+
+    *previous_end_cluster = end_cluster;
+    if (emit) {
+        rc = emit(emit_context, *descriptor_index, d);
+        if (rc != 0)
+            return rc;
+    }
+    ++*descriptor_index;
+    return FAUXFAT_OK;
+}
+
+int fauxfat_scan_loose(const fauxfat_view *v,
+                       const fauxfat_device *device,
+                       fauxfat_file_emit_fn emit,
+                       void *emit_context,
+                       size_t *descriptor_count,
+                       fauxfat_volume_class *classification)
+{
+    ff_root_reader r;
+    fauxfat_volume_class strict_class;
+    uint64_t root_first_block;
+    uint64_t previous_end_cluster;
+    uint32_t entry            = 0u;
+    unsigned descriptor_index = 0u;
+    int rc;
+
+    if (!v || !device || !device->read || !classification)
+        return FAUXFAT_EINVAL;
+
+    rc = fauxfat_validate_strict(v, device, &strict_class);
+    if (rc != FAUXFAT_OK)
+        return rc;
+
+    if (v->root_cluster < 2u || v->root_cluster > v->cluster_count + 1u)
+        return FAUXFAT_EGEOMETRY;
+    root_first_block = (uint64_t)v->cluster_heap_block +
+                       (uint64_t)(v->root_cluster - 2u) *
+                           FAUXFAT_BLOCKS_PER_CLUSTER;
+    if (root_first_block > v->volume_blocks ||
+        FAUXFAT_BLOCKS_PER_CLUSTER > v->volume_blocks - root_first_block)
+        return FAUXFAT_EGEOMETRY;
+
+    memset(&r, 0, sizeof(r));
+    r.device             = device;
+    r.first_block        = root_first_block;
+    previous_end_cluster = v->data_first_cluster;
+
+    while (entry < FF_ROOT_ENTRIES) {
+        uint8_t first[32];
+        uint8_t type;
+
+        rc = ff_root_entry(&r, entry, first);
+        if (rc != FAUXFAT_OK)
+            return rc;
+        type = first[0];
+
+        /* Normal exFAT end marker. fauxFAT instead pads to the cluster end. */
+        if (type == 0u)
+            break;
+
+        /* Deleted/non-live directory entries are irrelevant to salvage. */
+        if ((type & FF_ENTRY_IN_USE) == 0u) {
+            ++entry;
+            continue;
+        }
+
+        if (type == FF_ENTRY_BITMAP || type == FF_ENTRY_UPCASE ||
+            type == FF_ENTRY_LABEL || type == FF_ENTRY_GUID ||
+            type == FF_ENTRY_PAD) {
+            ++entry;
+            continue;
+        }
+
+        if (type == FF_ENTRY_FILE) {
+            unsigned secondary_count = first[1];
+            unsigned total_count;
+            uint8_t set[19u * 32u];
+            fauxfat_disk_file d;
+            uint64_t end_cluster;
+            uint32_t first_cluster;
+            int public_hint = 0;
+            int opaque_hint = 0;
+
+            /* exFAT File sets have 2..18 secondaries; cap scratch accordingly. */
+            if (secondary_count < 2u || secondary_count > 18u)
+                return FAUXFAT_ESTRUCTURE;
+            total_count = secondary_count + 1u;
+            if (entry > FF_ROOT_ENTRIES - total_count)
+                return FAUXFAT_ESTRUCTURE;
+            rc = ff_root_set(&r, entry, total_count, set);
+            if (rc != FAUXFAT_OK)
+                return rc;
+            if (ff_load16(set + 2u) !=
+                ff_entry_set_checksum(set, (size_t)total_count * 32u))
+                return FAUXFAT_ESTRUCTURE;
+
+            if (secondary_count >= 4u) {
+                public_hint =
+                    (set[96u] == FF_ENTRY_VENDOR_EXT &&
+                     memcmp(set + 98u, ff_public_name_guid0, 16u) == 0) ||
+                    (set[128u] == FF_ENTRY_VENDOR_EXT &&
+                     memcmp(set + 130u, ff_public_name_guid1, 16u) == 0);
+                opaque_hint =
+                    (set[96u] == FF_ENTRY_VENDOR_EXT &&
+                     memcmp(set + 98u, ff_opaque_meta_guid, 16u) == 0) ||
+                    (set[128u] == FF_ENTRY_VENDOR_ALLOC &&
+                     memcmp(set + 130u, ff_opaque_alloc_guid, 16u) == 0);
+            }
+
+            if (secondary_count == 4u &&
+                set[96u] == FF_ENTRY_VENDOR_EXT &&
+                set[128u] == FF_ENTRY_VENDOR_EXT &&
+                memcmp(set + 98u, ff_public_name_guid0, 16u) == 0 &&
+                memcmp(set + 130u, ff_public_name_guid1, 16u) == 0) {
+                if (!ff_parse_public_set(v, set, &d, &end_cluster))
+                    return FAUXFAT_ESTRUCTURE;
+                first_cluster = ff_load32(set + 32u + 20u);
+                rc            = ff_emit_loose_descriptor(emit, emit_context,
+                                                         &descriptor_index,
+                                                         &previous_end_cluster,
+                                                         end_cluster, first_cluster, &d);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+            } else if (secondary_count == 4u &&
+                       set[96u] == FF_ENTRY_VENDOR_EXT &&
+                       set[128u] == FF_ENTRY_VENDOR_ALLOC &&
+                       memcmp(set + 98u, ff_opaque_meta_guid, 16u) == 0 &&
+                       memcmp(set + 130u, ff_opaque_alloc_guid, 16u) == 0) {
+                if (!ff_parse_opaque_set_loose(v, set, &d, &end_cluster))
+                    return FAUXFAT_ESTRUCTURE;
+                first_cluster = ff_load32(set + 128u + 20u);
+                rc            = ff_emit_loose_descriptor(emit, emit_context,
+                                                         &descriptor_index,
+                                                         &previous_end_cluster,
+                                                         end_cluster, first_cluster, &d);
+                if (rc != FAUXFAT_OK)
+                    return rc;
+            } else if (public_hint || opaque_hint) {
+                /* A torn/corrupted fauxFAT descriptor is not a foreign object. */
+                return FAUXFAT_ESTRUCTURE;
+            } else if (secondary_count == 2u) {
+                uint16_t attrs        = ff_load16(set + 4u);
+                const uint8_t *stream = set + 32u;
+
+                /*
+                 * Directories and fragmented files are valid exFAT but are
+                 * outside the fauxFAT salvage profile. Skip, don't learn to
+                 * traverse them.
+                 */
+                if ((attrs & FF_ATTR_DIRECTORY) == 0u &&
+                    stream[0] == FF_ENTRY_STREAM && stream[1] == 0x03u) {
+                    if (!ff_parse_regular_set_loose(v, set, &d, &end_cluster))
+                        return FAUXFAT_ESTRUCTURE;
+                    first_cluster = ff_load32(stream + 20u);
+                    rc            = ff_emit_loose_descriptor(emit, emit_context,
+                                                             &descriptor_index,
+                                                             &previous_end_cluster,
+                                                             end_cluster, first_cluster,
+                                                             &d);
+                    if (rc != FAUXFAT_OK)
+                        return rc;
+                }
+            }
+
+            entry += total_count;
+            continue;
+        }
+
+        /* A secondary outside its File set is ambiguous corruption. */
+        if ((type & FF_ENTRY_SECONDARY) != 0u)
+            return FAUXFAT_ESTRUCTURE;
+
+        /* Unknown benign primaries are explicitly ignorable. */
+        if ((type & FF_ENTRY_BENIGN) != 0u) {
+            ++entry;
+            continue;
+        }
+
+        return FAUXFAT_ESTRUCTURE;
+    }
+
+    if (descriptor_count)
+        *descriptor_count = descriptor_index;
+    if (strict_class == FAUXFAT_VOLUME_FAUXFAT_VALID)
+        *classification = FAUXFAT_VOLUME_FAUXFAT_VALID;
+    else if (strict_class == FAUXFAT_VOLUME_FAUXFAT_CHANGED)
+        *classification = FAUXFAT_VOLUME_FAUXFAT_CHANGED;
+    else
+        *classification = FAUXFAT_VOLUME_EXFAT_BEST_EFFORT;
     return FAUXFAT_OK;
 }

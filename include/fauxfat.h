@@ -12,7 +12,7 @@ extern "C" {
 #define FAUXFAT_BLOCK_SIZE         512u
 #define FAUXFAT_CLUSTER_SIZE       65536u
 #define FAUXFAT_BLOCKS_PER_CLUSTER 128u
-#define FAUXFAT_MAX_FILES          681u
+#define FAUXFAT_MAX_FILES          408u
 #define FAUXFAT_MAX_OPAQUE_FILES   408u
 #define FAUXFAT_NAME_MAX           15u
 
@@ -153,11 +153,17 @@ typedef enum fauxfat_disk_file_kind {
 typedef struct fauxfat_disk_file {
     char name[FAUXFAT_NAME_MAX + 1u];
     fauxfat_disk_file_kind kind;
+    uint32_t flags;
     uint64_t first_block;       /* volume-relative first 512-byte block */
     uint64_t data_length;       /* logical bytes described by the entry */
     uint64_t allocation_blocks; /* complete contiguous physical allocation */
     time_t mtime;
 } fauxfat_disk_file;
+
+enum {
+    /* Host-visible namespace name differs from the persisted logical name. */
+    FAUXFAT_DISK_FILE_NAME_CHANGED = 1u << 0
+};
 
 /*
  * Bounded descriptor sink used by the on-disk parser. index is the canonical
@@ -328,7 +334,7 @@ int fauxfat_format(const fauxfat_view *view,
  * later passes.
  *
  * The parser accepts only the strict fauxFAT root grammar: four fixed system
- * entries, canonical public three-entry sets, canonical fauxFAT opaque
+ * entries, canonical public five-entry sets, canonical fauxFAT opaque
  * five-entry sets, then 0xA1 padding through the end of the cluster. The host
  * may have changed Archive, last-modified/access timestamps and their UTC
  * offsets, provided the resulting entry-set checksum is valid. Everything
@@ -362,6 +368,29 @@ int fauxfat_parse_root_strict(const fauxfat_view *view,
 int fauxfat_validate_strict(const fauxfat_view *view,
                             const fauxfat_device *device,
                             fauxfat_volume_class *classification);
+
+/*
+ * Bounded best-effort scan of the fixed fauxFAT root using geometry from
+ * `view`.  This is intentionally a salvage path, not a general exFAT reader.
+ * It emits only contiguous NoFatChain regular files and exact fauxFAT opaque
+ * descriptors, skips well-formed unsupported File sets, and aborts on
+ * malformed or ambiguous structure.  No FAT chain is followed.
+ *
+ * Public fauxFAT files carry their manufactured logical name in benign vendor
+ * secondaries.  If a host renamed such a file, the emitted descriptor keeps
+ * the original name and sets FAUXFAT_DISK_FILE_NAME_CHANGED.
+ *
+ * `classification` is first obtained from full strict validation.  If strict
+ * validation fails structurally but the bounded scan succeeds, recognizable
+ * fauxFAT remains FAUXFAT_CHANGED; otherwise a structurally sane exFAT root is
+ * reported as EXFAT_BEST_EFFORT.  Device callback failures are propagated.
+ */
+int fauxfat_scan_loose(const fauxfat_view *view,
+                       const fauxfat_device *device,
+                       fauxfat_file_emit_fn emit,
+                       void *emit_context,
+                       size_t *descriptor_count,
+                       fauxfat_volume_class *classification);
 
 #ifdef __cplusplus
 }
