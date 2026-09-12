@@ -109,7 +109,7 @@ rc = fauxfat_read_block(&view, block, sector);
 rc = fauxfat_read_blocks(&view, first_block, count, buffer);
 ```
 
-`partition_lba` is metadata only. If a whole-disk adapter presents this volume at LBA 2048, subtract 2048 before calling fauxFAT block functions.
+`partition_lba` is metadata only. If a whole-disk adapter presents this volume at LBA 2048, subtract 2048 before calling fauxFAT block functions. The companion `fauxgpt` API renders and writes whole-disk GPT metadata; the product-level adapter still owns LBA routing between GPT, fauxFAT partition 1, and the untouched user partition.
 
 Metadata blocks are synthesized. Public and named opaque payload reads are forwarded to `cfg.read` with the corresponding `{fd, offset, length}`. Reads of anonymous reserved space and structurally undefined bytes synthesize zero in the view even though an in-place formatter is not required to zero those physical bytes.
 
@@ -451,3 +451,54 @@ Do not assume fauxFAT provides any of the following:
 - payload relocation during format/recovery.
 
 Those omissions are the point of the design, not pending filesystem features.
+
+## 15. Publish a whole-card GPT
+
+`include/fauxgpt.h` is deliberately separate from fauxFAT. It renders only the protective MBR, primary/backup GPT entry arrays, and primary/backup headers. It never reads or writes a partition body.
+
+```c
+#include "fauxgpt.h"
+
+fauxgpt_partition parts[2] = {0};
+
+memcpy(parts[0].type_guid, fauxgpt_type_microsoft_basic_data, 16);
+memcpy(parts[0].unique_guid, app_partition_guid, 16);
+parts[0].first_lba = 2048;
+parts[0].block_count = fauxfat_block_count(&view);
+parts[0].name = "INGRESS";
+
+memcpy(parts[1].type_guid, fauxgpt_type_microsoft_basic_data, 16);
+memcpy(parts[1].unique_guid, user_partition_guid, 16);
+parts[1].first_lba = align_up(parts[0].first_lba + parts[0].block_count,
+                              alignment_blocks);
+parts[1].block_count = (card_blocks - 34) - parts[1].first_lba + 1;
+parts[1].name = "USER DATA";
+
+fauxgpt_layout layout = {
+    .disk_blocks = card_blocks,
+    .partitions = parts,
+    .partition_count = 2,
+};
+memcpy(layout.disk_guid, card_guid, 16);
+
+fauxgpt_view gpt;
+rc = fauxgpt_init(&gpt, &layout);
+```
+
+All GUID byte arrays are already in GPT on-disk byte order. The module does not parse UUID strings or invent identifiers. Names are optional printable ASCII, at most 36 bytes.
+
+For a synthetic whole-disk read path, call `fauxgpt_render_block()` first for GPT metadata LBAs; `FAUXGPT_EUNMAPPED` means route the request to a partition body or other storage.
+
+For physical provisioning, format/materialize firmware-owned partition content first, then publish GPT metadata:
+
+```c
+fauxgpt_device gd = {
+    .write = raw_write,
+    .flush = raw_flush,
+    .context = card,
+};
+
+rc = fauxgpt_format(&gpt, &gd);
+```
+
+`fauxgpt_format()` writes backup array/header, flushes, then primary array/header and the protective MBR, then flushes again. It emits no writes between `FAUXGPT_FIRST_USABLE_LBA` and `gpt.last_usable_lba`, so the blank/user-formatted second partition is preserved by construction.
