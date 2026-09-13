@@ -230,7 +230,7 @@ Recovering a useful file from a changed volume never promotes that volume back t
 
 `fauxfat_reopen()` needs only a block-device reader. It derives the supported fauxFAT geometry from the Main Boot Sector, checks the bounded boot/OEM/root/FAT/bitmap/upcase structures, emits direct physical descriptors, and reports the classification above.
 
-Reopen needs no file table from the caller. One surviving recognizable OEM identity copy is enough to classify a damaged presentation as fauxFAT-changed. If fauxFAT identity is gone but the supported bounded exFAT geometry/root remains sane, reopen may return `FAUXFAT_VOLUME_EXFAT_BEST_EFFORT` descriptors.
+Reopen needs no file table from the caller. One surviving recognizable OEM identity copy plus a coherent bounded fauxFAT root profile is enough to classify a damaged presentation as fauxFAT-changed. OEM parameter bytes alone are not ownership: host quick-format operations may replace the exFAT filesystem while leaving stale OEM sectors untouched. If fauxFAT identity is gone but the supported bounded exFAT geometry/root remains sane, reopen may return `FAUXFAT_VOLUME_EXFAT_BEST_EFFORT` descriptors.
 
 This is intentionally not a general exFAT mount operation.
 

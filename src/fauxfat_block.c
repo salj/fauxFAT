@@ -479,8 +479,9 @@ static int fb_block_open_at_generation(fauxfat_block_opened *opened,
         block_count = device->block_count;
     }
 
-    if (probe.classification != FAUXFAT_VOLUME_FAUXFAT_VALID &&
-        probe.classification != FAUXFAT_VOLUME_FAUXFAT_CHANGED)
+    if ((probe.classification != FAUXFAT_VOLUME_FAUXFAT_VALID &&
+         probe.classification != FAUXFAT_VOLUME_FAUXFAT_CHANGED) ||
+        (probe.fauxfat.flags & FAUXFAT_REOPEN_SCAN_READY) == 0u)
         return fb_open_fail(opened, FAUXFAT_BLOCK_ENOTFAUXFAT, 0);
     if (probe.fauxfat.partition_lba != first_block ||
         probe.fauxfat.volume_blocks != block_count)

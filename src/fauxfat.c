@@ -3682,18 +3682,25 @@ int fauxfat_reopen_probe(const fauxfat_device *device,
     else if (ff_oem_recognizable(backup_oem))
         identity_oem = backup_oem;
     recognized = identity_oem != NULL;
-    if (recognized) {
-        *classification       = FAUXFAT_VOLUME_FAUXFAT_CHANGED;
+    if (recognized)
         out->structural_epoch = faux_load_le64(identity_oem + 72u);
-    }
 
     rc = ff_reopen_root_identity(&v, device, out);
     if (rc != FAUXFAT_OK) {
+        /*
+         * OEM parameter sectors are not ownership by themselves.  A host
+         * quick-format can replace the exFAT boot/root structures while
+         * leaving old OEM parameter bytes behind.  Do not promote such stale
+         * identity to fauxFAT-changed unless the bounded fauxFAT root profile
+         * is still coherent enough for descriptor recovery.
+         */
         if (rc == FAUXFAT_ESTRUCTURE || rc == FAUXFAT_EGEOMETRY)
             return FAUXFAT_OK;
         return rc;
     }
     out->flags |= FAUXFAT_REOPEN_ROOT_VALID;
+    if (recognized)
+        *classification = FAUXFAT_VOLUME_FAUXFAT_CHANGED;
 
     rc = ff_reopen_validate_self(&v, device, main_boot, main_oem,
                                  boot_strict, &self_valid);

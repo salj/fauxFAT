@@ -313,6 +313,30 @@ static void test_gpt_open_format_and_guards(void)
                                 NULL, NULL, 0u) == FAUXFAT_BLOCK_OK);
     assert(media.data[user_probe * FAUXFAT_BLOCK_SIZE + 3u] == 0x5au);
 
+    /* A host quick-format may replace the exFAT root while leaving our OEM
+     * parameter sectors stale. OEM bytes alone must not resurrect ownership. */
+    {
+        uint64_t root_lba = p1_first + view.cluster_heap_block +
+                            (uint64_t)(view.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        uint8_t *root      = media.data + root_lba * FAUXFAT_BLOCK_SIZE;
+        uint8_t saved_type = root[3u * 32u];
+
+        root[3u * 32u] = 0u;
+        assert(fauxfat_block_probe(&probe, &dev) == FAUXFAT_BLOCK_OK);
+        assert(probe.kind == FAUXFAT_BLOCK_MEDIA_GPT);
+        assert(probe.classification == FAUXFAT_VOLUME_INVALID);
+        assert((probe.fauxfat.flags & FAUXFAT_REOPEN_GEOMETRY_VALID) != 0u);
+        assert((probe.fauxfat.flags & FAUXFAT_REOPEN_ROOT_VALID) == 0u);
+        assert((probe.fauxfat.flags & FAUXFAT_REOPEN_SCAN_READY) == 0u);
+        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO,
+                                  &layout, NULL, NULL, NULL) ==
+               FAUXFAT_BLOCK_ENOTFAUXFAT);
+        root[3u * 32u] = saved_type;
+        assert(fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO,
+                                  &layout, NULL, NULL, NULL) ==
+               FAUXFAT_BLOCK_OK);
+    }
+
     /* Safe reformat proves fauxFAT stable identity, not merely shape. */
     {
         fauxfat_config foreign_cfg = cfg;

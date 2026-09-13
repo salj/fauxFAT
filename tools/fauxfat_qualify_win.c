@@ -54,23 +54,6 @@ typedef struct ffq_get_length_information {
     LARGE_INTEGER Length;
 } GET_LENGTH_INFORMATION;
 
-typedef struct ffq_storage_device_number {
-    DWORD DeviceType;
-    DWORD DeviceNumber;
-    DWORD PartitionNumber;
-} STORAGE_DEVICE_NUMBER;
-
-typedef struct ffq_disk_extent {
-    DWORD DiskNumber;
-    LARGE_INTEGER StartingOffset;
-    LARGE_INTEGER ExtentLength;
-} DISK_EXTENT;
-
-typedef struct ffq_volume_disk_extents {
-    DWORD NumberOfDiskExtents;
-    DISK_EXTENT Extents[1];
-} VOLUME_DISK_EXTENTS;
-
 typedef struct ffq_virtual_storage_type {
     DWORD DeviceId;
     GUID VendorId;
@@ -123,9 +106,6 @@ typedef char ffq_assert_create_params_size[(sizeof(CREATE_VIRTUAL_DISK_PARAMETER
 typedef char ffq_assert_open_params_size[(sizeof(OPEN_VIRTUAL_DISK_PARAMETERS) == 8u) ? 1 : -1];
 typedef char ffq_assert_attach_params_size[(sizeof(ATTACH_VIRTUAL_DISK_PARAMETERS) == 8u) ? 1 : -1];
 typedef char ffq_assert_disk_geometry_size[(sizeof(DISK_GEOMETRY) == 24u) ? 1 : -1];
-typedef char ffq_assert_storage_device_number_size[(sizeof(STORAGE_DEVICE_NUMBER) == 12u) ? 1 : -1];
-typedef char ffq_assert_disk_extent_size[(sizeof(DISK_EXTENT) == 24u) ? 1 : -1];
-typedef char ffq_assert_volume_disk_extents_size[(sizeof(VOLUME_DISK_EXTENTS) == 32u) ? 1 : -1];
 
 extern HANDLE CreateFileW(const WCHAR *name, DWORD desired_access,
                           DWORD share_mode, void *security_attributes,
@@ -158,10 +138,6 @@ extern int WideCharToMultiByte(uint32_t code_page, DWORD flags,
                                BOOL *used_default_char);
 extern DWORD GetFullPathNameW(const WCHAR *path, DWORD buffer_length,
                               WCHAR *buffer, WCHAR **file_part);
-extern HANDLE FindFirstVolumeW(WCHAR *volume_name, DWORD buffer_length);
-extern BOOL FindNextVolumeW(HANDLE find_volume, WCHAR *volume_name,
-                            DWORD buffer_length);
-extern BOOL FindVolumeClose(HANDLE find_volume);
 extern HRESULT CoCreateGuid(GUID *guid);
 
 extern DWORD CreateVirtualDisk(const VIRTUAL_STORAGE_TYPE *storage_type,
@@ -204,17 +180,9 @@ extern DWORD GetVirtualDiskPhysicalPath(HANDLE handle,
 #define FFQ_FORMAT_MESSAGE_IGNORE_INSERTS  UINT32_C(0x00000200)
 #define FFQ_FORMAT_MESSAGE_FROM_SYSTEM     UINT32_C(0x00001000)
 
-#define FFQ_IOCTL_DISK_GET_DRIVE_GEOMETRY        UINT32_C(0x00070000)
-#define FFQ_IOCTL_DISK_GET_LENGTH_INFO           UINT32_C(0x0007405c)
-#define FFQ_IOCTL_DISK_UPDATE_PROPERTIES         UINT32_C(0x00070140)
-#define FFQ_IOCTL_STORAGE_GET_DEVICE_NUMBER      UINT32_C(0x002d1080)
-#define FFQ_IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS UINT32_C(0x00560000)
-#define FFQ_FSCTL_LOCK_VOLUME                    UINT32_C(0x00090018)
-#define FFQ_FSCTL_UNLOCK_VOLUME                  UINT32_C(0x0009001c)
-#define FFQ_FSCTL_DISMOUNT_VOLUME                UINT32_C(0x00090020)
-
-#define FFQ_ERROR_NO_MORE_FILES UINT32_C(18)
-#define FFQ_ERROR_MORE_DATA     UINT32_C(234)
+#define FFQ_IOCTL_DISK_GET_DRIVE_GEOMETRY UINT32_C(0x00070000)
+#define FFQ_IOCTL_DISK_GET_LENGTH_INFO    UINT32_C(0x0007405c)
+#define FFQ_IOCTL_DISK_UPDATE_PROPERTIES  UINT32_C(0x00070140)
 
 #define FFQ_VIRTUAL_STORAGE_TYPE_DEVICE_VHDX UINT32_C(3)
 #define FFQ_VIRTUAL_DISK_ACCESS_NONE         UINT32_C(0x00000000)
@@ -241,7 +209,6 @@ extern DWORD GetVirtualDiskPhysicalPath(HANDLE handle,
 #define FFQ_MIB                      (UINT64_C(1024) * 1024u)
 #define FFQ_ZERO_CHUNK_BYTES         (64u * 1024u)
 #define FFQ_PHYSICAL_PATH_WCHARS     256u
-#define FFQ_VOLUME_NAME_WCHARS       256u
 
 static const GUID ffq_vendor_microsoft = {
     UINT32_C(0xec984aec), UINT16_C(0xa0f9), UINT16_C(0x47e9), { UINT8_C(0x90), UINT8_C(0x1f), UINT8_C(0x71), UINT8_C(0x41), UINT8_C(0x5a), UINT8_C(0x66), UINT8_C(0x34), UINT8_C(0x5b) }
@@ -252,25 +219,8 @@ static uint8_t ffq_zeroes[FFQ_ZERO_CHUNK_BYTES];
 typedef struct ffq_raw_device {
     HANDLE handle;
     uint64_t blocks;
-    DWORD disk_number;
-    DWORD last_windows_error;
-    int last_backend_error;
-    const char *last_operation;
     int writable;
 } ffq_raw_device;
-
-typedef struct ffq_volume_lock {
-    HANDLE handle;
-    WCHAR name[FFQ_VOLUME_NAME_WCHARS];
-} ffq_volume_lock;
-
-typedef struct ffq_volume_locks {
-    ffq_volume_lock *items;
-    size_t count;
-    size_t capacity;
-} ffq_volume_locks;
-
-static const char *ffq_block_error_name(int rc);
 
 typedef struct ffq_format_options {
     uint64_t vhdx_mib;
@@ -388,241 +338,6 @@ static char *ffq_utf8_from_wide(const WCHAR *s)
     return out;
 }
 
-static size_t ffq_wide_length(const WCHAR *s)
-{
-    size_t n = 0u;
-
-    while (s[n] != 0u)
-        ++n;
-    return n;
-}
-
-static void ffq_copy_wide(WCHAR *dst, size_t dst_count, const WCHAR *src)
-{
-    size_t i = 0u;
-
-    if (dst_count == 0u)
-        return;
-    while (i + 1u < dst_count && src[i] != 0u) {
-        dst[i] = src[i];
-        ++i;
-    }
-    dst[i] = 0u;
-}
-
-static int ffq_volume_contains_disk(HANDLE volume, DWORD disk_number,
-                                    int *contains)
-{
-    VOLUME_DISK_EXTENTS first;
-    VOLUME_DISK_EXTENTS *extents = &first;
-    DWORD returned               = 0u;
-    DWORD error;
-    size_t bytes = sizeof(first);
-    size_t i;
-    int allocated = 0;
-
-    *contains = 0;
-    memset(&first, 0, sizeof(first));
-    if (!DeviceIoControl(volume, FFQ_IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                         NULL, 0u, &first, (DWORD)sizeof(first),
-                         &returned, NULL)) {
-        error = GetLastError();
-        if (error != FFQ_ERROR_MORE_DATA || first.NumberOfDiskExtents <= 1u)
-            return -1;
-        {
-            uint64_t needed = (uint64_t)sizeof(first) +
-                              (uint64_t)(first.NumberOfDiskExtents - 1u) *
-                                  (uint64_t)sizeof(DISK_EXTENT);
-            if (needed > UINT32_MAX)
-                return -1;
-            bytes = (size_t)needed;
-        }
-        extents = (VOLUME_DISK_EXTENTS *)calloc(1u, bytes);
-        if (!extents)
-            return -1;
-        allocated = 1;
-        if (!DeviceIoControl(volume, FFQ_IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                             NULL, 0u, extents, (DWORD)bytes,
-                             &returned, NULL)) {
-            free(extents);
-            return -1;
-        }
-    }
-
-    for (i = 0u; i < extents->NumberOfDiskExtents; ++i) {
-        if (extents->Extents[i].DiskNumber == disk_number) {
-            *contains = 1;
-            break;
-        }
-    }
-    if (allocated)
-        free(extents);
-    return 0;
-}
-
-static int ffq_volume_locks_append(ffq_volume_locks *locks, HANDLE handle,
-                                   const WCHAR *name)
-{
-    ffq_volume_lock *grown;
-    size_t new_capacity;
-
-    if (locks->count == locks->capacity) {
-        new_capacity = locks->capacity == 0u ? 4u : locks->capacity * 2u;
-        if (new_capacity < locks->capacity ||
-            new_capacity > SIZE_MAX / sizeof(*locks->items))
-            return -1;
-        grown = (ffq_volume_lock *)realloc(
-            locks->items, new_capacity * sizeof(*locks->items));
-        if (!grown)
-            return -1;
-        locks->items    = grown;
-        locks->capacity = new_capacity;
-    }
-    locks->items[locks->count].handle = handle;
-    ffq_copy_wide(locks->items[locks->count].name,
-                  FFQ_VOLUME_NAME_WCHARS, name);
-    ++locks->count;
-    return 0;
-}
-
-static void ffq_print_volume_error(const char *what, const WCHAR *name,
-                                   DWORD error)
-{
-    char *utf8 = ffq_utf8_from_wide(name);
-
-    if (utf8) {
-        fprintf(stderr, "%s %s\n", what, utf8);
-        free(utf8);
-    } else {
-        fprintf(stderr, "%s target volume\n", what);
-    }
-    ffq_print_win_error("volume operation", error);
-}
-
-static int ffq_release_volume_locks(ffq_volume_locks *locks, int dismount)
-{
-    size_t i;
-    int result = 0;
-
-    for (i = 0u; i < locks->count; ++i) {
-        DWORD returned = 0u;
-        HANDLE handle  = locks->items[i].handle;
-
-        if (dismount &&
-            !DeviceIoControl(handle, FFQ_FSCTL_DISMOUNT_VOLUME,
-                             NULL, 0u, NULL, 0u, &returned, NULL)) {
-            ffq_print_volume_error("warning: failed to dismount",
-                                   locks->items[i].name, GetLastError());
-            result = -1;
-        }
-        if (!DeviceIoControl(handle, FFQ_FSCTL_UNLOCK_VOLUME,
-                             NULL, 0u, NULL, 0u, &returned, NULL)) {
-            ffq_print_volume_error("warning: failed to unlock",
-                                   locks->items[i].name, GetLastError());
-            result = -1;
-        }
-        CloseHandle(handle);
-    }
-    free(locks->items);
-    memset(locks, 0, sizeof(*locks));
-    return result;
-}
-
-static int ffq_lock_target_volumes(const ffq_raw_device *raw,
-                                   ffq_volume_locks *locks)
-{
-    WCHAR volume_name[FFQ_VOLUME_NAME_WCHARS];
-    HANDLE find;
-    DWORD error = 0u;
-    int result  = -1;
-
-    memset(locks, 0, sizeof(*locks));
-    find = FindFirstVolumeW(volume_name, FFQ_VOLUME_NAME_WCHARS);
-    if (find == FFQ_INVALID_HANDLE_VALUE) {
-        ffq_print_win_error("FindFirstVolumeW", GetLastError());
-        return -1;
-    }
-
-    for (;;) {
-        WCHAR open_name[FFQ_VOLUME_NAME_WCHARS];
-        size_t length = ffq_wide_length(volume_name);
-        HANDLE probe  = FFQ_INVALID_HANDLE_VALUE;
-        HANDLE locked = FFQ_INVALID_HANDLE_VALUE;
-        int contains  = 0;
-
-        if (length != 0u && length < FFQ_VOLUME_NAME_WCHARS) {
-            ffq_copy_wide(open_name, FFQ_VOLUME_NAME_WCHARS, volume_name);
-            if (open_name[length - 1u] == (WCHAR)'\\')
-                open_name[length - 1u] = 0u;
-
-            probe = CreateFileW(open_name, 0u,
-                                FFQ_FILE_SHARE_READ | FFQ_FILE_SHARE_WRITE |
-                                    FFQ_FILE_SHARE_DELETE,
-                                NULL, FFQ_OPEN_EXISTING,
-                                FFQ_FILE_ATTRIBUTE_NORMAL, NULL);
-            if (probe != FFQ_INVALID_HANDLE_VALUE) {
-                if (ffq_volume_contains_disk(probe, raw->disk_number,
-                                             &contains) != 0)
-                    contains = 0;
-                CloseHandle(probe);
-            }
-
-            if (contains) {
-                DWORD returned = 0u;
-                char *utf8;
-
-                locked = CreateFileW(open_name,
-                                     FFQ_GENERIC_READ | FFQ_GENERIC_WRITE,
-                                     FFQ_FILE_SHARE_READ | FFQ_FILE_SHARE_WRITE |
-                                         FFQ_FILE_SHARE_DELETE,
-                                     NULL, FFQ_OPEN_EXISTING,
-                                     FFQ_FILE_ATTRIBUTE_NORMAL, NULL);
-                if (locked == FFQ_INVALID_HANDLE_VALUE) {
-                    ffq_print_volume_error("cannot open target volume for locking:",
-                                           volume_name, GetLastError());
-                    goto done;
-                }
-                if (!DeviceIoControl(locked, FFQ_FSCTL_LOCK_VOLUME,
-                                     NULL, 0u, NULL, 0u, &returned, NULL)) {
-                    ffq_print_volume_error(
-                        "cannot lock target volume; close files using:",
-                        volume_name, GetLastError());
-                    CloseHandle(locked);
-                    goto done;
-                }
-                if (ffq_volume_locks_append(locks, locked, volume_name) != 0) {
-                    DeviceIoControl(locked, FFQ_FSCTL_UNLOCK_VOLUME,
-                                    NULL, 0u, NULL, 0u, &returned, NULL);
-                    CloseHandle(locked);
-                    fprintf(stderr, "out of memory recording volume lock\n");
-                    goto done;
-                }
-                utf8 = ffq_utf8_from_wide(volume_name);
-                if (utf8) {
-                    printf("locked target volume: %s\n", utf8);
-                    free(utf8);
-                }
-            }
-        }
-
-        if (!FindNextVolumeW(find, volume_name, FFQ_VOLUME_NAME_WCHARS)) {
-            error = GetLastError();
-            if (error == FFQ_ERROR_NO_MORE_FILES) {
-                result = 0;
-                break;
-            }
-            ffq_print_win_error("FindNextVolumeW", error);
-            break;
-        }
-    }
-
-done:
-    FindVolumeClose(find);
-    if (result != 0)
-        (void)ffq_release_volume_locks(locks, 0);
-    return result;
-}
-
 static int ffq_parse_u64(const char *text, uint64_t *value)
 {
     char *end = NULL;
@@ -695,31 +410,17 @@ static int ffq_is_physical_drive_path(const char *s)
     return 1;
 }
 
-static void ffq_raw_failure(ffq_raw_device *raw, int backend_error,
-                            const char *operation, DWORD windows_error)
-{
-    raw->last_backend_error = backend_error;
-    raw->last_operation     = operation;
-    raw->last_windows_error = windows_error;
-}
-
-static int ffq_seek(ffq_raw_device *raw, uint64_t byte_offset)
+static int ffq_seek(HANDLE handle, uint64_t byte_offset)
 {
     LARGE_INTEGER pos;
 
-    if (byte_offset > INT64_MAX) {
-        ffq_raw_failure(raw, -1000, "seek range", 0u);
+    if (byte_offset > INT64_MAX)
         return -1;
-    }
     pos.QuadPart = (int64_t)byte_offset;
-    if (!SetFilePointerEx(raw->handle, pos, NULL, FFQ_FILE_BEGIN)) {
-        ffq_raw_failure(raw, -1000, "SetFilePointerEx", GetLastError());
-        return -1;
-    }
-    return 0;
+    return SetFilePointerEx(handle, pos, NULL, FFQ_FILE_BEGIN) ? 0 : -1;
 }
 
-static int ffq_transfer(ffq_raw_device *raw, uint64_t byte_offset,
+static int ffq_transfer(HANDLE handle, uint64_t byte_offset,
                         void *buffer, size_t length, int write)
 {
     uint8_t *p = (uint8_t *)buffer;
@@ -729,24 +430,14 @@ static int ffq_transfer(ffq_raw_device *raw, uint64_t byte_offset,
         DWORD chunk = length > UINT32_C(0x40000000) ? UINT32_C(0x40000000) : (DWORD)length;
         BOOL ok;
 
-        if (ffq_seek(raw, byte_offset) != 0)
+        if (ffq_seek(handle, byte_offset) != 0)
             return -1;
         if (write)
-            ok = WriteFile(raw->handle, p, chunk, &done, NULL);
+            ok = WriteFile(handle, p, chunk, &done, NULL);
         else
-            ok = ReadFile(raw->handle, p, chunk, &done, NULL);
-        if (!ok) {
-            ffq_raw_failure(raw, write ? -1012 : -1002,
-                            write ? "WriteFile" : "ReadFile",
-                            GetLastError());
+            ok = ReadFile(handle, p, chunk, &done, NULL);
+        if (!ok || done != chunk)
             return -1;
-        }
-        if (done != chunk) {
-            ffq_raw_failure(raw, write ? -1012 : -1002,
-                            write ? "short WriteFile" : "short ReadFile",
-                            0u);
-            return -1;
-        }
         p += chunk;
         length -= chunk;
         byte_offset += chunk;
@@ -779,11 +470,9 @@ static int ffq_raw_read(void *context, uint64_t first_block,
 
     if (ffq_range_bytes(raw, first_block, (uint64_t)block_count,
                         &offset, &bytes) != 0 ||
-        bytes > SIZE_MAX) {
-        ffq_raw_failure(raw, -1001, "read range", 0u);
+        bytes > SIZE_MAX)
         return -1001;
-    }
-    return ffq_transfer(raw, offset, data, (size_t)bytes, 0) == 0 ? 0 : -1002;
+    return ffq_transfer(raw->handle, offset, data, (size_t)bytes, 0) == 0 ? 0 : -1002;
 }
 
 static int ffq_raw_write(void *context, uint64_t first_block,
@@ -793,17 +482,13 @@ static int ffq_raw_write(void *context, uint64_t first_block,
     uint64_t offset;
     uint64_t bytes;
 
-    if (!raw->writable) {
-        ffq_raw_failure(raw, -1010, "write on read-only handle", 0u);
+    if (!raw->writable)
         return -1010;
-    }
     if (ffq_range_bytes(raw, first_block, (uint64_t)block_count,
                         &offset, &bytes) != 0 ||
-        bytes > SIZE_MAX) {
-        ffq_raw_failure(raw, -1011, "write range", 0u);
+        bytes > SIZE_MAX)
         return -1011;
-    }
-    return ffq_transfer(raw, offset, (void *)data,
+    return ffq_transfer(raw->handle, offset, (void *)data,
                         (size_t)bytes, 1) == 0
                ? 0
                : -1012;
@@ -816,20 +501,14 @@ static int ffq_raw_zero(void *context, uint64_t first_block,
     uint64_t offset;
     uint64_t bytes;
 
-    if (!raw->writable) {
-        ffq_raw_failure(raw, -1020, "zero on read-only handle", 0u);
+    if (!raw->writable)
         return -1020;
-    }
-    if (ffq_range_bytes(raw, first_block, block_count, &offset, &bytes) != 0) {
-        ffq_raw_failure(raw, -1021, "zero range", 0u);
+    if (ffq_range_bytes(raw, first_block, block_count, &offset, &bytes) != 0)
         return -1021;
-    }
     while (bytes != 0u) {
         size_t chunk = bytes > sizeof(ffq_zeroes) ? sizeof(ffq_zeroes) : (size_t)bytes;
-        if (ffq_transfer(raw, offset, ffq_zeroes, chunk, 1) != 0) {
-            raw->last_backend_error = -1022;
+        if (ffq_transfer(raw->handle, offset, ffq_zeroes, chunk, 1) != 0)
             return -1022;
-        }
         offset += chunk;
         bytes -= chunk;
     }
@@ -844,33 +523,13 @@ static int ffq_raw_skip(void *context, uint64_t first_block,
     uint64_t bytes;
 
     (void)kind;
-    if (ffq_range_bytes(raw, first_block, block_count, &offset, &bytes) != 0) {
-        ffq_raw_failure(raw, -1030, "skip range", 0u);
-        return -1030;
-    }
-    return 0;
+    return ffq_range_bytes(raw, first_block, block_count, &offset, &bytes) == 0 ? 0 : -1030;
 }
 
 static int ffq_raw_flush(void *context)
 {
     ffq_raw_device *raw = (ffq_raw_device *)context;
-
-    if (!FlushFileBuffers(raw->handle)) {
-        ffq_raw_failure(raw, -1040, "FlushFileBuffers", GetLastError());
-        return -1040;
-    }
-    return 0;
-}
-
-static void ffq_print_raw_failure(const ffq_raw_device *raw)
-{
-    if (raw->last_backend_error == 0)
-        return;
-    fprintf(stderr, "raw backend failed during %s: %d\n",
-            raw->last_operation ? raw->last_operation : "I/O",
-            raw->last_backend_error);
-    if (raw->last_windows_error != 0u)
-        ffq_print_win_error("raw I/O", raw->last_windows_error);
+    return FlushFileBuffers(raw->handle) ? 0 : -1040;
 }
 
 static int ffq_open_raw_wide(const WCHAR *path, int writable,
@@ -881,7 +540,6 @@ static int ffq_open_raw_wide(const WCHAR *path, int writable,
     DWORD returned = 0u;
     GET_LENGTH_INFORMATION length;
     DISK_GEOMETRY geometry;
-    STORAGE_DEVICE_NUMBER number;
 
     memset(raw, 0, sizeof(*raw));
     handle = CreateFileW(path, access,
@@ -909,15 +567,6 @@ static int ffq_open_raw_wide(const WCHAR *path, int writable,
         return -1;
     }
 
-    memset(&number, 0, sizeof(number));
-    if (!DeviceIoControl(handle, FFQ_IOCTL_STORAGE_GET_DEVICE_NUMBER,
-                         NULL, 0u, &number, (DWORD)sizeof(number),
-                         &returned, NULL)) {
-        ffq_print_win_error("query disk device number", GetLastError());
-        CloseHandle(handle);
-        return -1;
-    }
-
     memset(&length, 0, sizeof(length));
     if (!DeviceIoControl(handle, FFQ_IOCTL_DISK_GET_LENGTH_INFO,
                          NULL, 0u, &length, (DWORD)sizeof(length),
@@ -933,10 +582,9 @@ static int ffq_open_raw_wide(const WCHAR *path, int writable,
         return -1;
     }
 
-    raw->handle      = handle;
-    raw->blocks      = (uint64_t)length.Length.QuadPart / FAUXFAT_BLOCK_SIZE;
-    raw->disk_number = number.DeviceNumber;
-    raw->writable    = writable;
+    raw->handle   = handle;
+    raw->blocks   = (uint64_t)length.Length.QuadPart / FAUXFAT_BLOCK_SIZE;
+    raw->writable = writable;
     return 0;
 }
 
@@ -1142,8 +790,6 @@ static int ffq_format_raw_device(ffq_raw_device *raw, uint64_t data_mib)
     fauxgpt_layout layout;
     fauxgpt_view gpt;
     fauxfat_block_device dev;
-    ffq_volume_locks locks;
-    int release_rc;
     int rc;
 
     if (ffq_build_format(raw->blocks, data_mib, &file, &cfg, &view, &plan,
@@ -1159,30 +805,12 @@ static int ffq_format_raw_device(ffq_raw_device *raw, uint64_t data_mib)
     printf("  raw user p2: LBA %" PRIu64 " + %" PRIu64 " blocks\n",
            plan.user_first_lba, plan.user_block_count);
 
-    if (ffq_lock_target_volumes(raw, &locks) != 0) {
-        fprintf(stderr, "refusing raw format without exclusive access to existing target volumes\n");
-        return -1;
-    }
-
-    raw->last_backend_error = 0;
-    raw->last_windows_error = 0u;
-    raw->last_operation     = NULL;
-
-    rc         = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
-                                      NULL, NULL,
-                                      FAUXFAT_BLOCK_FORMAT_ZERO_UNDEFINED |
-                                          FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA);
-    release_rc = ffq_release_volume_locks(&locks, 1);
+    rc = fauxfat_block_format(&view, &dev, FAUXFAT_BLOCK_WRAPPER_GPT, &gpt,
+                              NULL, NULL,
+                              FAUXFAT_BLOCK_FORMAT_ZERO_UNDEFINED |
+                                  FAUXFAT_BLOCK_FORMAT_DESTROY_USER_DATA);
     if (rc != FAUXFAT_BLOCK_OK) {
-        fprintf(stderr, "fauxfat_block_format failed: %s (%d)\n",
-                ffq_block_error_name(rc), rc);
-        ffq_print_raw_failure(raw);
-        (void)ffq_refresh_disk(raw->handle);
-        return -1;
-    }
-    if (release_rc != 0) {
-        fprintf(stderr, "format completed, but Windows did not cleanly dismount/unlock every old volume\n");
-        (void)ffq_refresh_disk(raw->handle);
+        fprintf(stderr, "fauxfat_block_format failed: %d\n", rc);
         return -1;
     }
     if (ffq_refresh_disk(raw->handle) != 0)
@@ -1201,6 +829,34 @@ static const char *ffq_class_name(fauxfat_volume_class classification)
         return "fauxfat-valid";
     default:
         return "invalid";
+    }
+}
+
+static const char *ffq_block_error_name(int rc)
+{
+    switch (rc) {
+    case FAUXFAT_BLOCK_OK:
+        return "OK";
+    case FAUXFAT_BLOCK_EINVAL:
+        return "EINVAL";
+    case FAUXFAT_BLOCK_ERANGE:
+        return "ERANGE";
+    case FAUXFAT_BLOCK_EWRAPPER:
+        return "EWRAPPER";
+    case FAUXFAT_BLOCK_EPARTITION:
+        return "EPARTITION";
+    case FAUXFAT_BLOCK_ENOTFAUXFAT:
+        return "ENOTFAUXFAT";
+    case FAUXFAT_BLOCK_EIO:
+        return "EIO";
+    case FAUXFAT_BLOCK_EIDENTITY:
+        return "EIDENTITY";
+    case FAUXFAT_BLOCK_ESTALE:
+        return "ESTALE";
+    case FAUXFAT_BLOCK_EVERIFY:
+        return "EVERIFY";
+    default:
+        return "unknown";
     }
 }
 
@@ -1240,7 +896,8 @@ static int ffq_verify_raw_device(ffq_raw_device *raw, int require_qualification)
     rc = fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, NULL,
                             ffq_emit_descriptor, &verify, &descriptor_count);
     if (rc != FAUXFAT_BLOCK_OK) {
-        fprintf(stderr, "fauxfat_block_open failed: %d", rc);
+        fprintf(stderr, "fauxfat_block_open failed: %s (%d)",
+                ffq_block_error_name(rc), rc);
         if (opened.backend_error != 0)
             fprintf(stderr, " (backend %d)", opened.backend_error);
         fputc('\n', stderr);
