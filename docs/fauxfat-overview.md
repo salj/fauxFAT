@@ -1,10 +1,10 @@
 # fauxFAT overview
 
-The fauxFAT format, parser, reopen path, and payload recovery are implemented. Host compatibility still needs qualification.
+Formatting, validation, recovery, GPT, and whole-device support are implemented. Windows VHDX qualification has been exercised; Linux/macOS and real-media durability still need work.
 
 fauxFAT exposes a fixed exFAT volume over storage whose physical layout stays under application control. Hosts can overwrite predefined files; the application owns the backing data and reserved ranges.
 
-See `fauxfat-disk-format.md` for the disk layout and `fauxfat-usage.md` for the API and recovery flow.
+See `fauxfat-disk-format.md` for the disk layout, `fauxfat-usage.md` for the API and recovery flow, and `fauxfat-partition-layout.md` for GPT layout.
 
 ## 1. Purpose
 
@@ -18,10 +18,17 @@ A fauxFAT volume has four relevant kinds of space:
 | --- | --- | --- |
 | Public file | Ordinary root file | Host may overwrite bytes inside fixed `DataLength`. |
 | Named opaque range | Hidden descriptor plus private allocation | Not writable through host block translation; recoverable by logical name and physical range. |
-| Anonymous opaque reserve | No useful directory object | Preserved physical capacity for application use or later layout changes. |
+| Anonymous opaque reserve | Canonically no useful directory object; qualification mode may add a non-file benign owner | Preserved physical capacity for application use or later layout changes. |
 | Filesystem structure / undefined padding | exFAT metadata or semantically irrelevant bytes | Generated, verified, zeroed, or skipped according to the format contract. |
 
 Every useful data allocation is contiguous. Public files are exFAT `NoFatChain` streams. Opaque and anonymous reserved clusters are marked allocated in the exFAT allocation bitmap and carry `0xFFFFFFF7` in the FAT, which fauxFAT uses as its deterministic private/reserved marker.
+
+Qualification builds may additionally describe each otherwise-ownerless
+anonymous contiguous run with an unrecognized benign Generic Primary entry.
+That redundant owner is never used instead of the bad-cluster marker: the
+canonical blocker remains present so a host which ignores the benign primary
+still sees the range as unavailable. This mode is experimental and exists only
+to learn what desktop stacks preserve.
 
 The allocation bitmap is saturated. The fixed one-cluster root directory is also saturated with defined entries or benign padding. There is no free namespace or free cluster pool for normal host allocation.
 
@@ -160,7 +167,13 @@ typedef struct fauxfat_disk_file {
 
 It intentionally describes only a recognized contiguous physical object. It is not a filesystem object graph.
 
-Descriptors can be obtained from a manufactured view, from the strict root parser, from the loose scanner, or from schema-free `fauxfat_reopen()`. The same descriptor can then be used for bounded byte I/O directly against a block device with `fauxfat_disk_file_read()` and `fauxfat_disk_file_write()`.
+Descriptors can be obtained from a manufactured view, from the strict root
+parser, from the loose scanner, or from schema-free `fauxfat_reopen()`. The
+split `fauxfat_reopen_probe()` / `fauxfat_reopen_scan()` form is used when a
+caller needs to apply policy after identifying the volume but before exposing
+recovered descriptors. The same descriptor can then be used for bounded byte
+I/O directly against a block device with `fauxfat_disk_file_read()` and
+`fauxfat_disk_file_write()`.
 
 The library does not allocate or retain a file-descriptor table. A caller which wants ordinary integer handles stores one recovered descriptor in each of its own open-handle slots.
 
@@ -228,7 +241,12 @@ Recovering a useful file from a changed volume never promotes that volume back t
 
 ## 9. Schema-free reopen
 
-`fauxfat_reopen()` needs only a block-device reader. It derives the supported fauxFAT geometry from the Main Boot Sector, checks the bounded boot/OEM/root/FAT/bitmap/upcase structures, emits direct physical descriptors, and reports the classification above.
+`fauxfat_reopen()` needs only a block-device reader. It derives the supported
+fauxFAT geometry from the Main Boot Sector, checks the bounded
+boot/OEM/root/FAT/bitmap/upcase structures, emits direct physical descriptors,
+and reports the classification above. The whole-device layer uses the split
+probe/scan form so policy can reject a candidate before a final descriptor scan
+without performing the full reopen twice.
 
 Reopen needs no file table from the caller. One surviving recognizable OEM identity copy plus a coherent bounded fauxFAT root profile is enough to classify a damaged presentation as fauxFAT-changed. OEM parameter bytes alone are not ownership: host quick-format operations may replace the exFAT filesystem while leaving stale OEM sectors untouched. If fauxFAT identity is gone but the supported bounded exFAT geometry/root remains sane, reopen may return `FAUXFAT_VOLUME_EXFAT_BEST_EFFORT` descriptors.
 
@@ -284,13 +302,43 @@ Implemented now:
 - direct bounded byte I/O using recovered descriptors;
 - structural XXH32 and component fingerprints;
 - Unix `time_t` input for manufactured file timestamps.
+- bounded GPT render/probe/open/verify with primary/backup reconciliation;
+- canonical GPT placement planning using `max(1 MiB, SD AU)` alignment;
+- bare/GPT whole-device probe/open/format policy with explicit destructive
+  authorization for foreign/unknown media;
+- stable fauxFAT + GPT identity checks for non-destructive formatting;
+- GPT-only non-destructive repair which never writes partition bodies;
+- optional removable-media generation fencing for stale handles/hotplug;
+- immediate readback verification after whole-device format/repair;
+- exhaustive callback-failure and torn-GPT-write tests in `make test-faults`;
+- native Windows VHDX/raw qualification harness cross-built with Zig.
+
+Windows qualification has already established several useful boundaries:
+
+- the canonical VHDX/GPT/fauxFAT image mounts and reopens through a real
+  `PhysicalDrive`;
+- manufactured logical identity survives a namespace rename through the vendor
+  name records;
+- delete/recreate is not a supported update primitive because the freed extent
+  becomes ordinary allocatable space and Windows may consume it immediately;
+- DiskPart quick-format can leave stale OEM parameter bytes, so OEM identity is
+  never trusted without a coherent bounded root profile;
+- anonymous bitmap-only reservation is not viable: Windows `chkdsk` diagnoses
+  it as corruption and `/F` releases it;
+- the canonical bad-cluster blocker survives `chkdsk`, at the cosmetic cost of
+  being reported as bad media capacity.
 
 Still required before treating the host contract as production-qualified:
 
-- exercise the supported mount/read/in-place-write/flush/eject cycle on the actual Windows versions and exFAT drivers we intend to support;
-- exercise at least one independent exFAT implementation for comparison;
+- broaden Windows coverage across the exact versions/filter stacks we intend to
+  support;
+- exercise normal Linux kernel exFAT and current macOS exFAT implementations;
 - verify preservation of the benign vendor records, opaque Vendor Allocation descriptors, `0xFFFFFFF7` blockers, saturated bitmap, and full padded root;
+- qualify the optional redundant benign-primary reservation mode, or remove it
+  if a normal desktop path objects;
 - record any real host mutations which need to be added to the strict canonicalization allowlist;
-- fault-test block-device I/O and interrupted regeneration separately from host compatibility.
+- verify the real SD backend's flush/durability semantics; host-side fault
+  injection proves ordering logic, not what a particular card does with its
+  internal cache.
 
 The core rule remains simple: payload storage is valuable; the exFAT façade is reproducible metadata.

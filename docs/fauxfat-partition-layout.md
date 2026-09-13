@@ -284,9 +284,9 @@ The partition layer and fauxFAT recovery are deliberately separate.
 A normal boot can now do this through `fauxfat_block_open()` directly:
 
 ```text
-validate narrow GPT profile
+probe/validate narrow GPT profile
     -> locate fauxFAT partition 1
-    -> fauxfat_reopen() / strict validation
+    -> bounded fauxFAT reopen/scan
     -> recover/preserve understood payload descriptors as needed
 ```
 
@@ -308,17 +308,34 @@ Before calling the GPT profile boring enough to ship, test at least:
 | Linux current | same | partition node visible; format/mount normally | same |
 | representative Android/AOSP-ish device | detect/mount | behavior with second unformatted Basic Data partition | detect/mount |
 
-The Windows side should have a native qualification utility built as a `.exe`
-with `zig cc`. Keep two deliberately separate modes: an explicit raw-device
-mode for real-media qualification, and a safer default VHDX mode. The VHDX
-path should create and attach a virtual disk using the Windows virtual-disk
-API, feed the resulting block device through `fauxfat_block_format()`, let the
-normal Windows filesystem stack mount and modify it, then reopen/verify the
-same virtual disk through `fauxfat_block_probe()` / `fauxfat_block_open()`.
-The container file itself is not a raw fauxFAT image, so verification must use
-the attached virtual-disk block device rather than pretending VHDX is just a
-fancy extension on a flat image. Humans have suffered enough from tools which
-confuse containers with payloads.
+The Windows qualification utility is implemented as
+`build/fauxfat-qualify.exe`, cross-built by `make windows-tool` with
+`zig cc -target x86_64-windows-gnu`. It deliberately has two paths:
+
+```text
+create-vhdx / verify-vhdx / attach-vhdx / detach-vhdx
+format-raw / verify-raw
+```
+
+The normal path creates and attaches a VHDX through the Windows Virtual Disk
+API, formats the resulting `\\.\PhysicalDriveN` through
+`fauxfat_block_format()`, reattaches it normally for Windows to mount/mutate,
+then reopens the same block device through the real whole-device API. The VHDX
+container itself is never mistaken for a raw disk image.
+
+The raw path accepts only an explicit `\\.\PhysicalDriveN` spelling and
+requires `--destroy-user-data`. Before the first write it enumerates every
+Windows volume touching that disk and locks all of them; if any lock fails, the
+operation is refused before mutation. After formatting it dismounts/unlocks the
+old volumes and issues `IOCTL_DISK_UPDATE_PROPERTIES` so Windows refreshes its
+partition cache.
+
+Windows VHDX testing has already confirmed that the canonical GPT survives
+mount/reopen with both copies plus PMBR intact, partition 1 remains recoverable
+after ordinary fauxFAT namespace mutation, and partition 2 remains untouched by
+the firmware formatter. DiskPart quick-format of partition 1 correctly turns it
+into foreign/non-fauxFAT media; stale OEM sectors left behind by quick format no
+longer fool ownership detection.
 
 For each host, also inspect whether it rewrites GPT names, attributes, partition GUIDs, entry ordering, or backup tables during ordinary filesystem use. After formatting partition 2, regenerate/repair GPT metadata and verify that every partition-2 sector remains untouched and the host filesystem still mounts. It should, but this is removable storage and optimism has already had enough turns at the controls.
 

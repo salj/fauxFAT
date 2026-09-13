@@ -58,6 +58,7 @@ static const fauxfat_config cfg = {
 
     /* Leave additional anonymous private capacity after the named extents. */
     .data_cluster_count = 700,
+    .private_reservation = FAUXFAT_PRIVATE_BAD_CLUSTERS,
 
     .read = payload_read,
     .write = payload_write,
@@ -90,6 +91,11 @@ Important configuration rules:
 - explicit `data_cluster` values are offsets inside the payload arena and must be monotonically ordered/non-overlapping across the public table followed by the opaque table;
 - `FAUXFAT_CLUSTER_AUTO` packs the entry immediately after the previous configured extent;
 - `data_cluster_count == 0` ends the arena at the last configured extent; a larger value reserves an anonymous opaque tail;
+- `private_reservation` normally stays
+  `FAUXFAT_PRIVATE_BAD_CLUSTERS`; the only other current value is the
+  qualification-only `FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD`, which keeps the
+  same bad-cluster map and adds redundant benign-primary owners for anonymous
+  reserve runs;
 - `read` is required when any public or opaque object exists;
 - `write` is required when any public file exists;
 - `volume_guid` must be non-zero;
@@ -840,6 +846,14 @@ contents for that owner are semantically invalid and may simultaneously contain
 the bad-cluster markers.  The mode is experimental until Windows, Linux, and
 macOS normal mount/repair paths stop finding inventive reasons to object.
 
+Two earlier reservation experiments are intentionally gone rather than kept as
+compatibility modes. Bitmap-only anonymous allocation was rejected after
+Windows `chkdsk` diagnosed the unexplained allocation as corruption and `/F`
+released it. A literal `.` blocker file was also retired: Windows tolerated it
+inconsistently across namespace APIs, while exfatprogs rejected the filename as
+illegal. `--benign-reserve` is the only current qualification alternative and
+always retains the canonical bad-cluster markers underneath it.
+
 `verify-vhdx` reuses an existing attachment when possible; otherwise it makes a
 temporary read-only/no-drive-letter attachment. It opens the resulting
 `\\.\\PhysicalDriveN` through the real block-device API, requires the PMBR and
@@ -879,3 +893,14 @@ The raw backend also retains the last native Win32 failure. A whole-device
 `EIO` from the library is therefore followed by the underlying operation and
 Windows error code/message, rather than collapsing useful host-policy failures
 into an anonymous `-37`.
+
+Current Windows qualification has exercised more than the create/open happy
+path. Renaming `QUALIFY.BIN` leaves the persisted logical name recoverable and
+reports `FAUXFAT_DISK_FILE_NAME_CHANGED`. Deleting and recreating it under the
+same ordinary name can be salvaged if Windows has not already consumed the
+freed extent; recreating and then renaming it correctly loses manufactured
+logical identity because the vendor-name secondaries no longer exist. A
+DiskPart quick-format of partition 1 is rejected as `ENOTFAUXFAT` even when
+stale OEM parameter sectors survive the format. Those behaviors are
+qualification boundaries, not supported update operations: the intended host
+writer still opens the existing file and overwrites it in place.

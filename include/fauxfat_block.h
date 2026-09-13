@@ -171,9 +171,11 @@ int fauxfat_block_probe(fauxfat_block_probe_info *probe,
  * GUIDs and names are not part of this geometry check. Without an expected
  * layout, GPT partitions must be zero-attribute Microsoft Basic Data.
  *
- * GPT partition 1 must carry a recognizable fauxFAT OEM identity. A generic
- * exFAT volume is deliberately rejected even if the bounded exFAT scanner
- * could otherwise read it.
+ * GPT partition 1 must classify as recognizable, scan-ready fauxFAT. OEM
+ * identity bytes alone are deliberately insufficient because a host quick
+ * format can replace the filesystem while leaving stale OEM sectors behind.
+ * A generic exFAT volume is rejected even if the bounded exFAT scanner could
+ * otherwise read it.
  *
  * When device.generation is available, open captures it before probing and the
  * returned volume adapter checks the same token before and after every raw

@@ -398,10 +398,11 @@ int fauxfat_format(const fauxfat_view *view,
  *
  * The parser accepts only the strict fauxFAT root grammar: four fixed system
  * entries, canonical public five-entry sets, canonical fauxFAT opaque
- * five-entry sets, then 0xA1 padding through the end of the cluster. The host
- * may have changed Archive, last-modified/access timestamps and their UTC
- * offsets, provided the resulting entry-set checksum is valid. Everything
- * else is structural.
+ * five-entry sets, optional exact 0xBF anonymous-reserve owners when the OEM
+ * flag selects the qualification mode, then 0xA1 padding through the end of
+ * the cluster. The host may have changed Archive, last-modified/access
+ * timestamps and their UTC offsets, provided the resulting entry-set checksum
+ * is valid. Everything else is structural.
  *
  * No allocation is performed. At most one 512-byte root block and one
  * five-entry set are buffered. descriptor_count may be NULL.

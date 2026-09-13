@@ -189,7 +189,7 @@ Its 32-byte `CustomDefined` payload is exactly:
 |---:|---:|---|
 | 0 | 4 | ASCII `FFV1` |
 | 4 | 2 | format version = 1 |
-| 6 | 2 | flags = 0 |
+| 6 | 2 | fauxFAT flags, described below |
 | 8 | 8 | little-endian structural epoch |
 | 16 | 4 | XXH32 of canonical FAT bytes, seed `0x46415431` |
 | 20 | 4 | XXH32 of Allocation Bitmap meaningful bytes, seed `0x42495431` |
@@ -197,6 +197,18 @@ Its 32-byte `CustomDefined` payload is exactly:
 | 28 | 4 | XXH32 of exact Up-case Table bytes, seed `0x55504331` |
 
 All fauxFAT-private hashes use standard XXH32. exFAT-mandated boot checksums, directory-set checksums, NameHash, and Up-case Table checksum retain their native exFAT algorithms.
+
+Defined fauxFAT flags are:
+
+```text
+bit 0   qualification-only benign anonymous-reserve owners are present
+bits 1..15   zero
+```
+
+Bit 0 corresponds to `FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD`. It does not
+weaken the canonical private-cluster rule: the same clusters still have bitmap
+bit `1` and FAT value `0xFFFFFFF7`. Unknown flag bits make the OEM identity
+unrecognizable rather than being silently ignored.
 
 The structural epoch changes only when the device intentionally changes the fauxFAT structure: file slot activation/deactivation, file extent movement/resize, public/private range reclassification, or other material layout changes. Ordinary host writes to file contents do not change it.
 
@@ -333,6 +345,26 @@ the canonical `0xFFFFFFF7` FAT markers.  This is not contradictory: with
 `NoFatChain = 1`, the FAT entries associated with that primary allocation are
 semantically invalid and are not interpreted as its cluster chain.
 
+The exact qualification entry is:
+
+| Offset | Size | Content |
+|---:|---:|---|
+| 0 | 1 | `0xBF` (in-use, benign, primary, custom type) |
+| 1 | 1 | `SecondaryCount = 0` |
+| 2 | 2 | normal one-entry `SetChecksum` |
+| 4 | 2 | `GeneralPrimaryFlags = 0x0003` (`AllocationPossible | NoFatChain`) |
+| 6 | 8 | ASCII `FAUXRSV1` |
+| 14 | 4 | zero-based anonymous-run ordinal, little-endian |
+| 18 | 2 | total anonymous-run count, little-endian |
+| 20 | 4 | first physical cluster of this anonymous run |
+| 24 | 8 | complete run length in bytes |
+
+The ordinal/count fields make torn, duplicated, missing, or reordered reserve
+owners detectable by strict validation without turning the records into an
+application manifest. The run remains anonymous application reserve; the
+record's only job is to give generic exFAT tooling a standards-shaped allocation
+owner if that tooling chooses to honor unknown benign primaries.
+
 Only anonymous gaps/tail receive these experimental owners.  Named opaque
 ranges already have a `NoFatChain` Vendor Allocation owner and therefore are
 not deliberately cross-linked to a second allocation record.  The redundant
@@ -366,7 +398,12 @@ The canonical root-entry budget is therefore:
 The experimental redundant-reserve mode adds `anonymous_run_count` one-entry
 primaries to that budget.
 
-The theoretical maximum is therefore 408 file/descriptor sets in any mixture. Real products use vastly fewer, so spending two extra benign records on stable public-file identity is considerably cheaper than teaching recovery code to guess what a host rename meant.
+Without the qualification-only reserve owners, the theoretical maximum is
+therefore 408 file/descriptor sets in any mixture. Experimental `0xBF` reserve
+owners consume one additional root entry per anonymous run and reduce that
+budget accordingly. Real products use vastly fewer entries, so spending two
+extra benign records on stable public-file identity is considerably cheaper
+than teaching recovery code to guess what a host rename meant.
 
 ### 9.1 Volume Label
 
@@ -677,7 +714,10 @@ The on-disk format does not prescribe an application commit policy or require on
 3. `FAUXFAT_CLUSTER_AUTO` resolves an extent immediately after the previous configured extent;
 4. any gap before/between configured extents is an anonymous opaque reservation;
 5. if `DataClusterCount` extends beyond the last configured extent, the remaining tail is an anonymous opaque reservation;
-6. anonymous reservations have bitmap bit `1`, FAT value `0xFFFFFFF7`, no root descriptor, and preserve semantics during formatting.
+6. anonymous reservations have bitmap bit `1`, FAT value `0xFFFFFFF7`, and
+   preserve semantics during formatting; canonically they have no root
+   descriptor, while qualification mode may add one redundant `0xBF` Generic
+   Primary owner per contiguous anonymous run.
 
 A schema may therefore leave capacity unused without making it host-allocatable. Turning anonymous reserve into a named public or opaque extent is a structural change performed while the volume is private: update the desired schema, increment the structural epoch, regenerate the canonical metadata, and strict-validate it before exposing the volume again.
 
@@ -755,7 +795,10 @@ Strict validation performs this bounded sequence:
 3. validate the Allocation Bitmap and Up-case root entries;
 4. verify the fauxFAT Up-case checksum/content;
 5. verify the root is exactly one cluster and FAT-chained EOC;
-6. verify every root entry is one of the expected system entries, public file sets, fauxFAT opaque descriptor sets, or canonical `0xA1` padding;
+6. verify every root entry is one of the expected system entries, public file
+   sets, fauxFAT opaque descriptor sets, the exact qualification-only `0xBF`
+   reserve owners when the OEM flag selects that mode, or canonical `0xA1`
+   padding;
 7. verify each public/opaque File set checksum and permit only the host-mutable timestamp/archive fields listed above;
 8. recompute FAT, bitmap, root, and upcase XXH32 component fingerprints and the map fingerprint;
 9. compare those values to OEM Parameters;
@@ -767,13 +810,58 @@ There is no general path lookup, cluster allocator, directory repair, orphan rec
 
 ## 16. Important qualification points
 
-The format is intentionally legal-but-hostile. Before treating it as qualified host behavior, qualify at least:
+The format is intentionally legal-but-hostile. Before treating it as fully
+qualified host behavior, qualify at least:
 
 - Windows 10 and 11 native exFAT;
 - ordinary Explorer mount/eject and file overwrite;
 - the tiny supported updater doing `OPEN_EXISTING` in-place writes;
 - antivirus/indexing/filter stacks likely to be encountered;
 - Linux exFAT if cards may be handled there;
-- `chkdsk` only to document how it damages/reclassifies the deliberately fake bad clusters. `chkdsk` is not an accepted writer.
+- `chkdsk` only as qualification/diagnostic tooling, not as an accepted writer.
 
-The central empirical question is whether desktop exFAT implementations leave the manufactured bad-cluster ranges, fauxFAT Vendor Extension/Vendor Allocation descriptor sets, and `0xA1` root padding alone during ordinary mount/write/unmount. The base compatibility rules say unknown benign vendor secondaries and their allocations should survive that cycle. Host qualification gets the final vote, because storage software enjoys interpretive dance.
+Known Windows qualification findings as of 2026-09-13:
+
+- a VHDX containing the canonical GPT + fauxFAT layout mounts and reopens
+  through the real `PhysicalDrive` path;
+- renaming a manufactured public file causes strict classification to become
+  changed, but the persisted fauxFAT logical name survives and the descriptor
+  reports `FAUXFAT_DISK_FILE_NAME_CHANGED`;
+- deleting and recreating the file under its original name can be recovered by
+  ordinary-name salvage if the extent has not already been consumed; deleting,
+  recreating, and then renaming it correctly loses manufactured logical
+  identity because the vendor-name records are gone;
+- deleting a public file temporarily creates genuinely free space, so Windows
+  may immediately allocate something such as `System Volume Information` into
+  that extent. Delete/recreate is therefore not part of the supported update
+  protocol;
+- `chkdsk` accepts the canonical bad-cluster reservation as structurally clean,
+  but reports the reserved capacity as bad sectors. This ugly presentation is
+  currently preferable to losing the reservation;
+- bitmap-only anonymous allocation was tested and rejected: `chkdsk` reports
+  bitmap corruption and `/F` releases the unexplained allocation;
+- DiskPart quick-format can replace partition 1 while leaving stale fauxFAT OEM
+  sectors behind. OEM identity alone is therefore not ownership evidence;
+  schema-free reopen/open requires a coherent bounded root profile before a
+  recognizable OEM copy can classify the volume as fauxFAT-changed.
+
+The literal-`.` blocker experiment is also retired. Windows tolerated it in an
+odd namespace-dependent way, but exfatprogs correctly rejects `.` as an illegal
+filename. The remaining experimental alternative is the redundant `0xBF`
+benign-primary owner described above, always combined with the canonical bad
+cluster map.
+
+One known repair-tool incompatibility is deliberately not made part of the
+format contract: current exfatprogs source recognizes the `0xA1` TexFAT Padding
+constant but its fsck path still offers such entries for deletion as unknown.
+Likewise, arbitrary unknown benign primaries are not preserved by that fsck.
+Ordinary Linux/macOS mount behavior still requires qualification; a repair tool
+which destructively rewrites standards-defined benign entries is not treated as
+the authority for fauxFAT's on-disk contract.
+
+The central empirical question remains whether normal desktop exFAT
+implementations leave the manufactured bad-cluster ranges, fauxFAT Vendor
+Extension/Vendor Allocation descriptor sets, `0xA1` root padding, and the
+optional redundant `0xBF` owners alone during the supported
+mount/read/in-place-write/unmount cycle. Host qualification gets the final
+vote, because storage software enjoys interpretive dance.
