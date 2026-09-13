@@ -1,4 +1,5 @@
 #include "fauxgpt.h"
+#include "fauxbytes.h"
 
 #include <limits.h>
 #include <string.h>
@@ -7,51 +8,6 @@ const uint8_t fauxgpt_type_microsoft_basic_data[16] = {
     0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
     0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7
 };
-
-static void fg_store16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-}
-
-static void fg_store32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    p[3] = (uint8_t)(v >> 24);
-}
-
-static void fg_store64(uint8_t *p, uint64_t v)
-{
-    fg_store32(p, (uint32_t)v);
-    fg_store32(p + 4, (uint32_t)(v >> 32));
-}
-
-static uint32_t fg_load32(const uint8_t *p)
-{
-    return (uint32_t)p[0] |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
-static uint64_t fg_load64(const uint8_t *p)
-{
-    return (uint64_t)fg_load32(p) |
-           ((uint64_t)fg_load32(p + 4) << 32);
-}
-
-static int fg_guid_zero(const uint8_t guid[16])
-{
-    unsigned i;
-
-    for (i = 0; i < 16u; ++i) {
-        if (guid[i] != 0u)
-            return 0;
-    }
-    return 1;
-}
 
 static uint32_t fg_crc32_update(uint32_t crc, const void *data, size_t length)
 {
@@ -104,11 +60,11 @@ static int fg_pmbr_valid(const uint8_t block[FAUXGPT_BLOCK_SIZE],
         const uint8_t *e = block + 446u + i * 16u;
         if (i == 0u) {
             if (e[0] != 0u || e[4] != 0xeeu ||
-                fg_load32(e + 8u) != 1u ||
-                fg_load32(e + 12u) != want_size)
+                faux_load_le32(e + 8u) != 1u ||
+                faux_load_le32(e + 12u) != want_size)
                 return 0;
         } else if (e[0] != 0u || e[4] != 0u ||
-                   fg_load32(e + 8u) != 0u || fg_load32(e + 12u) != 0u) {
+                   faux_load_le32(e + 8u) != 0u || faux_load_le32(e + 12u) != 0u) {
             return 0;
         }
     }
@@ -151,10 +107,10 @@ static int fg_parse_entry(const uint8_t entry[FAUXGPT_ENTRY_SIZE],
                           uint64_t first_usable, uint64_t last_usable,
                           fauxgpt_partition_info *out)
 {
-    uint64_t first = fg_load64(entry + 32u);
-    uint64_t last  = fg_load64(entry + 40u);
+    uint64_t first = faux_load_le64(entry + 32u);
+    uint64_t last  = faux_load_le64(entry + 40u);
 
-    if (fg_guid_zero(entry) || fg_guid_zero(entry + 16u) ||
+    if (faux_guid_is_zero(entry) || faux_guid_is_zero(entry + 16u) ||
         first < first_usable || first > last || last > last_usable)
         return 0;
 
@@ -163,7 +119,7 @@ static int fg_parse_entry(const uint8_t entry[FAUXGPT_ENTRY_SIZE],
     memcpy(out->unique_guid, entry + 16u, 16u);
     out->first_lba   = first;
     out->block_count = last - first + 1u;
-    out->attributes  = fg_load64(entry + 48u);
+    out->attributes  = faux_load_le64(entry + 48u);
     return 1;
 }
 
@@ -195,25 +151,25 @@ static int fg_read_copy(const fauxgpt_device *device, uint64_t disk_blocks,
         return FAUXGPT_OK;
     copy->flags |= FAUXGPT_COPY_MARKER;
 
-    if (fg_load32(header + 8u) != 0x00010000u ||
-        fg_load32(header + 12u) != 92u || fg_load32(header + 20u) != 0u ||
-        fg_load64(header + 24u) != header_lba ||
-        fg_load64(header + 32u) != (backup ? FAUXGPT_PRIMARY_HEADER_LBA : disk_blocks - 1u) ||
-        fg_load64(header + 40u) != FAUXGPT_FIRST_USABLE_LBA ||
-        fg_load64(header + 48u) != want_last_usable ||
-        fg_guid_zero(header + 56u) ||
-        fg_load64(header + 72u) != array_lba ||
-        fg_load32(header + 80u) != FAUXGPT_ENTRY_COUNT ||
-        fg_load32(header + 84u) != FAUXGPT_ENTRY_SIZE)
+    if (faux_load_le32(header + 8u) != 0x00010000u ||
+        faux_load_le32(header + 12u) != 92u || faux_load_le32(header + 20u) != 0u ||
+        faux_load_le64(header + 24u) != header_lba ||
+        faux_load_le64(header + 32u) != (backup ? FAUXGPT_PRIMARY_HEADER_LBA : disk_blocks - 1u) ||
+        faux_load_le64(header + 40u) != FAUXGPT_FIRST_USABLE_LBA ||
+        faux_load_le64(header + 48u) != want_last_usable ||
+        faux_guid_is_zero(header + 56u) ||
+        faux_load_le64(header + 72u) != array_lba ||
+        faux_load_le32(header + 80u) != FAUXGPT_ENTRY_COUNT ||
+        faux_load_le32(header + 84u) != FAUXGPT_ENTRY_SIZE)
         return FAUXGPT_OK;
 
-    stored_header_crc = fg_load32(header + 16u);
+    stored_header_crc = faux_load_le32(header + 16u);
     memcpy(crc_header, header, sizeof(crc_header));
     memset(crc_header + 16u, 0, 4u);
     if (fg_crc32(crc_header, 92u) != stored_header_crc)
         return FAUXGPT_OK;
 
-    stored_array_crc            = fg_load32(header + 88u);
+    stored_array_crc            = faux_load_le32(header + 88u);
     copy->info.first_usable_lba = FAUXGPT_FIRST_USABLE_LBA;
     copy->info.last_usable_lba  = want_last_usable;
     memcpy(copy->info.disk_guid, header + 56u, 16u);
@@ -234,7 +190,7 @@ static int fg_read_copy(const fauxgpt_device *device, uint64_t disk_blocks,
                            slot;
             fauxgpt_partition_info parsed;
 
-            if (fg_guid_zero(entry))
+            if (faux_guid_is_zero(entry))
                 continue;
             if (index >= FAUXGPT_OPEN_MAX_PARTITIONS) {
                 copy->flags |= FAUXGPT_COPY_TOO_MANY;
@@ -295,14 +251,14 @@ static void fg_render_entry(const fauxgpt_view *view, size_t index,
     p = &view->layout->partitions[index];
     memcpy(out, p->type_guid, 16u);
     memcpy(out + 16u, p->unique_guid, 16u);
-    fg_store64(out + 32u, p->first_lba);
-    fg_store64(out + 40u, p->first_lba + p->block_count - 1u);
-    fg_store64(out + 48u, p->attributes);
+    faux_store_le64(out + 32u, p->first_lba);
+    faux_store_le64(out + 40u, p->first_lba + p->block_count - 1u);
+    faux_store_le64(out + 48u, p->attributes);
 
     if (!p->name)
         return;
     for (i = 0u; i < FAUXGPT_NAME_MAX && p->name[i] != '\0'; ++i)
-        fg_store16(out + 56u + 2u * i, (uint16_t)(uint8_t)p->name[i]);
+        faux_store_le16(out + 56u + 2u * i, (uint16_t)(uint8_t)p->name[i]);
 }
 
 static void fg_render_array_block(const fauxgpt_view *view, unsigned array_block,
@@ -328,20 +284,20 @@ static void fg_render_header(const fauxgpt_view *view, int backup,
 
     memset(out, 0, FAUXGPT_BLOCK_SIZE);
     memcpy(out, "EFI PART", 8u);
-    fg_store32(out + 8u, 0x00010000u);
-    fg_store32(out + 12u, 92u);
-    fg_store64(out + 24u, my_lba);
-    fg_store64(out + 32u, alternate_lba);
-    fg_store64(out + 40u, FAUXGPT_FIRST_USABLE_LBA);
-    fg_store64(out + 48u, view->last_usable_lba);
+    faux_store_le32(out + 8u, 0x00010000u);
+    faux_store_le32(out + 12u, 92u);
+    faux_store_le64(out + 24u, my_lba);
+    faux_store_le64(out + 32u, alternate_lba);
+    faux_store_le64(out + 40u, FAUXGPT_FIRST_USABLE_LBA);
+    faux_store_le64(out + 48u, view->last_usable_lba);
     memcpy(out + 56u, view->layout->disk_guid, 16u);
-    fg_store64(out + 72u, array_lba);
-    fg_store32(out + 80u, FAUXGPT_ENTRY_COUNT);
-    fg_store32(out + 84u, FAUXGPT_ENTRY_SIZE);
-    fg_store32(out + 88u, view->partition_array_crc32);
+    faux_store_le64(out + 72u, array_lba);
+    faux_store_le32(out + 80u, FAUXGPT_ENTRY_COUNT);
+    faux_store_le32(out + 84u, FAUXGPT_ENTRY_SIZE);
+    faux_store_le32(out + 88u, view->partition_array_crc32);
 
     crc = fg_crc32(out, 92u);
-    fg_store32(out + 16u, crc);
+    faux_store_le32(out + 16u, crc);
 }
 
 static void fg_render_pmbr(const fauxgpt_view *view,
@@ -361,8 +317,8 @@ static void fg_render_pmbr(const fauxgpt_view *view,
     entry[5] = 0xffu;
     entry[6] = 0xffu;
     entry[7] = 0xffu;
-    fg_store32(entry + 8u, 1u);
-    fg_store32(entry + 12u, size_lba);
+    faux_store_le32(entry + 8u, 1u);
+    faux_store_le32(entry + 12u, size_lba);
     out[510] = 0x55u;
     out[511] = 0xaau;
 }
@@ -376,7 +332,7 @@ int fauxgpt_init(fauxgpt_view *view, const fauxgpt_layout *layout)
 
     if (!view || !layout ||
         (layout->partition_count != 0u && !layout->partitions) ||
-        fg_guid_zero(layout->disk_guid))
+        faux_guid_is_zero(layout->disk_guid))
         return FAUXGPT_EINVAL;
     if (layout->partition_count > FAUXGPT_ENTRY_COUNT)
         return FAUXGPT_ERANGE;
@@ -398,7 +354,7 @@ int fauxgpt_init(fauxgpt_view *view, const fauxgpt_layout *layout)
         uint64_t last;
         size_t j;
 
-        if (fg_guid_zero(p->type_guid) || fg_guid_zero(p->unique_guid) ||
+        if (faux_guid_is_zero(p->type_guid) || faux_guid_is_zero(p->unique_guid) ||
             p->block_count == 0u || !fg_name_valid(p->name))
             return FAUXGPT_EINVAL;
         if (p->first_lba < FAUXGPT_FIRST_USABLE_LBA ||
@@ -454,6 +410,45 @@ int fauxgpt_probe(fauxgpt_probe_info *probe,
     rc = fg_read_copy(device, disk_blocks, 1, &probe->backup);
     if (rc != 0)
         return rc;
+    if ((probe->primary.flags & FAUXGPT_COPY_VALID) != 0u &&
+        (probe->backup.flags & FAUXGPT_COPY_VALID) != 0u &&
+        !fg_copy_equal(&probe->primary, &probe->backup))
+        probe->flags |= FAUXGPT_PROBE_CONFLICT;
+    return FAUXGPT_OK;
+}
+
+int fauxgpt_probe_resolve(fauxgpt_info *info,
+                          const fauxgpt_probe_info *probe)
+{
+    const fauxgpt_copy_info *chosen;
+    int primary_valid;
+    int backup_valid;
+
+    if (!info || !probe)
+        return FAUXGPT_EINVAL;
+    memset(info, 0, sizeof(*info));
+
+    primary_valid = (probe->primary.flags & FAUXGPT_COPY_VALID) != 0u;
+    backup_valid  = (probe->backup.flags & FAUXGPT_COPY_VALID) != 0u;
+    if (!primary_valid && !backup_valid) {
+        if ((probe->flags & FAUXGPT_PROBE_PMBR_MARKER) != 0u ||
+            (probe->primary.flags & FAUXGPT_COPY_MARKER) != 0u ||
+            (probe->backup.flags & FAUXGPT_COPY_MARKER) != 0u)
+            return FAUXGPT_ESTRUCTURE;
+        return FAUXGPT_ENOTGPT;
+    }
+    if ((probe->flags & FAUXGPT_PROBE_CONFLICT) != 0u)
+        return FAUXGPT_ESTRUCTURE;
+
+    chosen      = primary_valid ? &probe->primary : &probe->backup;
+    *info       = chosen->info;
+    info->flags = 0u;
+    if (primary_valid)
+        info->flags |= FAUXGPT_INFO_PRIMARY_VALID;
+    if (backup_valid)
+        info->flags |= FAUXGPT_INFO_BACKUP_VALID;
+    if ((probe->flags & FAUXGPT_PROBE_PMBR_VALID) != 0u)
+        info->flags |= FAUXGPT_INFO_PMBR_VALID;
     return FAUXGPT_OK;
 }
 
@@ -462,46 +457,21 @@ int fauxgpt_open(fauxgpt_info *info,
                  uint64_t disk_blocks)
 {
     fauxgpt_probe_info probe;
-    const fauxgpt_copy_info *chosen;
-    int primary_valid;
-    int backup_valid;
     int rc;
 
     if (!info || !device || !device->read)
         return FAUXGPT_EINVAL;
-    memset(info, 0, sizeof(*info));
 
     rc = fauxgpt_probe(&probe, device, disk_blocks);
     if (rc != FAUXGPT_OK)
         return rc;
-
-    primary_valid = (probe.primary.flags & FAUXGPT_COPY_VALID) != 0u;
-    backup_valid  = (probe.backup.flags & FAUXGPT_COPY_VALID) != 0u;
-
-    if (!primary_valid && !backup_valid) {
-        if ((probe.flags & FAUXGPT_PROBE_PMBR_MARKER) != 0u ||
-            (probe.primary.flags & FAUXGPT_COPY_MARKER) != 0u ||
-            (probe.backup.flags & FAUXGPT_COPY_MARKER) != 0u)
-            return FAUXGPT_ESTRUCTURE;
-        return FAUXGPT_ENOTGPT;
-    }
-    if (primary_valid && backup_valid &&
-        !fg_copy_equal(&probe.primary, &probe.backup))
-        return FAUXGPT_ESTRUCTURE;
-
-    chosen = primary_valid ? &probe.primary : &probe.backup;
-    if ((chosen->flags & FAUXGPT_COPY_TOO_MANY) != 0u ||
-        chosen->info.partition_count > FAUXGPT_OPEN_MAX_PARTITIONS)
+    rc = fauxgpt_probe_resolve(info, &probe);
+    if (rc != FAUXGPT_OK)
+        return rc;
+    if (info->partition_count > FAUXGPT_OPEN_MAX_PARTITIONS) {
+        memset(info, 0, sizeof(*info));
         return FAUXGPT_EPARTITIONS;
-
-    *info       = chosen->info;
-    info->flags = 0u;
-    if (primary_valid)
-        info->flags |= FAUXGPT_INFO_PRIMARY_VALID;
-    if (backup_valid)
-        info->flags |= FAUXGPT_INFO_BACKUP_VALID;
-    if ((probe.flags & FAUXGPT_PROBE_PMBR_VALID) != 0u)
-        info->flags |= FAUXGPT_INFO_PMBR_VALID;
+    }
     return FAUXGPT_OK;
 }
 
@@ -647,6 +617,7 @@ int fauxgpt_verify(const fauxgpt_view *view, const fauxgpt_device *device)
         if (rc != FAUXGPT_OK)
             return rc;
     }
+
     for (lba = view->backup_array_lba; lba <= view->backup_header_lba; ++lba) {
         rc = fg_verify_block(view, device, lba);
         if (rc != FAUXGPT_OK)

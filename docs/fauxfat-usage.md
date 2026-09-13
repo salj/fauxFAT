@@ -751,11 +751,13 @@ rc = fauxgpt_open(&gi, &gd, card_blocks);
 
 `fauxgpt_probe()` is the observation primitive underneath `fauxgpt_open()`.
 It inspects the PMBR, primary copy, and backup copy independently and records
-markers, CRC-valid copies, array CRCs, and the bounded active-entry count.
-Structural damage or a primary/backup conflict remains visible in the probe
-result instead of being collapsed immediately into `FAUXGPT_ESTRUCTURE`.
-`fauxgpt_open()` then applies the ordinary one-coherent-map / at-most-two-entry
-policy to that observation.
+markers, CRC-valid copies, array CRCs, the active-entry count, and an explicit
+`FAUXGPT_PROBE_CONFLICT` bit when two individually valid copies disagree.
+`fauxgpt_probe_resolve()` turns a non-conflicting probe into one coherent
+`fauxgpt_info` without yet imposing the two-partition product limit; policy
+layers can therefore inspect coherent foreign GPTs without reimplementing the
+copy-selection rules. `fauxgpt_open()` is just probe + resolve + the bounded
+at-most-two-entry acceptance rule.
 
 `fauxgpt_open()` validates the canonical header geometry, header CRCs, complete
 128-entry array CRCs, and active entry ranges. `fauxgpt_verify()` is the stricter

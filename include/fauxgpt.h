@@ -116,7 +116,9 @@ typedef struct fauxgpt_probe_info {
 
 enum {
     FAUXGPT_PROBE_PMBR_MARKER = 1u << 0,
-    FAUXGPT_PROBE_PMBR_VALID  = 1u << 1
+    FAUXGPT_PROBE_PMBR_VALID  = 1u << 1,
+    /* Both GPT copies are individually valid but disagree. */
+    FAUXGPT_PROBE_CONFLICT = 1u << 2
 };
 
 enum {
@@ -146,6 +148,16 @@ int fauxgpt_init(fauxgpt_view *view, const fauxgpt_layout *layout);
 int fauxgpt_probe(fauxgpt_probe_info *probe,
                   const fauxgpt_device *device,
                   uint64_t disk_blocks);
+
+/*
+ * Resolve independently observed copies into one coherent GPT view without
+ * enforcing the <=2-partition open profile. This is useful to policy layers
+ * which need to inspect coherent-but-unacceptable GPTs before rejecting them.
+ * Markers with no valid copy, or two valid copies which disagree, return
+ * FAUXGPT_ESTRUCTURE. No GPT markers at all returns FAUXGPT_ENOTGPT.
+ */
+int fauxgpt_probe_resolve(fauxgpt_info *info,
+                          const fauxgpt_probe_info *probe);
 
 /*
  * Read and validate the narrow on-disk GPT profile in constant memory.

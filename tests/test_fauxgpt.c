@@ -326,6 +326,9 @@ static void test_open_and_partition_match(void)
     assert((probe.backup.flags & FAUXGPT_COPY_VALID) != 0u);
     assert(probe.primary.info.partition_count == 2u);
     assert(probe.primary.partition_array_crc32 == view.partition_array_crc32);
+    assert((probe.flags & FAUXGPT_PROBE_CONFLICT) == 0u);
+    assert(fauxgpt_probe_resolve(&info, &probe) == FAUXGPT_OK);
+    assert(info.partition_count == 2u);
 
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) == FAUXGPT_OK);
     assert(info.flags == (FAUXGPT_INFO_PRIMARY_VALID |
@@ -357,7 +360,6 @@ static void test_open_and_partition_match(void)
     expected_parts[0].name = "RENAMED";
     assert(fauxgpt_geometry_matches(&info, &expected));
     assert(fauxgpt_identity_matches(&info, &expected));
-    /* Compatibility spelling still means geometry, not identity. */
 
     /* One intact copy is enough to open; the missing copy is visible. */
     src.corrupt_lba = FAUXGPT_PRIMARY_HEADER_LBA;
@@ -393,6 +395,8 @@ static void test_open_and_partition_match(void)
     assert((probe.backup.flags & FAUXGPT_COPY_VALID) != 0u);
     assert(probe.primary.partition_array_crc32 !=
            probe.backup.partition_array_crc32);
+    assert((probe.flags & FAUXGPT_PROBE_CONFLICT) != 0u);
+    assert(fauxgpt_probe_resolve(&info, &probe) == FAUXGPT_ESTRUCTURE);
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) ==
            FAUXGPT_ESTRUCTURE);
     src.backup_view = NULL;
@@ -409,6 +413,8 @@ static void test_open_and_partition_match(void)
     assert(fauxgpt_probe(&probe, &dev, layout.disk_blocks) == FAUXGPT_OK);
     assert((probe.primary.flags & FAUXGPT_COPY_TOO_MANY) != 0u);
     assert(probe.primary.info.partition_count == 3u);
+    assert(fauxgpt_probe_resolve(&info, &probe) == FAUXGPT_OK);
+    assert(info.partition_count == 3u);
     assert(fauxgpt_open(&info, &dev, layout.disk_blocks) ==
            FAUXGPT_EPARTITIONS);
 }
