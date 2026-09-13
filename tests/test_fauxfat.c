@@ -1607,6 +1607,89 @@ int main(void)
     }
 
     /*
+     * Qualification-only dot blocker: every non-public data cluster is one
+     * fragmented FAT chain owned by a hidden/system/read-only file named
+     * ".".  The chain jumps across public extents, so arbitrary gaps cost
+     * only the FAT entries we already have.
+     */
+    {
+        fauxfat_file placed_files[] = {
+            { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, 0u },
+            { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, 4u }
+        };
+        fauxfat_opaque_file placed_opaque = {
+            "SOLVER.DB", 13, sizeof(opaque_data), (time_t)1735787045, 7u
+        };
+
+        fauxfat_config dcfg = cfg;
+        fauxfat_view dv;
+        fauxfat_device ddev;
+        fauxfat_volume_class vc;
+        fauxfat_reopen_info ri;
+        emit_test got;
+        size_t count = 0u;
+        uint64_t root;
+        uint8_t fat[512];
+        uint8_t root_block[512];
+        const uint8_t *dot;
+
+        dcfg.files               = placed_files;
+        dcfg.file_count          = 2u;
+        dcfg.opaque_files        = &placed_opaque;
+        dcfg.opaque_file_count   = 1u;
+        dcfg.data_cluster_count  = 10u;
+        dcfg.private_reservation = FAUXFAT_PRIVATE_DOT_FILE;
+        assert(fauxfat_init(&dv, &dcfg) == FAUXFAT_OK);
+
+        assert(fauxfat_read_block(&dv, 128u, fat) == FAUXFAT_OK);
+        assert(load32(fat + 4u * 5u) == 0u);
+        assert(load32(fat + 4u * 6u) == 0u);
+        assert(load32(fat + 4u * 7u) == 8u);
+        assert(load32(fat + 4u * 8u) == 10u); /* jump over CONFIG.BIN */
+        assert(load32(fat + 4u * 9u) == 0u);
+        assert(load32(fat + 4u * 10u) == 11u);
+        assert(load32(fat + 4u * 11u) == 12u);
+        assert(load32(fat + 4u * 12u) == 13u);
+        assert(load32(fat + 4u * 13u) == 14u);
+        assert(load32(fat + 4u * 14u) == 0xffffffffu);
+
+        root = dv.cluster_heap_block +
+               (uint64_t)(dv.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
+        assert(fauxfat_read_block(&dv, root + 1u, root_block) == FAUXFAT_OK);
+        dot = root_block + 3u * 32u; /* root entry 19 */
+        assert(dot[0] == 0x85u && dot[1] == 2u);
+        assert(load16(dot + 4u) == 0x0007u);
+        assert(dot[32u] == 0xc0u && dot[33u] == 0x01u);
+        assert(dot[35u] == 1u);
+        assert(load64(dot + 40u) == 0u); /* ValidDataLength */
+        assert(load32(dot + 52u) == 7u);
+        assert(load64(dot + 56u) == 7u * FAUXFAT_CLUSTER_SIZE);
+        assert(dot[64u] == 0xc1u && load16(dot + 66u) == '.');
+        assert(load16(dot + 2u) == entry_set_checksum(dot, 96u));
+
+        memset(&ddev, 0, sizeof(ddev));
+        ddev.read    = view_dev_read;
+        ddev.context = &dv;
+        assert(fauxfat_validate_strict(&dv, &ddev, &vc) == FAUXFAT_OK);
+        assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+
+        memset(&ri, 0, sizeof(ri));
+        memset(&got, 0, sizeof(got));
+        assert(fauxfat_reopen(&ddev, collect_file, &got, &count, &vc, &ri) ==
+               FAUXFAT_OK);
+        assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
+        assert(ri.private_reservation == FAUXFAT_PRIVATE_DOT_FILE);
+        assert(count == 3u && got.count == 3u); /* blocker is not a payload */
+
+        /* A dot owner with nothing to own is nonsensical. */
+        dcfg.opaque_files            = NULL;
+        dcfg.opaque_file_count       = 0u;
+        dcfg.data_cluster_count      = 3u;
+        placed_files[1].data_cluster = 2u;
+        assert(fauxfat_init(&dv, &dcfg) == FAUXFAT_EGEOMETRY);
+    }
+
+    /*
      * A recovered fauxfat_disk_file is itself enough to bind a caller file
      * handle to the underlying block device. Byte I/O remains bounded by
      * DataLength and preserves bytes outside unaligned writes.

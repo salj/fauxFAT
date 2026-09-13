@@ -824,6 +824,19 @@ lifetime. Partition 1 is labelled `FAUXQUAL` and contains one fixed 8 MiB
 filesystem. Windows can therefore mount/mutate partition 1 and the operator can
 format partition 2 with normal host tooling before running `verify-vhdx` again.
 
+For one deliberately non-canonical allocator experiment, `create-vhdx` and
+`format-raw` also accept `--dot-blocker`.  Instead of marking every non-public
+data cluster `0xFFFFFFF7`, fauxFAT emits one hidden/system/read-only regular file
+whose literal exFAT name is `.`.  Its stream is FAT-chained rather than
+`NoFatChain`: every otherwise-private cluster points to the next private cluster,
+skipping across public-file extents.  `ValidDataLength` is zero while
+`DataLength` covers the full chained allocation.  This costs no extra cluster
+storage and only changes FAT entries that already exist.  The point is purely
+to ask real host implementations whether a namespace-special `.` entry can own
+the allocation without being normally listable and without `chkdsk` treating it
+as lost space.  Bad-cluster reservation remains canonical until that experiment
+earns promotion.
+
 `verify-vhdx` reuses an existing attachment when possible; otherwise it makes a
 temporary read-only/no-drive-letter attachment. It opens the resulting
 `\\.\\PhysicalDriveN` through the real block-device API, requires the PMBR and
@@ -846,10 +859,20 @@ fauxfat-qualify.exe verify-raw \\.\\PhysicalDrive7
 ```
 
 `format-raw` accepts only the exact `\\.\\PhysicalDriveN` spelling and refuses
-to run without the literal `--destroy-user-data` option. It does not lock or
-dismount existing Windows volumes on the target; Windows may therefore reject
-writes to an in-use disk, which is preferable to this test utility quietly
-becoming `diskpart` with worse judgment. After direct GPT writes it issues
-`IOCTL_DISK_UPDATE_PROPERTIES` so Windows invalidates its cached partition map.
-The fauxFAT library's own `DESTROY_USER_DATA` flag is also set; partition 2's
-body is still never written by fauxFAT/GPT formatting.
+to run without the literal `--destroy-user-data` option. Before issuing any raw
+writes it enumerates Windows volumes, identifies every volume with an extent on
+the target physical disk, and acquires `FSCTL_LOCK_VOLUME` on all of them. If
+any target volume cannot be locked, formatting is refused before the first
+mutation rather than forcing a dismount underneath an application with an open
+file. After formatting, the locked old volumes are dismounted/unlocked and the
+tool issues `IOCTL_DISK_UPDATE_PROPERTIES` so Windows invalidates its cached
+partition map. This is required on Vista and later because Windows rejects raw
+disk writes that overlap a mounted filesystem unless the corresponding volume
+has been locked or dismounted. The fauxFAT library's own
+`DESTROY_USER_DATA` flag is also set; partition 2's body is still never written
+by fauxFAT/GPT formatting.
+
+The raw backend also retains the last native Win32 failure. A whole-device
+`EIO` from the library is therefore followed by the underlying operation and
+Windows error code/message, rather than collapsing useful host-policy failures
+into an anonymous `-37`.

@@ -17,6 +17,19 @@ extern "C" {
 #define FAUXFAT_NAME_MAX           15u
 #define FAUXFAT_CLUSTER_AUTO       UINT32_MAX
 
+typedef enum fauxfat_private_reservation {
+    /* Canonical mode: allocation bitmap set + FAT bad-cluster markers. */
+    FAUXFAT_PRIVATE_BAD_CLUSTERS = 0,
+
+    /*
+     * Qualification experiment: one hidden/system/read-only file named "."
+     * owns every non-public data cluster through a normal FAT chain.  The
+     * chain may jump across public-file extents.  This deliberately exercises
+     * host handling of a namespace-special name and is not yet canonical.
+     */
+    FAUXFAT_PRIVATE_DOT_FILE = 1
+} fauxfat_private_reservation;
+
 /* One host-visible file. File data itself is owned by the callback backend. */
 typedef struct fauxfat_file {
     /* 1..15 ISO-8859-1 bytes, excluding exFAT-forbidden characters. */
@@ -101,6 +114,8 @@ typedef struct fauxfat_config {
      * extent. A larger value creates an anonymous opaque tail reservation.
      */
     uint32_t data_cluster_count;
+
+    fauxfat_private_reservation private_reservation;
 
     /*
      * Payload storage backend. read is required when either table is nonempty;
@@ -220,6 +235,7 @@ typedef struct fauxfat_reopen_info {
     uint32_t root_cluster;
     uint8_t volume_guid[16];
     char volume_label[12];
+    fauxfat_private_reservation private_reservation;
     unsigned flags;
 } fauxfat_reopen_info;
 
