@@ -843,10 +843,20 @@ fauxfat-qualify.exe verify-raw \\.\\PhysicalDrive7
 ```
 
 `format-raw` accepts only the exact `\\.\\PhysicalDriveN` spelling and refuses
-to run without the literal `--destroy-user-data` option. It does not lock or
-dismount existing Windows volumes on the target; Windows may therefore reject
-writes to an in-use disk, which is preferable to this test utility quietly
-becoming `diskpart` with worse judgment. After direct GPT writes it issues
-`IOCTL_DISK_UPDATE_PROPERTIES` so Windows invalidates its cached partition map.
-The fauxFAT library's own `DESTROY_USER_DATA` flag is also set; partition 2's
-body is still never written by fauxFAT/GPT formatting.
+to run without the literal `--destroy-user-data` option. Before issuing any raw
+writes it enumerates Windows volumes, identifies every volume with an extent on
+the target physical disk, and acquires `FSCTL_LOCK_VOLUME` on all of them. If
+any target volume cannot be locked, formatting is refused before the first
+mutation rather than forcing a dismount underneath an application with an open
+file. After formatting, the locked old volumes are dismounted/unlocked and the
+tool issues `IOCTL_DISK_UPDATE_PROPERTIES` so Windows invalidates its cached
+partition map. This is required on Vista and later because Windows rejects raw
+disk writes that overlap a mounted filesystem unless the corresponding volume
+has been locked or dismounted. The fauxFAT library's own
+`DESTROY_USER_DATA` flag is also set; partition 2's body is still never written
+by fauxFAT/GPT formatting.
+
+The raw backend also retains the last native Win32 failure. A whole-device
+`EIO` from the library is therefore followed by the underlying operation and
+Windows error code/message, rather than collapsing useful host-policy failures
+into an anonymous `-37`.
