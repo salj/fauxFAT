@@ -10,12 +10,11 @@
 #define FF_FILE_SLOT_FIRST    4u
 #define FF_PUBLIC_ENTRY_COUNT 5u
 #define FF_OPAQUE_ENTRY_COUNT 5u
-#define FF_DOT_ENTRY_COUNT    3u
 #define FF_FAT_EOC            0xffffffffu
 #define FF_MAX_CLUSTER_COUNT  0xfffffff5u
 
-#define FF_OEM_FLAG_DOT_FILE 0x0001u
-#define FF_OEM_KNOWN_FLAGS   FF_OEM_FLAG_DOT_FILE
+#define FF_OEM_FLAG_BENIGN_RESERVE 0x0001u
+#define FF_OEM_KNOWN_FLAGS         FF_OEM_FLAG_BENIGN_RESERVE
 
 #define FF_XXH32_PRIME1 0x9e3779b1u
 #define FF_XXH32_PRIME2 0x85ebca77u
@@ -29,16 +28,17 @@
 #define FF_XXH32_ROOT_SEED   0x524f4f54u /* "ROOT" */
 #define FF_XXH32_UPCASE_SEED 0x55504331u /* "UPC1" */
 
-#define FF_ENTRY_BITMAP       0x81u
-#define FF_ENTRY_UPCASE       0x82u
-#define FF_ENTRY_LABEL        0x83u
-#define FF_ENTRY_FILE         0x85u
-#define FF_ENTRY_GUID         0xa0u
-#define FF_ENTRY_PAD          0xa1u
-#define FF_ENTRY_STREAM       0xc0u
-#define FF_ENTRY_NAME         0xc1u
-#define FF_ENTRY_VENDOR_EXT   0xe0u
-#define FF_ENTRY_VENDOR_ALLOC 0xe1u
+#define FF_ENTRY_BITMAP          0x81u
+#define FF_ENTRY_UPCASE          0x82u
+#define FF_ENTRY_LABEL           0x83u
+#define FF_ENTRY_FILE            0x85u
+#define FF_ENTRY_GUID            0xa0u
+#define FF_ENTRY_PAD             0xa1u
+#define FF_ENTRY_PRIVATE_RESERVE 0xbfu
+#define FF_ENTRY_STREAM          0xc0u
+#define FF_ENTRY_NAME            0xc1u
+#define FF_ENTRY_VENDOR_EXT      0xe0u
+#define FF_ENTRY_VENDOR_ALLOC    0xe1u
 
 #define FF_ENTRY_IN_USE    0x80u
 #define FF_ENTRY_SECONDARY 0x40u
@@ -61,6 +61,10 @@ static const uint8_t ff_oem_map_guid[16] = {
 static const uint8_t ff_oem_epoch_guid[16] = {
     0xdb, 0x83, 0x72, 0x8b, 0xea, 0xb9, 0xdb, 0x4a,
     0xa3, 0x27, 0x9b, 0x59, 0x73, 0x63, 0x47, 0x9b
+};
+
+static const uint8_t ff_private_reserve_magic[8] = {
+    'F', 'A', 'U', 'X', 'R', 'S', 'V', '1'
 };
 
 static const uint8_t ff_opaque_meta_guid[16] = {
@@ -714,54 +718,80 @@ static int ff_data_cluster_is_public(const fauxfat_view *v,
     return 0;
 }
 
-static uint64_t ff_private_cluster_count(const fauxfat_view *v)
+static void ff_data_extent(const fauxfat_view *v, size_t index,
+                           uint64_t *first, uint64_t *end)
 {
-    uint64_t count = ff_data_cluster_count(v);
+    if (index < v->config->file_count) {
+        *first = ff_file_data_cluster(v, index);
+        *end   = *first + ff_file_clusters(&v->config->files[index]);
+    } else {
+        size_t oi = index - v->config->file_count;
+        *first    = ff_opaque_data_cluster(v, oi);
+        *end      = *first + ff_opaque_clusters(&v->config->opaque_files[oi]);
+    }
+}
+
+static size_t ff_anonymous_private_run_count(const fauxfat_view *v)
+{
+    size_t extent_count = v->config->file_count + v->config->opaque_file_count;
+    uint64_t cursor     = 0u;
+    uint64_t data_count = ff_data_cluster_count(v);
+    size_t count        = 0u;
     size_t i;
 
-    for (i = 0u; i < v->config->file_count; ++i)
-        count -= ff_file_clusters(&v->config->files[i]);
+    for (i = 0u; i < extent_count; ++i) {
+        uint64_t first;
+        uint64_t end;
+
+        ff_data_extent(v, i, &first, &end);
+        if (cursor < first)
+            ++count;
+        cursor = end;
+    }
+    if (cursor < data_count)
+        ++count;
     return count;
 }
 
-static uint64_t ff_first_private_data_cluster(const fauxfat_view *v)
+static int ff_anonymous_private_run(const fauxfat_view *v, size_t ordinal,
+                                    uint64_t *first_out,
+                                    uint64_t *count_out)
 {
-    uint64_t cluster = 0u;
+    size_t extent_count = v->config->file_count + v->config->opaque_file_count;
+    uint64_t cursor     = 0u;
+    uint64_t data_count = ff_data_cluster_count(v);
+    size_t run          = 0u;
     size_t i;
 
-    for (i = 0u; i < v->config->file_count; ++i) {
-        uint64_t first = ff_file_data_cluster(v, i);
-        uint64_t end   = first + ff_file_clusters(&v->config->files[i]);
+    for (i = 0u; i < extent_count; ++i) {
+        uint64_t first;
+        uint64_t end;
 
-        if (cluster < first)
-            break;
-        if (cluster < end)
-            cluster = end;
+        ff_data_extent(v, i, &first, &end);
+        if (cursor < first) {
+            if (run == ordinal) {
+                *first_out = cursor;
+                *count_out = first - cursor;
+                return 1;
+            }
+            ++run;
+        }
+        cursor = end;
     }
-    return cluster;
-}
-
-static uint64_t ff_next_private_data_cluster(const fauxfat_view *v,
-                                             uint64_t data_cluster)
-{
-    uint64_t cluster = data_cluster + 1u;
-    size_t i;
-
-    for (i = 0u; i < v->config->file_count; ++i) {
-        uint64_t first = ff_file_data_cluster(v, i);
-        uint64_t end   = first + ff_file_clusters(&v->config->files[i]);
-
-        if (cluster < first)
-            break;
-        if (cluster < end)
-            cluster = end;
+    if (cursor < data_count && run == ordinal) {
+        *first_out = cursor;
+        *count_out = data_count - cursor;
+        return 1;
     }
-    return cluster;
+    return 0;
 }
 
 static uint16_t ff_oem_flags(const fauxfat_view *v)
 {
-    return v->config->private_reservation == FAUXFAT_PRIVATE_DOT_FILE ? FF_OEM_FLAG_DOT_FILE : 0u;
+    return v->config->private_reservation ==
+                   FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD
+               ? FF_OEM_FLAG_BENIGN_RESERVE
+               : 0u;
 }
 
 static uint32_t ff_fat_entry(const fauxfat_view *v, uint32_t entry)
@@ -788,13 +818,6 @@ static uint32_t ff_fat_entry(const fauxfat_view *v, uint32_t entry)
     if (ff_data_cluster_is_public(v, data_cluster))
         /* NoFatChain payload: FAT contents are invalid; zero is canonical. */
         return 0u;
-
-    if (v->config->private_reservation == FAUXFAT_PRIVATE_DOT_FILE) {
-        uint64_t next = ff_next_private_data_cluster(v, data_cluster);
-        if (next >= ff_data_cluster_count(v))
-            return FF_FAT_EOC;
-        return (uint32_t)((uint64_t)v->data_first_cluster + next);
-    }
 
     /* Opaque descriptors, explicit holes and tail reserve are blockers. */
     return 0xfffffff7u;
@@ -1037,37 +1060,31 @@ static void ff_make_opaque_file_set(const fauxfat_view *v,
     faux_store_le16(file_ent + 2, ff_entry_set_checksum(set, 160));
 }
 
-static void ff_make_dot_blocker_set(const fauxfat_view *v, uint8_t set[96])
+static void ff_make_private_reserve_entry(const fauxfat_view *v,
+                                          size_t ordinal,
+                                          uint8_t out[32])
 {
-    uint8_t *file_ent         = set;
-    uint8_t *stream_ent       = set + 32u;
-    uint8_t *name_ent         = set + 64u;
-    uint64_t private_clusters = ff_private_cluster_count(v);
-    uint64_t first            = ff_first_private_data_cluster(v);
-    uint64_t data_length      = private_clusters * FAUXFAT_CLUSTER_SIZE;
+    uint64_t first   = 0u;
+    uint64_t count   = 0u;
+    size_t run_count = ff_anonymous_private_run_count(v);
 
-    memset(set, 0, 96u);
-
-    file_ent[0] = FF_ENTRY_FILE;
-    file_ent[1] = 2u;
-    faux_store_le16(file_ent + 4u,
-                    FF_ATTR_READONLY | FF_ATTR_HIDDEN | FF_ATTR_SYSTEM);
-    ff_store_file_times(file_ent, (time_t)FF_UNIX_1980);
-
-    /* AllocationPossible, deliberately FAT-chained (NoFatChain clear). */
-    stream_ent[0] = FF_ENTRY_STREAM;
-    stream_ent[1] = 0x01u;
-    stream_ent[3] = 1u;
-    faux_store_le16(stream_ent + 4u, ff_name_hash("."));
-    /* ValidDataLength remains zero: own the clusters without exposing bytes. */
-    faux_store_le32(stream_ent + 20u,
+    if (!ff_anonymous_private_run(v, ordinal, &first, &count)) {
+        memset(out, 0, 32u);
+        return;
+    }
+    memset(out, 0, 32u);
+    out[0] = FF_ENTRY_PRIVATE_RESERVE;
+    out[1] = 0u;
+    /* Generic Primary: AllocationPossible | NoFatChain. */
+    faux_store_le16(out + 4u, 0x0003u);
+    memcpy(out + 6u, ff_private_reserve_magic,
+           sizeof(ff_private_reserve_magic));
+    faux_store_le32(out + 14u, (uint32_t)ordinal);
+    faux_store_le16(out + 18u, (uint16_t)run_count);
+    faux_store_le32(out + 20u,
                     (uint32_t)((uint64_t)v->data_first_cluster + first));
-    faux_store_le64(stream_ent + 24u, data_length);
-
-    name_ent[0] = FF_ENTRY_NAME;
-    faux_store_le16(name_ent + 2u, '.');
-
-    faux_store_le16(file_ent + 2u, ff_entry_set_checksum(set, 96u));
+    faux_store_le64(out + 24u, count * FAUXFAT_CLUSTER_SIZE);
+    faux_store_le16(out + 2u, ff_entry_set_checksum(out, 32u));
 }
 
 static void ff_make_root_entry(const fauxfat_view *v,
@@ -1083,7 +1100,7 @@ static void ff_make_root_entry(const fauxfat_view *v,
                           (uint32_t)(cfg->opaque_file_count * FF_OPAQUE_ENTRY_COUNT);
     uint32_t blocker_first = opaque_end;
     uint32_t blocker_end   = blocker_first +
-                           (cfg->private_reservation == FAUXFAT_PRIVATE_DOT_FILE ? FF_DOT_ENTRY_COUNT : 0u);
+                           (cfg->private_reservation == FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD ? (uint32_t)ff_anonymous_private_run_count(v) : 0u);
 
     memset(out, 0, 32);
 
@@ -1145,11 +1162,7 @@ static void ff_make_root_entry(const fauxfat_view *v,
     }
 
     if (entry_index >= blocker_first && entry_index < blocker_end) {
-        uint8_t set[96];
-        unsigned member = entry_index - blocker_first;
-
-        ff_make_dot_blocker_set(v, set);
-        memcpy(out, set + member * 32u, 32u);
+        ff_make_private_reserve_entry(v, entry_index - blocker_first, out);
         return;
     }
 
@@ -1540,7 +1553,6 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
 {
     uint64_t cursor = 0u;
     uint64_t data_clusters;
-    uint64_t public_clusters = 0u;
     uint32_t bitmap_clusters = 1u;
     uint64_t clusters64;
     uint64_t fat_bytes;
@@ -1556,15 +1568,15 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
         cfg->file_count > FAUXFAT_MAX_FILES ||
         cfg->opaque_file_count > FAUXFAT_MAX_OPAQUE_FILES ||
         (cfg->private_reservation != FAUXFAT_PRIVATE_BAD_CLUSTERS &&
-         cfg->private_reservation != FAUXFAT_PRIVATE_DOT_FILE) ||
+         cfg->private_reservation !=
+             FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD) ||
         faux_guid_is_zero(cfg->volume_guid) ||
         !ff_label_valid(cfg->volume_label, &dummy))
         return FAUXFAT_EINVAL;
 
     root_entries = FF_FILE_SLOT_FIRST +
                    (uint64_t)cfg->file_count * FF_PUBLIC_ENTRY_COUNT +
-                   (uint64_t)cfg->opaque_file_count * FF_OPAQUE_ENTRY_COUNT +
-                   (cfg->private_reservation == FAUXFAT_PRIVATE_DOT_FILE ? FF_DOT_ENTRY_COUNT : 0u);
+                   (uint64_t)cfg->opaque_file_count * FF_OPAQUE_ENTRY_COUNT;
     if (root_entries > FF_ROOT_ENTRIES)
         return FAUXFAT_EGEOMETRY;
 
@@ -1587,8 +1599,7 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
         }
 
         nclusters = ff_file_clusters(f);
-        public_clusters += nclusters;
-        first = f->data_cluster == FAUXFAT_CLUSTER_AUTO ? cursor : f->data_cluster;
+        first     = f->data_cluster == FAUXFAT_CLUSTER_AUTO ? cursor : f->data_cluster;
         if (first < cursor || nclusters > FF_MAX_CLUSTER_COUNT ||
             first > FF_MAX_CLUSTER_COUNT ||
             nclusters > FF_MAX_CLUSTER_COUNT - first)
@@ -1628,9 +1639,6 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
     data_clusters = cfg->data_cluster_count ? cfg->data_cluster_count : cursor;
     if (data_clusters < cursor || data_clusters > FF_MAX_CLUSTER_COUNT)
         return FAUXFAT_EGEOMETRY;
-    if (cfg->private_reservation == FAUXFAT_PRIVATE_DOT_FILE &&
-        data_clusters == public_clusters)
-        return FAUXFAT_EGEOMETRY;
 
     for (;;) {
         uint64_t bitmap_bytes;
@@ -1654,6 +1662,13 @@ int fauxfat_init(fauxfat_view *v, const fauxfat_config *cfg)
     v->root_cluster       = v->upcase_cluster + 1u;
     v->data_first_cluster = v->root_cluster + 1u;
     v->cluster_count      = (uint32_t)clusters64;
+
+    if (cfg->private_reservation == FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD) {
+        root_entries += ff_anonymous_private_run_count(v);
+        if (root_entries > FF_ROOT_ENTRIES ||
+            ff_anonymous_private_run_count(v) > UINT16_MAX)
+            return FAUXFAT_EGEOMETRY;
+    }
 
     fat_bytes = ((uint64_t)v->cluster_count + 2u) * 4u;
     if (fat_bytes > UINT32_MAX * (uint64_t)FAUXFAT_BLOCK_SIZE)
@@ -2424,45 +2439,43 @@ static int ff_parse_opaque_set_loose(const fauxfat_view *v,
     return ff_parse_opaque_set_common(v, set, NULL, d, end_cluster);
 }
 
-static int ff_dot_blocker_set_valid(const fauxfat_view *v,
-                                    const uint8_t set[96])
+static int ff_private_reserve_entry_valid(const fauxfat_view *v,
+                                          size_t ordinal,
+                                          const uint8_t entry[32],
+                                          uint16_t *run_count_out,
+                                          uint64_t *end_cluster_out)
 {
-    const uint8_t *file_ent = set;
-    const uint8_t *stream   = set + 32u;
-    const uint8_t *name_ent = set + 64u;
-    uint16_t attrs;
+    uint16_t run_count;
     uint32_t first_cluster;
     uint64_t data_length;
     uint64_t clusters;
+    uint64_t end_cluster;
 
-    if (file_ent[0] != FF_ENTRY_FILE || file_ent[1] != 2u ||
-        faux_load_le16(file_ent + 2u) != ff_entry_set_checksum(set, 96u))
-        return 0;
-    attrs = faux_load_le16(file_ent + 4u);
-    if ((attrs & (uint16_t)~FF_ATTR_ARCHIVE) !=
-        (FF_ATTR_READONLY | FF_ATTR_HIDDEN | FF_ATTR_SYSTEM))
-        return 0;
-
-    if (stream[0] != FF_ENTRY_STREAM || stream[1] != 0x01u ||
-        stream[2] != 0u || stream[3] != 1u ||
-        faux_load_le16(stream + 4u) != ff_name_hash(".") ||
-        !ff_all_zero(stream + 6u, 14u) ||
-        faux_load_le64(stream + 8u) != 0u)
-        return 0;
-    if (name_ent[0] != FF_ENTRY_NAME || name_ent[1] != 0u ||
-        faux_load_le16(name_ent + 2u) != '.' ||
-        !ff_all_zero(name_ent + 4u, 28u))
+    if (entry[0] != FF_ENTRY_PRIVATE_RESERVE || entry[1] != 0u ||
+        faux_load_le16(entry + 2u) != ff_entry_set_checksum(entry, 32u) ||
+        faux_load_le16(entry + 4u) != 0x0003u ||
+        memcmp(entry + 6u, ff_private_reserve_magic,
+               sizeof(ff_private_reserve_magic)) != 0 ||
+        faux_load_le32(entry + 14u) != (uint32_t)ordinal)
         return 0;
 
-    first_cluster = faux_load_le32(stream + 20u);
-    data_length   = faux_load_le64(stream + 24u);
-    if (first_cluster < v->data_first_cluster ||
-        first_cluster > v->cluster_count + 1u ||
+    run_count     = faux_load_le16(entry + 18u);
+    first_cluster = faux_load_le32(entry + 20u);
+    data_length   = faux_load_le64(entry + 24u);
+    if (run_count == 0u || ordinal >= run_count ||
+        first_cluster < v->data_first_cluster ||
         data_length == 0u ||
         (data_length % FAUXFAT_CLUSTER_SIZE) != 0u)
         return 0;
-    clusters = data_length / FAUXFAT_CLUSTER_SIZE;
-    return clusters <= ff_data_cluster_count(v);
+    clusters    = data_length / FAUXFAT_CLUSTER_SIZE;
+    end_cluster = (uint64_t)first_cluster + clusters;
+    if (end_cluster > (uint64_t)v->cluster_count + 2u)
+        return 0;
+    if (run_count_out)
+        *run_count_out = run_count;
+    if (end_cluster_out)
+        *end_cluster_out = end_cluster;
+    return 1;
 }
 
 static int ff_parse_regular_set_loose(const fauxfat_view *v,
@@ -2661,11 +2674,14 @@ int fauxfat_parse_root_strict(const fauxfat_view *v,
     ff_root_reader r;
     uint64_t root_first_block;
     uint64_t previous_end_cluster;
-    uint32_t entry            = FF_FILE_SLOT_FIRST;
-    uint32_t public_end_entry = FF_FILE_SLOT_FIRST;
-    unsigned public_count     = 0u;
-    unsigned opaque_count     = 0u;
-    unsigned descriptor_index = 0u;
+    uint32_t entry               = FF_FILE_SLOT_FIRST;
+    uint32_t public_end_entry    = FF_FILE_SLOT_FIRST;
+    unsigned public_count        = 0u;
+    unsigned opaque_count        = 0u;
+    unsigned blocker_count       = 0u;
+    uint16_t blocker_total       = 0u;
+    uint64_t blocker_end_cluster = 0u;
+    unsigned descriptor_index    = 0u;
 
     enum {
         FF_ROOT_PUBLIC,
@@ -2697,6 +2713,28 @@ int fauxfat_parse_root_strict(const fauxfat_view *v,
                 !ff_all_zero(first + 4, 28u))
                 return FAUXFAT_ESTRUCTURE;
             phase = FF_ROOT_PADDING;
+            ++entry;
+            continue;
+        }
+
+        if (first[0] == FF_ENTRY_PRIVATE_RESERVE &&
+            v->config->private_reservation ==
+                FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD) {
+            uint16_t total;
+            uint64_t end_cluster;
+            uint32_t first_cluster = faux_load_le32(first + 20u);
+
+            if (phase == FF_ROOT_PADDING ||
+                !ff_private_reserve_entry_valid(v, blocker_count, first,
+                                                &total, &end_cluster) ||
+                (blocker_count != 0u && total != blocker_total) ||
+                (blocker_count != 0u &&
+                 (uint64_t)first_cluster < blocker_end_cluster))
+                return FAUXFAT_ESTRUCTURE;
+            blocker_total       = total;
+            blocker_end_cluster = end_cluster;
+            phase               = FF_ROOT_BLOCKER;
+            ++blocker_count;
             ++entry;
             continue;
         }
@@ -2794,26 +2832,14 @@ int fauxfat_parse_root_strict(const fauxfat_view *v,
             }
         }
 
-        if (first[1] == 2u &&
-            v->config->private_reservation == FAUXFAT_PRIVATE_DOT_FILE) {
-            uint8_t set[96];
-
-            if (entry > FF_ROOT_ENTRIES - FF_DOT_ENTRY_COUNT)
-                return FAUXFAT_ESTRUCTURE;
-            rc = ff_root_set(&r, entry, FF_DOT_ENTRY_COUNT, set);
-            if (rc != FAUXFAT_OK)
-                return rc;
-            if (!ff_dot_blocker_set_valid(v, set))
-                return FAUXFAT_ESTRUCTURE;
-            phase = FF_ROOT_BLOCKER;
-            entry += FF_DOT_ENTRY_COUNT;
-            continue;
-        }
-
         return FAUXFAT_ESTRUCTURE;
     }
 
     if (public_count > FAUXFAT_MAX_FILES || opaque_count > FAUXFAT_MAX_OPAQUE_FILES)
+        return FAUXFAT_ESTRUCTURE;
+    if (v->config->private_reservation ==
+            FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD &&
+        blocker_count != blocker_total)
         return FAUXFAT_ESTRUCTURE;
     if (descriptor_count)
         *descriptor_count = descriptor_index;
@@ -3655,12 +3681,15 @@ static int ff_reopen_public_next(const fauxfat_view *v,
         c->have = 0;
         return 0;
     }
-    if (first[0] == FF_ENTRY_FILE && first[1] == 2u &&
-        v->config->private_reservation == FAUXFAT_PRIVATE_DOT_FILE) {
+
+    if (first[0] == FF_ENTRY_PRIVATE_RESERVE &&
+        v->config->private_reservation ==
+            FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD) {
         c->done = 1;
         c->have = 0;
         return 0;
     }
+
     if (first[0] != FF_ENTRY_FILE || first[1] != 4u ||
         c->entry > FF_ROOT_ENTRIES - 5u)
         return FAUXFAT_ESTRUCTURE;
@@ -3690,30 +3719,6 @@ static int ff_reopen_public_next(const fauxfat_view *v,
     }
 
     return FAUXFAT_ESTRUCTURE;
-}
-
-static int ff_reopen_dot_next_private(const fauxfat_view *v,
-                                      const ff_reopen_public_cursor *cursor,
-                                      uint32_t entry,
-                                      uint32_t *value)
-{
-    ff_reopen_public_cursor look = *cursor;
-    uint64_t candidate           = (uint64_t)entry + 1u;
-    uint64_t limit               = (uint64_t)v->cluster_count + 2u;
-    int rc;
-
-    while (look.have) {
-        if (candidate < look.first_cluster)
-            break;
-        if (candidate < look.end_cluster)
-            candidate = look.end_cluster;
-        rc = ff_reopen_public_next(v, &look);
-        if (rc < 0)
-            return rc;
-    }
-
-    *value = candidate >= limit ? FF_FAT_EOC : (uint32_t)candidate;
-    return FAUXFAT_OK;
 }
 
 static uint32_t ff_reopen_fixed_fat_entry(const fauxfat_view *v,
@@ -3785,14 +3790,8 @@ static int ff_reopen_verify_fat(const fauxfat_view *v,
                 if (cursor.have && e >= cursor.first_cluster &&
                     e < cursor.end_cluster)
                     value = 0u;
-                else if (v->config->private_reservation ==
-                         FAUXFAT_PRIVATE_DOT_FILE) {
-                    rc = ff_reopen_dot_next_private(v, &cursor, e, &value);
-                    if (rc != FAUXFAT_OK)
-                        return rc;
-                } else {
+                else
                     value = 0xfffffff7u;
-                }
             }
             faux_store_le32(expected + 4u * i, value);
         }
@@ -3914,7 +3913,7 @@ int fauxfat_reopen_probe(const fauxfat_device *device,
     if (recognized) {
         uint16_t flags = faux_load_le16(identity_oem + 70u);
         cfg.private_reservation =
-            (flags & FF_OEM_FLAG_DOT_FILE) != 0u ? FAUXFAT_PRIVATE_DOT_FILE : FAUXFAT_PRIVATE_BAD_CLUSTERS;
+            (flags & FF_OEM_FLAG_BENIGN_RESERVE) != 0u ? FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD : FAUXFAT_PRIVATE_BAD_CLUSTERS;
         out->private_reservation = cfg.private_reservation;
         out->structural_epoch    = faux_load_le64(identity_oem + 72u);
     }
@@ -3960,7 +3959,8 @@ static int ff_reopen_view_from_info(const fauxfat_reopen_info *info,
     if (!info || !cfg || !v ||
         (info->flags & FAUXFAT_REOPEN_SCAN_READY) == 0u ||
         (info->private_reservation != FAUXFAT_PRIVATE_BAD_CLUSTERS &&
-         info->private_reservation != FAUXFAT_PRIVATE_DOT_FILE) ||
+         info->private_reservation !=
+             FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD) ||
         info->cluster_count == 0u || info->cluster_count > FF_MAX_CLUSTER_COUNT ||
         info->fat_length_blocks == 0u ||
         (info->fat_length_blocks % FAUXFAT_BLOCKS_PER_CLUSTER) != 0u)

@@ -323,6 +323,22 @@ Anonymous reservations are intentional physical ownership, not free space and no
 
 This lets a schema reserve fixed staging slots, alignment holes, private capacity, and tail reserve without allocating RAM for an extent map. Named opaque state that must be rediscovered after losing the schema still uses the vendor descriptor in section 10.6.
 
+Qualification builds may redundantly describe each anonymous contiguous run
+with one unrecognized benign primary entry of type `0xBF`.  The entry follows
+the Generic Primary template, has `SecondaryCount = 0`, sets
+`AllocationPossible | NoFatChain`, and stores the run in
+`FirstCluster/DataLength`.  Its `CustomDefined` bytes contain the fauxFAT
+`FAUXRSV1` signature plus run ordinal/count.  The same clusters still carry
+the canonical `0xFFFFFFF7` FAT markers.  This is not contradictory: with
+`NoFatChain = 1`, the FAT entries associated with that primary allocation are
+semantically invalid and are not interpreted as its cluster chain.
+
+Only anonymous gaps/tail receive these experimental owners.  Named opaque
+ranges already have a `NoFatChain` Vendor Allocation owner and therefore are
+not deliberately cross-linked to a second allocation record.  The redundant
+primary mode exists solely for host qualification and is not yet the canonical
+format contract.
+
 ## 9. Root directory layout
 
 The root cluster contains exactly 2048 entries of 32 bytes each. No entry is unused and there is no end-of-directory marker.
@@ -336,14 +352,19 @@ entry 2        Volume Label (0x83)
 entry 3        Volume GUID (0xA0)
 then           public file sets, 5 entries each
 then           opaque descriptor sets, 5 entries each
+then           optional qualification-only 0xBF anonymous reserve owners,
+               one entry per contiguous anonymous run
 remainder      one-entry 0xA1 padding records
 ```
 
-The root-entry budget is therefore:
+The canonical root-entry budget is therefore:
 
 ```text
 4 + 5 * public_file_count + 5 * opaque_descriptor_count <= 2048
 ```
+
+The experimental redundant-reserve mode adds `anonymous_run_count` one-entry
+primaries to that budget.
 
 The theoretical maximum is therefore 408 file/descriptor sets in any mixture. Real products use vastly fewer, so spending two extra benign records on stable public-file identity is considerably cheaper than teaching recovery code to guess what a host rename meant.
 

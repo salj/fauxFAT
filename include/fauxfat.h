@@ -22,12 +22,15 @@ typedef enum fauxfat_private_reservation {
     FAUXFAT_PRIVATE_BAD_CLUSTERS = 0,
 
     /*
-     * Qualification experiment: one hidden/system/read-only file named "."
-     * owns every non-public data cluster through a normal FAT chain.  The
-     * chain may jump across public-file extents.  This deliberately exercises
-     * host handling of a namespace-special name and is not yet canonical.
+     * Qualification experiment: anonymous private runs also receive an
+     * unrecognized benign primary allocation owner.  Each owner describes one
+     * contiguous run with NoFatChain while the same clusters retain canonical
+     * FAT 0xFFFFFFF7 bad-cluster markers.  The FAT entries are invalid for the
+     * NoFatChain owner by definition, so the two reservations coexist without
+     * needing a fragmented chain.  Named opaque allocations already have a
+     * Vendor Allocation owner and do not receive a second primary owner.
      */
-    FAUXFAT_PRIVATE_DOT_FILE = 1
+    FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD = 1
 } fauxfat_private_reservation;
 
 /* One host-visible file. File data itself is owned by the callback backend. */
@@ -102,7 +105,9 @@ typedef struct fauxfat_config {
      * but each table entry may request an explicit payload-arena cluster.
      * FAUXFAT_CLUSTER_AUTO packs after the previous extent. Gaps and unused
      * tail clusters are anonymous opaque reservations: bitmap allocated, FAT
-     * 0xFFFFFFF7, never modified by fauxFAT formatting.
+     * 0xFFFFFFF7, never modified by fauxFAT formatting.  Qualification builds
+     * may additionally describe each anonymous run with a benign primary
+     * allocation entry; the bad-cluster markers remain present either way.
      */
     const fauxfat_file *files;
     size_t file_count;

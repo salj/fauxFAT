@@ -288,11 +288,11 @@ static void ffq_usage(FILE *out)
 {
     fprintf(out,
             "usage:\n"
-            "  fauxfat-qualify.exe create-vhdx <file.vhdx> [--size-mib N] [--fauxfat-data-mib N] [--dot-blocker]\n"
+            "  fauxfat-qualify.exe create-vhdx <file.vhdx> [--size-mib N] [--fauxfat-data-mib N] [--benign-reserve]\n"
             "  fauxfat-qualify.exe attach-vhdx <file.vhdx>\n"
             "  fauxfat-qualify.exe detach-vhdx <file.vhdx>\n"
             "  fauxfat-qualify.exe verify-vhdx <file.vhdx>\n"
-            "  fauxfat-qualify.exe format-raw <\\\\.\\PhysicalDriveN> --destroy-user-data [--fauxfat-data-mib N] [--dot-blocker]\n"
+            "  fauxfat-qualify.exe format-raw <\\\\.\\PhysicalDriveN> --destroy-user-data [--fauxfat-data-mib N] [--benign-reserve]\n"
             "  fauxfat-qualify.exe verify-raw <\\\\.\\PhysicalDriveN>\n"
             "\n"
             "create-vhdx creates a dynamic VHDX, formats partition 1 as fauxFAT,\n"
@@ -653,8 +653,9 @@ static int ffq_parse_create_options(int argc, char **argv, int first,
             if (++i >= argc ||
                 ffq_parse_u64(argv[i], &options->fauxfat_data_mib) != 0)
                 return -1;
-        } else if (strcmp(argv[i], "--dot-blocker") == 0) {
-            options->private_reservation = FAUXFAT_PRIVATE_DOT_FILE;
+        } else if (strcmp(argv[i], "--benign-reserve") == 0) {
+            options->private_reservation =
+                FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD;
         } else {
             return -1;
         }
@@ -679,8 +680,9 @@ static int ffq_parse_raw_format_options(int argc, char **argv, int first,
             if (++i >= argc ||
                 ffq_parse_u64(argv[i], &options->fauxfat_data_mib) != 0)
                 return -1;
-        } else if (strcmp(argv[i], "--dot-blocker") == 0) {
-            options->private_reservation = FAUXFAT_PRIVATE_DOT_FILE;
+        } else if (strcmp(argv[i], "--benign-reserve") == 0) {
+            options->private_reservation =
+                FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD;
         } else {
             return -1;
         }
@@ -1171,7 +1173,10 @@ static int ffq_format_raw_device(ffq_raw_device *raw,
     printf("  raw user p2: LBA %" PRIu64 " + %" PRIu64 " blocks\n",
            plan.user_first_lba, plan.user_block_count);
     printf("  private reservation: %s\n",
-           cfg.private_reservation == FAUXFAT_PRIVATE_DOT_FILE ? "FAT-chained hidden '.' blocker (EXPERIMENTAL)" : "bad-cluster markers");
+           cfg.private_reservation ==
+                   FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD
+               ? "bad-cluster markers + benign primary owners (EXPERIMENTAL)"
+               : "bad-cluster markers");
 
     if (ffq_lock_target_volumes(raw, &locks) != 0) {
         fprintf(stderr, "refusing raw format without exclusive access to existing target volumes\n");
@@ -1298,7 +1303,10 @@ static int ffq_verify_raw_device(ffq_raw_device *raw, int require_qualification)
            opened.volume_first_block, opened.volume_blocks,
            opened.fauxfat.volume_serial, opened.fauxfat.structural_epoch);
     printf("private reservation: %s\n",
-           opened.fauxfat.private_reservation == FAUXFAT_PRIVATE_DOT_FILE ? "dot-blocker experiment" : "bad-cluster markers");
+           opened.fauxfat.private_reservation ==
+                   FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD
+               ? "bad-cluster markers + benign primary owners"
+               : "bad-cluster markers");
 
     if (opened.wrapper == FAUXFAT_BLOCK_WRAPPER_GPT) {
         size_t i;

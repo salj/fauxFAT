@@ -1607,10 +1607,11 @@ int main(void)
     }
 
     /*
-     * Qualification-only dot blocker: every non-public data cluster is one
-     * fragmented FAT chain owned by a hidden/system/read-only file named
-     * ".".  The chain jumps across public extents, so arbitrary gaps cost
-     * only the FAT entries we already have.
+     * Qualification-only redundant reservation: anonymous private runs get
+     * one unrecognized benign primary owner each while every non-public data
+     * cluster, including named opaque allocations, remains FAT-bad.  Named
+     * opaque ranges already have their Vendor Allocation owner, so the benign
+     * primaries deliberately cover only otherwise-ownerless gaps and tail.
      */
     {
         fauxfat_file placed_files[] = {
@@ -1631,41 +1632,46 @@ int main(void)
         uint64_t root;
         uint8_t fat[512];
         uint8_t root_block[512];
-        const uint8_t *dot;
+        const uint8_t *reserve;
+        uint32_t data_first;
+        unsigned i;
 
         dcfg.files               = placed_files;
         dcfg.file_count          = 2u;
         dcfg.opaque_files        = &placed_opaque;
         dcfg.opaque_file_count   = 1u;
         dcfg.data_cluster_count  = 10u;
-        dcfg.private_reservation = FAUXFAT_PRIVATE_DOT_FILE;
+        dcfg.private_reservation = FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD;
         assert(fauxfat_init(&dv, &dcfg) == FAUXFAT_OK);
 
         assert(fauxfat_read_block(&dv, 128u, fat) == FAUXFAT_OK);
-        assert(load32(fat + 4u * 5u) == 0u);
-        assert(load32(fat + 4u * 6u) == 0u);
-        assert(load32(fat + 4u * 7u) == 8u);
-        assert(load32(fat + 4u * 8u) == 10u); /* jump over CONFIG.BIN */
-        assert(load32(fat + 4u * 9u) == 0u);
-        assert(load32(fat + 4u * 10u) == 11u);
-        assert(load32(fat + 4u * 11u) == 12u);
-        assert(load32(fat + 4u * 12u) == 13u);
-        assert(load32(fat + 4u * 13u) == 14u);
-        assert(load32(fat + 4u * 14u) == 0xffffffffu);
+        data_first = dv.data_first_cluster;
+        assert(load32(fat + 4u * (data_first + 0u)) == 0u);
+        assert(load32(fat + 4u * (data_first + 1u)) == 0u);
+        assert(load32(fat + 4u * (data_first + 2u)) == 0xfffffff7u);
+        assert(load32(fat + 4u * (data_first + 3u)) == 0xfffffff7u);
+        assert(load32(fat + 4u * (data_first + 4u)) == 0u);
+        assert(load32(fat + 4u * (data_first + 5u)) == 0xfffffff7u);
+        assert(load32(fat + 4u * (data_first + 6u)) == 0xfffffff7u);
+        assert(load32(fat + 4u * (data_first + 7u)) == 0xfffffff7u);
+        assert(load32(fat + 4u * (data_first + 8u)) == 0xfffffff7u);
+        assert(load32(fat + 4u * (data_first + 9u)) == 0xfffffff7u);
 
         root = dv.cluster_heap_block +
                (uint64_t)(dv.root_cluster - 2u) * FAUXFAT_BLOCKS_PER_CLUSTER;
         assert(fauxfat_read_block(&dv, root + 1u, root_block) == FAUXFAT_OK);
-        dot = root_block + 3u * 32u; /* root entry 19 */
-        assert(dot[0] == 0x85u && dot[1] == 2u);
-        assert(load16(dot + 4u) == 0x0007u);
-        assert(dot[32u] == 0xc0u && dot[33u] == 0x01u);
-        assert(dot[35u] == 1u);
-        assert(load64(dot + 40u) == 0u); /* ValidDataLength */
-        assert(load32(dot + 52u) == 7u);
-        assert(load64(dot + 56u) == 7u * FAUXFAT_CLUSTER_SIZE);
-        assert(dot[64u] == 0xc1u && load16(dot + 66u) == '.');
-        assert(load16(dot + 2u) == entry_set_checksum(dot, 96u));
+        for (i = 0u; i < 3u; ++i) {
+            static const uint32_t firsts[] = { 2u, 5u, 8u };
+            reserve                        = root_block + (3u + i) * 32u; /* root entries 19..21 */
+            assert(reserve[0] == 0xbfu && reserve[1] == 0u);
+            assert(load16(reserve + 2u) == entry_set_checksum(reserve, 32u));
+            assert(load16(reserve + 4u) == 0x0003u);
+            assert(memcmp(reserve + 6u, "FAUXRSV1", 8u) == 0);
+            assert(load32(reserve + 14u) == i);
+            assert(load16(reserve + 18u) == 3u);
+            assert(load32(reserve + 20u) == data_first + firsts[i]);
+            assert(load64(reserve + 24u) == 2u * FAUXFAT_CLUSTER_SIZE);
+        }
 
         memset(&ddev, 0, sizeof(ddev));
         ddev.read    = view_dev_read;
@@ -1678,15 +1684,9 @@ int main(void)
         assert(fauxfat_reopen(&ddev, collect_file, &got, &count, &vc, &ri) ==
                FAUXFAT_OK);
         assert(vc == FAUXFAT_VOLUME_FAUXFAT_VALID);
-        assert(ri.private_reservation == FAUXFAT_PRIVATE_DOT_FILE);
-        assert(count == 3u && got.count == 3u); /* blocker is not a payload */
-
-        /* A dot owner with nothing to own is nonsensical. */
-        dcfg.opaque_files            = NULL;
-        dcfg.opaque_file_count       = 0u;
-        dcfg.data_cluster_count      = 3u;
-        placed_files[1].data_cluster = 2u;
-        assert(fauxfat_init(&dv, &dcfg) == FAUXFAT_EGEOMETRY);
+        assert(ri.private_reservation ==
+               FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD);
+        assert(count == 3u && got.count == 3u); /* reserve owners aren't payloads */
     }
 
     /*

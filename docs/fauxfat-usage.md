@@ -824,18 +824,21 @@ lifetime. Partition 1 is labelled `FAUXQUAL` and contains one fixed 8 MiB
 filesystem. Windows can therefore mount/mutate partition 1 and the operator can
 format partition 2 with normal host tooling before running `verify-vhdx` again.
 
-For one deliberately non-canonical allocator experiment, `create-vhdx` and
-`format-raw` also accept `--dot-blocker`.  Instead of marking every non-public
-data cluster `0xFFFFFFF7`, fauxFAT emits one hidden/system/read-only regular file
-whose literal exFAT name is `.`.  Its stream is FAT-chained rather than
-`NoFatChain`: every otherwise-private cluster points to the next private cluster,
-skipping across public-file extents.  `ValidDataLength` is zero while
-`DataLength` covers the full chained allocation.  This costs no extra cluster
-storage and only changes FAT entries that already exist.  The point is purely
-to ask real host implementations whether a namespace-special `.` entry can own
-the allocation without being normally listable and without `chkdsk` treating it
-as lost space.  Bad-cluster reservation remains canonical until that experiment
-earns promotion.
+For one deliberately redundant allocator experiment, `create-vhdx` and
+`format-raw` also accept `--benign-reserve`.  Canonical `0xFFFFFFF7` FAT
+bad-cluster markers remain in place.  In addition, each otherwise-ownerless
+contiguous gap/tail run gets one unrecognized benign primary (`0xBF`) with
+`AllocationPossible | NoFatChain`, a fauxFAT signature, and the run's
+`FirstCluster/DataLength`.  Named opaque ranges are excluded because their
+Vendor Allocation secondary already supplies a standard allocation owner.
+
+This is intentionally belt-and-suspenders qualification: a host which ignores
+unknown benign primaries should still respect the bad-cluster map, while a host
+which preserves the generic primary allocation has an ordinary non-listable
+owner explaining the bitmap allocation.  Because `NoFatChain` is set, the FAT
+contents for that owner are semantically invalid and may simultaneously contain
+the bad-cluster markers.  The mode is experimental until Windows, Linux, and
+macOS normal mount/repair paths stop finding inventive reasons to object.
 
 `verify-vhdx` reuses an existing attachment when possible; otherwise it makes a
 temporary read-only/no-drive-letter attachment. It opens the resulting
