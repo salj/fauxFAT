@@ -1,15 +1,19 @@
 CC ?= cc
 CFLAGS ?= -O2 -std=c99 -Wall -Wextra -Werror -pedantic
 CPPFLAGS ?= -Iinclude
+CPPFLAGS += -Ilib/xxh32/include -DXXH_NAMESPACE=fauxfat_xxh32_
 ZIG ?= zig
 WINDOWS_TARGET ?= x86_64-windows-gnu
 WINDOWS_TOOL ?= build/fauxfat-qualify.exe
 CLANG_FORMAT ?= clang-format-20
 
-FAUXFAT_SOURCES := src/fauxfat.c
+# FauxFAT needs the streaming API; keep the other vendor sources standalone.
+XXH32_SOURCES := lib/xxh32/src/xxh32_stream.c
+XXH32_HEADERS := lib/xxh32/include/xxhash.h lib/xxh32/src/xxh32_internal.h
+FAUXFAT_SOURCES := src/fauxfat.c $(XXH32_SOURCES)
 FAUXGPT_SOURCES := src/fauxgpt.c
 BLOCK_SOURCES := $(FAUXFAT_SOURCES) $(FAUXGPT_SOURCES) src/fauxfat_block.c
-INTERNAL_HEADERS := src/fauxbytes.h
+INTERNAL_HEADERS := src/fauxbytes.h $(XXH32_HEADERS)
 STORAGE_HEADERS := include/fauxfat.h include/fauxgpt.h include/fauxfat_block.h $(INTERNAL_HEADERS)
 FORMAT_FILES := $(wildcard src/*.[ch] src/*.cc src/*.cpp src/*.cxx src/*.hh src/*.hpp src/*.hxx \
 	include/*.[ch] include/*.cc include/*.cpp include/*.cxx include/*.hh include/*.hpp include/*.hxx \

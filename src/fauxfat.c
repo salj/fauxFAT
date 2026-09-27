@@ -1,6 +1,9 @@
 #include "fauxfat.h"
 #include "fauxbytes.h"
 
+#define XXH_STATIC_LINKING_ONLY
+#include <xxhash.h>
+
 #include <limits.h>
 #include <string.h>
 
@@ -15,12 +18,6 @@
 
 #define FF_OEM_FLAG_BENIGN_RESERVE 0x0001u
 #define FF_OEM_KNOWN_FLAGS         FF_OEM_FLAG_BENIGN_RESERVE
-
-#define FF_XXH32_PRIME1 0x9e3779b1u
-#define FF_XXH32_PRIME2 0x85ebca77u
-#define FF_XXH32_PRIME3 0xc2b2ae3du
-#define FF_XXH32_PRIME4 0x27d4eb2fu
-#define FF_XXH32_PRIME5 0x165667b1u
 
 #define FF_XXH32_MAP_SEED    0x00000000u
 #define FF_XXH32_FAT_SEED    0x46415431u /* "FAT1" */
@@ -92,11 +89,6 @@ static const uint8_t ff_public_name_guid1[16] = {
     0x0e, 0x4a, 0xb1, 0x58, 0x9c, 0x89, 0x34, 0x47,
     0xb3, 0xe1, 0x5a, 0x71, 0x7d, 0x0a, 0x2f, 0xcc
 };
-
-static uint32_t ff_rol32(uint32_t v, unsigned n)
-{
-    return (v << n) | (v >> (32u - n));
-}
 
 static uint16_t ff_ror16(uint16_t v)
 {
@@ -460,113 +452,22 @@ static uint16_t ff_entry_set_checksum(const uint8_t *p, size_t bytes)
     return sum;
 }
 
-/*
- * Streaming XXH32.  fauxFAT uses this only for its private structural seal;
- * exFAT's mandated boot, directory-set, NameHash, and up-case checksums remain
- * their native algorithms.
- */
-typedef struct ff_xxh32 {
-    uint32_t total_len;
-    uint32_t v1;
-    uint32_t v2;
-    uint32_t v3;
-    uint32_t v4;
-    uint8_t mem[16];
-    uint8_t memsize;
-    uint8_t large_len;
-} ff_xxh32;
+/* fauxFAT hashes private structure only; exFAT checksums keep their own rules. */
+typedef XXH32_state_t ff_xxh32;
 
-static uint32_t ff_xxh32_round(uint32_t acc, uint32_t input)
+static void ff_xxh32_init(ff_xxh32 *state, uint32_t seed)
 {
-    acc += input * FF_XXH32_PRIME2;
-    acc = ff_rol32(acc, 13u);
-    return acc * FF_XXH32_PRIME1;
+    (void)XXH32_reset(state, seed);
 }
 
-static void ff_xxh32_stripe(ff_xxh32 *s, const uint8_t p[16])
+static void ff_xxh32_update(ff_xxh32 *state, const uint8_t *data, size_t size)
 {
-    s->v1        = ff_xxh32_round(s->v1, faux_load_le32(p + 0));
-    s->v2        = ff_xxh32_round(s->v2, faux_load_le32(p + 4));
-    s->v3        = ff_xxh32_round(s->v3, faux_load_le32(p + 8));
-    s->v4        = ff_xxh32_round(s->v4, faux_load_le32(p + 12));
-    s->large_len = 1u;
+    (void)XXH32_update(state, data, size);
 }
 
-static void ff_xxh32_init(ff_xxh32 *s, uint32_t seed)
+static uint32_t ff_xxh32_digest(const ff_xxh32 *state)
 {
-    s->total_len = 0u;
-    s->v1        = seed + FF_XXH32_PRIME1 + FF_XXH32_PRIME2;
-    s->v2        = seed + FF_XXH32_PRIME2;
-    s->v3        = seed;
-    s->v4        = seed - FF_XXH32_PRIME1;
-    s->memsize   = 0u;
-    s->large_len = 0u;
-}
-
-static void ff_xxh32_update(ff_xxh32 *s, const uint8_t *p, size_t n)
-{
-    s->total_len += (uint32_t)n;
-
-    if ((size_t)s->memsize + n < 16u) {
-        memcpy(s->mem + s->memsize, p, n);
-        s->memsize = (uint8_t)(s->memsize + n);
-        return;
-    }
-
-    if (s->memsize != 0u) {
-        size_t fill = 16u - s->memsize;
-        memcpy(s->mem + s->memsize, p, fill);
-        ff_xxh32_stripe(s, s->mem);
-        p += fill;
-        n -= fill;
-        s->memsize = 0u;
-    }
-
-    while (n >= 16u) {
-        ff_xxh32_stripe(s, p);
-        p += 16u;
-        n -= 16u;
-    }
-
-    if (n != 0u) {
-        memcpy(s->mem, p, n);
-        s->memsize = (uint8_t)n;
-    }
-}
-
-static uint32_t ff_xxh32_digest(const ff_xxh32 *s)
-{
-    const uint8_t *p = s->mem;
-    size_t n         = s->memsize;
-    uint32_t h;
-
-    if (s->large_len) {
-        h = ff_rol32(s->v1, 1u) + ff_rol32(s->v2, 7u) +
-            ff_rol32(s->v3, 12u) + ff_rol32(s->v4, 18u);
-    } else {
-        h = s->v3 + FF_XXH32_PRIME5;
-    }
-
-    h += s->total_len;
-
-    while (n >= 4u) {
-        h += faux_load_le32(p) * FF_XXH32_PRIME3;
-        h = ff_rol32(h, 17u) * FF_XXH32_PRIME4;
-        p += 4u;
-        n -= 4u;
-    }
-    while (n != 0u) {
-        h += (uint32_t)*p++ * FF_XXH32_PRIME5;
-        h = ff_rol32(h, 11u) * FF_XXH32_PRIME1;
-        --n;
-    }
-
-    h ^= h >> 15;
-    h *= FF_XXH32_PRIME2;
-    h ^= h >> 13;
-    h *= FF_XXH32_PRIME3;
-    h ^= h >> 16;
-    return h;
+    return XXH32_digest(state);
 }
 
 typedef struct ff_structural_hash_state {
