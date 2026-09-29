@@ -8,7 +8,7 @@ See `fauxfat-disk-format.md` for the disk layout, `fauxfat-usage.md` for the API
 
 ## 1. Purpose
 
-fauxFAT gives the host a few ordinary files while firmware keeps each file at a known physical range. The host can overwrite file data, but cannot allocate or resize files or grow the root directory. Strict validation rejects those changes.
+fauxFAT gives the host a few ordinary files while firmware keeps each file at a known physical range. By default the host can overwrite file data, but cannot allocate clusters or grow the root directory. A file configured with an explicit reserved allocation may change its directory length within that fixed extent; strict validation accepts that length change.
 
 ## 2. Physical model
 
@@ -16,12 +16,12 @@ A fauxFAT volume has four relevant kinds of space:
 
 | Kind | Host-visible meaning | Firmware rule |
 | --- | --- | --- |
-| Public file | Ordinary root file | Host may overwrite bytes inside fixed `DataLength`. |
+| Public file | Ordinary root file | Host may overwrite bytes inside `DataLength`; explicitly reserved files may change `DataLength` within their fixed extent. |
 | Named opaque range | Hidden descriptor plus private allocation | Not writable through host block translation; recoverable by logical name and physical range. |
 | Anonymous opaque reserve | Canonically no useful directory object; qualification mode may add a non-file benign owner | Preserved physical capacity for application use or later layout changes. |
 | Filesystem structure / undefined padding | exFAT metadata or semantically irrelevant bytes | Generated, verified, zeroed, or skipped according to the format contract. |
 
-Every useful data allocation is contiguous. Public files are exFAT `NoFatChain` streams. Opaque and anonymous reserved clusters are marked allocated in the exFAT allocation bitmap and carry `0xFFFFFFF7` in the FAT, which fauxFAT uses as its deterministic private/reserved marker.
+Every useful data allocation is contiguous. Public files without explicit capacity are exFAT `NoFatChain` streams. Public files with reserved growth capacity use a contiguous FAT chain so the chain can exceed the current `DataLength`. Opaque and anonymous reserved clusters are marked allocated in the exFAT allocation bitmap and carry `0xFFFFFFF7` in the FAT, which fauxFAT uses as its deterministic private/reserved marker.
 
 Qualification builds may additionally describe each otherwise-ownerless
 anonymous contiguous run with an unrecognized benign Generic Primary entry.

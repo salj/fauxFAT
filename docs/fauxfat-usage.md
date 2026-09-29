@@ -35,6 +35,7 @@ static const fauxfat_file public_files[] = {
         .name = "EDIT.CFG",
         .fd = 2,
         .size = 64ULL * 1024,
+        .allocation_size = 128ULL * 1024,
         .mtime = (time_t)1789161600,
         .data_cluster = FAUXFAT_CLUSTER_AUTO,
     },
@@ -85,6 +86,10 @@ Important configuration rules:
 
 - public and opaque names are 1..15 ISO-8859-1 bytes and must obey the fauxFAT/exFAT restrictions;
 - public file sizes must be non-zero;
+- `allocation_size == 0` uses the minimum cluster-rounded extent and seals the
+  initial directory lengths; a non-zero `allocation_size` must be cluster
+  aligned and at least `size`, and reserves a FAT-chained extent which lets
+  the host change the on-disk directory length within that capacity;
 - opaque sizes must be non-zero multiples of 64 KiB;
 - `mtime` is UTC Unix time and must fit the exFAT 1980..2107 range;
 - public names are case-folded for collision checks;
@@ -126,11 +131,42 @@ rc = fauxfat_write_block(&view, block, sector);
 rc = fauxfat_write_blocks(&view, first_block, count, buffer);
 ```
 
-Only bytes inside public `DataLength` map to `cfg.write`. Metadata, opaque ranges, anonymous reserve, and public allocation slack return `FAUXFAT_EUNMAPPED`.
+Public payload writes map through `cfg.write`. Files with explicit
+`allocation_size` accept writes anywhere inside that reserved capacity, even
+before the host raises `DataLength`; other files stop at their current logical
+length. Opaque ranges and anonymous reserve remain unwritable.
 
-`fauxfat_write_blocks()` validates the full block mapping before issuing the first payload callback. This prevents an unmapped block later in the request from causing partial mapping-level application. It does not turn multiple backend callbacks into a durable transaction.
+Writes to generated root-directory sectors may update the File Set checksum,
+Archive, and host-modifiable modify/access time fields for public files.
+`ValidDataLength` and `DataLength` may change only for files with explicit
+`allocation_size`; those updates must keep `0 <= ValidDataLength <=
+DataLength <= allocation_size` (the current API requires a non-zero
+`DataLength`). The host supplies the sector image and checksum as it would for
+a real exFAT volume; the synthetic view updates its runtime metadata and
+returns the new directory sector on later reads. Length and checksum sectors
+may arrive separately, in either order. A checksum written first is held
+pending until the matching stream update arrives.
 
-For the final sector of a non-sector-aligned public file, only the valid prefix is sent to the payload backend.
+The main and backup boot sectors also accept changes to the exFAT
+`VolumeDirty` bit in `VolumeFlags`. All other boot-sector bytes remain fixed.
+
+The configured `fauxfat_file.size` remains the initial length. Query the
+runtime state after host writes with:
+
+```c
+uint64_t data_length, valid_data_length;
+rc = fauxfat_get_file_lengths(&view, file_index,
+                              &data_length, &valid_data_length);
+```
+
+`fauxfat_write_blocks()` validates the full request on a temporary view before
+issuing payload callbacks. This permits a request to update directory lengths
+and then write newly exposed reserved blocks. A backend failure after an
+earlier operation can still leave that earlier operation applied; this is not
+a durable transaction.
+
+For the final sector of a non-sector-aligned writable range, only the valid
+prefix is sent to the payload backend.
 
 If a caller needs to inspect the translation without performing a write:
 
@@ -139,7 +175,9 @@ fauxfat_write_mapping m;
 rc = fauxfat_translate_write(&view, block, &m);
 ```
 
-On success `m` gives the public file index, fd, byte offset, and valid byte count for that sector.
+On success `m` gives the public file index, fd, byte offset, and writable byte
+count for that sector. For a reserved file, this can extend past the current
+`DataLength`.
 
 ## 3. Enumerate physical descriptors from a view
 
@@ -158,7 +196,7 @@ for (size_t i = 0; i < fauxfat_disk_file_count(&view); ++i) {
 
 Public descriptors come first, followed by opaque descriptors.
 
-`d.data_length` is the logical data length. `d.allocation_blocks` is the complete cluster-rounded physical allocation. They are deliberately different for public files whose size is not cluster-aligned.
+`d.data_length` is the logical data length. `d.allocation_blocks` is the full physical allocation: cluster-rounded for ordinary public files, and possibly larger for a file with explicit `allocation_size`.
 
 ## 4. Materialize or regenerate a block device
 
@@ -207,7 +245,7 @@ undefined       no condition; omitted unless ZERO_UNDEFINED is requested
 preserve        must not be modified
 ```
 
-Named opaque ranges and anonymous reserve are always preserve ranges. Fresh public payload is zeroed through its logical data length; allocation slack is undefined.
+Named opaque ranges and anonymous reserve are always preserve ranges. Fresh public payload is zeroed through its logical data length. For a file with explicit `allocation_size`, the complete reserved extent is zeroed; slack in minimum-sized allocations is undefined.
 
 For a deterministic full image, including otherwise undefined bytes:
 
@@ -825,10 +863,26 @@ arena. `--size-mib N` and `--fauxfat-data-mib N` override those values. The tool
 creates a 512-byte-logical-sector VHDX, attaches it without drive letters while
 formatting, materializes the canonical two-partition GPT through
 `fauxfat_block_format()`, detaches it, then attaches it normally with permanent
-lifetime. Partition 1 is labelled `FAUXQUAL` and contains one fixed 8 MiB
-`QUALIFY.BIN`; partition 2 is Microsoft Basic Data but intentionally has no
-filesystem. Windows can therefore mount/mutate partition 1 and the operator can
-format partition 2 with normal host tooling before running `verify-vhdx` again.
+lifetime. Partition 1 is labelled `FAUXQUAL` and contains `QUALIFY.BIN` with an
+8 MiB initial `DataLength` and a 32 MiB reserved FAT chain; partition 2 is
+Microsoft Basic Data but intentionally has no filesystem. Windows can therefore
+mount/mutate partition 1 and the operator can format partition 2 with normal
+host tooling before running `verify-vhdx` again.
+
+The growth test drives the real Windows filesystem writer through the reserved
+chain:
+
+```text
+fauxfat-qualify.exe grow-test E:\QUALIFY.BIN
+fauxfat-qualify.exe verify-vhdx C:\temp\fauxfat-test.vhdx --require-growth
+```
+
+Replace `E:` with the drive letter Windows assigned to `FAUXQUAL`. `grow-test`
+appends deterministic data through the ordinary file API, taking the file from
+8 MiB to 16 MiB and flushing it. The verifier then requires a 16 MiB directory
+`DataLength`, a valid `ValidDataLength`, and the original 32 MiB allocation
+chain. Plain `verify-vhdx` accepts either the initial 8 MiB length or a larger
+valid length up to that reserved capacity.
 
 For one deliberately redundant allocator experiment, `create-vhdx` and
 `format-raw` also accept `--benign-reserve`.  Canonical `0xFFFFFFF7` FAT

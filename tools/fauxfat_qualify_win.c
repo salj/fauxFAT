@@ -138,6 +138,7 @@ extern BOOL WriteFile(HANDLE file, const void *buffer, DWORD bytes_to_write,
                       DWORD *bytes_written, void *overlapped);
 extern BOOL SetFilePointerEx(HANDLE file, LARGE_INTEGER distance,
                              LARGE_INTEGER *new_pointer, DWORD move_method);
+extern BOOL GetFileSizeEx(HANDLE file, LARGE_INTEGER *size);
 extern BOOL FlushFileBuffers(HANDLE file);
 extern BOOL DeviceIoControl(HANDLE device, DWORD control_code,
                             void *in_buffer, DWORD in_size,
@@ -238,6 +239,8 @@ extern DWORD GetVirtualDiskPhysicalPath(HANDLE handle,
 #define FFQ_DEFAULT_VHDX_MIB         UINT64_C(512)
 #define FFQ_DEFAULT_FAUXFAT_DATA_MIB UINT64_C(64)
 #define FFQ_QUALIFY_FILE_BYTES       (UINT64_C(8) * 1024u * 1024u)
+#define FFQ_QUALIFY_GROWN_FILE_BYTES (UINT64_C(16) * 1024u * 1024u)
+#define FFQ_QUALIFY_FILE_ALLOC_BYTES (UINT64_C(32) * 1024u * 1024u)
 #define FFQ_MIB                      (UINT64_C(1024) * 1024u)
 #define FFQ_ZERO_CHUNK_BYTES         (64u * 1024u)
 #define FFQ_PHYSICAL_PATH_WCHARS     256u
@@ -281,6 +284,8 @@ typedef struct ffq_format_options {
 typedef struct ffq_verify_context {
     int qualify_file_found;
     int qualify_file_bad;
+    int growth_required;
+    uint64_t qualify_file_length;
     size_t descriptor_count;
 } ffq_verify_context;
 
@@ -291,14 +296,16 @@ static void ffq_usage(FILE *out)
             "  fauxfat-qualify.exe create-vhdx <file.vhdx> [--size-mib N] [--fauxfat-data-mib N] [--benign-reserve]\n"
             "  fauxfat-qualify.exe attach-vhdx <file.vhdx>\n"
             "  fauxfat-qualify.exe detach-vhdx <file.vhdx>\n"
-            "  fauxfat-qualify.exe verify-vhdx <file.vhdx>\n"
+            "  fauxfat-qualify.exe grow-test <X:\\QUALIFY.BIN>\n"
+            "  fauxfat-qualify.exe verify-vhdx <file.vhdx> [--require-growth]\n"
             "  fauxfat-qualify.exe format-raw <\\\\.\\PhysicalDriveN> --destroy-user-data [--fauxfat-data-mib N] [--benign-reserve]\n"
             "  fauxfat-qualify.exe verify-raw <\\\\.\\PhysicalDriveN>\n"
             "\n"
             "create-vhdx creates a dynamic VHDX, formats partition 1 as fauxFAT,\n"
             "leaves partition 2 raw, then leaves the VHDX attached normally so\n"
-            "Windows can mount/mutate it. format-raw refuses to run without the\n"
-            "literal --destroy-user-data flag.\n");
+            "Windows can mount/mutate it. grow-test writes QUALIFY.BIN from 8 to\n"
+            "16 MiB through the mounted filesystem. format-raw refuses to run\n"
+            "without the literal --destroy-user-data flag.\n");
 }
 
 static void ffq_print_win_error(const char *what, DWORD code)
@@ -1045,17 +1052,18 @@ static int ffq_build_format(uint64_t disk_blocks, uint64_t fauxfat_data_mib,
     }
     clusters = fauxfat_data_mib * (FFQ_MIB / FAUXFAT_CLUSTER_SIZE);
     if (clusters > UINT32_MAX ||
-        clusters * FAUXFAT_CLUSTER_SIZE < FFQ_QUALIFY_FILE_BYTES) {
-        fprintf(stderr, "fauxFAT data area must be at least 8 MiB\n");
+        clusters * FAUXFAT_CLUSTER_SIZE < FFQ_QUALIFY_FILE_ALLOC_BYTES) {
+        fprintf(stderr, "fauxFAT data area must be at least 32 MiB\n");
         return -1;
     }
 
     memset(file, 0, sizeof(*file));
-    file->name         = "QUALIFY.BIN";
-    file->fd           = 1;
-    file->size         = FFQ_QUALIFY_FILE_BYTES;
-    file->mtime        = (time_t)UINT64_C(1704067200); /* 2024-01-01 UTC */
-    file->data_cluster = FAUXFAT_CLUSTER_AUTO;
+    file->name            = "QUALIFY.BIN";
+    file->fd              = 1;
+    file->size            = FFQ_QUALIFY_FILE_BYTES;
+    file->allocation_size = FFQ_QUALIFY_FILE_ALLOC_BYTES;
+    file->mtime           = (time_t)UINT64_C(1704067200); /* 2024-01-01 UTC */
+    file->data_cluster    = FAUXFAT_CLUSTER_AUTO;
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->files               = file;
@@ -1265,14 +1273,21 @@ static int ffq_emit_descriptor(void *context, unsigned index,
            (file->flags & FAUXFAT_DISK_FILE_NAME_CHANGED) != 0u ? " name-changed" : "");
     if (file->kind == FAUXFAT_DISK_FILE_PUBLIC &&
         strcmp(file->name, "QUALIFY.BIN") == 0) {
-        verify->qualify_file_found = 1;
-        if (file->data_length != FFQ_QUALIFY_FILE_BYTES)
+        verify->qualify_file_found  = 1;
+        verify->qualify_file_length = file->data_length;
+        if (file->data_length < FFQ_QUALIFY_FILE_BYTES ||
+            file->data_length > FFQ_QUALIFY_FILE_ALLOC_BYTES ||
+            file->allocation_blocks !=
+                FFQ_QUALIFY_FILE_ALLOC_BYTES / FAUXFAT_BLOCK_SIZE ||
+            (verify->growth_required &&
+             file->data_length != FFQ_QUALIFY_GROWN_FILE_BYTES))
             verify->qualify_file_bad = 1;
     }
     return 0;
 }
 
-static int ffq_verify_raw_device(ffq_raw_device *raw, int require_qualification)
+static int ffq_verify_raw_device(ffq_raw_device *raw, int require_qualification,
+                                 int growth_required)
 {
     fauxfat_block_device dev = ffq_block_device(raw);
     fauxfat_block_opened opened;
@@ -1284,8 +1299,9 @@ static int ffq_verify_raw_device(ffq_raw_device *raw, int require_qualification)
     int rc;
 
     memset(&verify, 0, sizeof(verify));
-    rc = fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, NULL,
-                            ffq_emit_descriptor, &verify, &descriptor_count);
+    verify.growth_required = growth_required;
+    rc                     = fauxfat_block_open(&opened, &dev, FAUXFAT_BLOCK_WRAPPER_AUTO, NULL,
+                                                ffq_emit_descriptor, &verify, &descriptor_count);
     if (rc != FAUXFAT_BLOCK_OK) {
         fprintf(stderr, "fauxfat_block_open failed: %s (%d)",
                 ffq_block_error_name(rc), rc);
@@ -1366,9 +1382,18 @@ static int ffq_verify_raw_device(ffq_raw_device *raw, int require_qualification)
     }
     if (require_qualification &&
         (!verify.qualify_file_found || verify.qualify_file_bad)) {
-        fprintf(stderr, "QUALIFY.BIN is missing or has the wrong logical size\n");
+        fprintf(stderr,
+                "QUALIFY.BIN is missing or has an invalid length/reserved chain%s\n",
+                growth_required ? " (expected 16 MiB after grow-test)" : "");
         return -1;
     }
+    if (require_qualification)
+        printf("QUALIFY.BIN: logical length=%" PRIu64
+               " bytes, reserved capacity=%" PRIu64 " bytes%s\n",
+               verify.qualify_file_length, FFQ_QUALIFY_FILE_ALLOC_BYTES,
+               verify.qualify_file_length > FFQ_QUALIFY_FILE_BYTES
+                   ? " (grown within reserved extent)"
+                   : " (initial length)");
     return 0;
 }
 
@@ -1531,7 +1556,7 @@ static int ffq_command_create_vhdx(const char *path,
 
     printf("VHDX created and left attached. Windows may assign FAUXQUAL a drive letter.\n");
     printf("Partition 2 is intentionally raw; format it with ordinary Windows tooling if desired.\n");
-    printf("After host mutations, run verify-vhdx against the same file.\n");
+    printf("Run grow-test <drive>:\\QUALIFY.BIN, then verify-vhdx <file> --require-growth.\n");
     ffq_print_physical_path(physical);
     rc = 0;
 
@@ -1623,7 +1648,123 @@ done:
     return rc;
 }
 
-static int ffq_command_verify_vhdx(const char *path)
+static WCHAR ffq_upper_ascii(WCHAR c)
+{
+    if (c >= (WCHAR)'a' && c <= (WCHAR)'z')
+        return (WCHAR)(c - (WCHAR)'a' + (WCHAR)'A');
+    return c;
+}
+
+static int ffq_is_qualify_file_path(const WCHAR *path)
+{
+    static const WCHAR suffix[] = {
+        'Q', 'U', 'A', 'L', 'I', 'F', 'Y', '.', 'B', 'I', 'N', 0
+    };
+    size_t length = ffq_wide_length(path);
+    size_t i;
+
+    if (length < 12u ||
+        (path[length - 12u] != (WCHAR)'\\' &&
+         path[length - 12u] != (WCHAR)'/'))
+        return 0;
+    for (i = 0u; i < 11u; ++i) {
+        if (ffq_upper_ascii(path[length - 11u + i]) != suffix[i])
+            return 0;
+    }
+    return 1;
+}
+
+static int ffq_command_grow_test(const char *path)
+{
+    WCHAR *wide = ffq_absolute_wide_path(path);
+    HANDLE file = FFQ_INVALID_HANDLE_VALUE;
+    LARGE_INTEGER size;
+    LARGE_INTEGER position;
+    uint8_t payload[FFQ_ZERO_CHUNK_BYTES];
+    uint64_t offset;
+    int rc = -1;
+
+    if (!wide) {
+        fprintf(stderr, "cannot resolve QUALIFY.BIN path\n");
+        return -1;
+    }
+    if (!ffq_is_qualify_file_path(wide)) {
+        fprintf(stderr, "grow-test only accepts a path ending in QUALIFY.BIN\n");
+        goto done;
+    }
+    file = CreateFileW(wide, FFQ_GENERIC_READ | FFQ_GENERIC_WRITE,
+                       FFQ_FILE_SHARE_READ | FFQ_FILE_SHARE_WRITE,
+                       NULL, FFQ_OPEN_EXISTING,
+                       FFQ_FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == FFQ_INVALID_HANDLE_VALUE) {
+        ffq_print_win_error("open QUALIFY.BIN", GetLastError());
+        goto done;
+    }
+    if (!GetFileSizeEx(file, &size)) {
+        ffq_print_win_error("GetFileSizeEx QUALIFY.BIN", GetLastError());
+        goto done;
+    }
+    if (size.QuadPart == (int64_t)FFQ_QUALIFY_GROWN_FILE_BYTES) {
+        printf("QUALIFY.BIN is already at the 16 MiB growth-test length.\n");
+        rc = 0;
+        goto done;
+    }
+    if (size.QuadPart != (int64_t)FFQ_QUALIFY_FILE_BYTES) {
+        fprintf(stderr,
+                "grow-test expects an 8 MiB QUALIFY.BIN; found %" PRId64 " bytes\n",
+                size.QuadPart);
+        goto done;
+    }
+
+    position.QuadPart = size.QuadPart;
+    if (!SetFilePointerEx(file, position, NULL, FFQ_FILE_BEGIN)) {
+        ffq_print_win_error("seek QUALIFY.BIN", GetLastError());
+        goto done;
+    }
+    offset = FFQ_QUALIFY_FILE_BYTES;
+    while (offset < FFQ_QUALIFY_GROWN_FILE_BYTES) {
+        uint64_t remaining = FFQ_QUALIFY_GROWN_FILE_BYTES - offset;
+        DWORD wanted       = remaining > sizeof(payload)
+                                 ? (DWORD)sizeof(payload)
+                                 : (DWORD)remaining;
+        DWORD written      = 0u;
+        DWORD i;
+
+        for (i = 0u; i < wanted; ++i)
+            payload[i] = (uint8_t)((offset + i) * UINT64_C(131) + UINT64_C(17));
+        if (!WriteFile(file, payload, wanted, &written, NULL)) {
+            ffq_print_win_error("write QUALIFY.BIN growth data", GetLastError());
+            goto done;
+        }
+        if (written == 0u) {
+            fprintf(stderr, "short write while growing QUALIFY.BIN\n");
+            goto done;
+        }
+        offset += written;
+    }
+    if (!FlushFileBuffers(file)) {
+        ffq_print_win_error("flush QUALIFY.BIN growth data", GetLastError());
+        goto done;
+    }
+    if (!GetFileSizeEx(file, &size)) {
+        ffq_print_win_error("GetFileSizeEx after grow-test", GetLastError());
+        goto done;
+    }
+    if (size.QuadPart != (int64_t)FFQ_QUALIFY_GROWN_FILE_BYTES) {
+        fprintf(stderr, "grow-test ended at an unexpected file length\n");
+        goto done;
+    }
+    printf("Wrote QUALIFY.BIN from 8 MiB to 16 MiB through the host filesystem.\n");
+    rc = 0;
+
+done:
+    if (file != FFQ_INVALID_HANDLE_VALUE)
+        CloseHandle(file);
+    free(wide);
+    return rc;
+}
+
+static int ffq_command_verify_vhdx(const char *path, int growth_required)
 {
     WCHAR *wide = ffq_absolute_wide_path(path);
     HANDLE vhd  = NULL;
@@ -1663,7 +1804,7 @@ static int ffq_command_verify_vhdx(const char *path)
     ffq_print_physical_path(physical);
     if (ffq_open_raw_wide(physical, 0, &raw) != 0)
         goto done;
-    rc = ffq_verify_raw_device(&raw, 1);
+    rc = ffq_verify_raw_device(&raw, 1, growth_required);
     ffq_close_raw(&raw);
 
 done:
@@ -1703,7 +1844,7 @@ static int ffq_command_verify_raw(const char *path)
     }
     if (ffq_open_raw_ascii(path, 0, &raw) != 0)
         return -1;
-    rc = ffq_verify_raw_device(&raw, 0);
+    rc = ffq_verify_raw_device(&raw, 0, 0);
     ffq_close_raw(&raw);
     return rc;
 }
@@ -1740,12 +1881,23 @@ int main(int argc, char **argv)
         return ffq_command_detach_vhdx(argv[2]) == 0 ? 0 : 1;
     }
 
-    if (strcmp(argv[1], "verify-vhdx") == 0) {
+    if (strcmp(argv[1], "grow-test") == 0) {
         if (argc != 3) {
             ffq_usage(stderr);
             return 2;
         }
-        return ffq_command_verify_vhdx(argv[2]) == 0 ? 0 : 1;
+        return ffq_command_grow_test(argv[2]) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[1], "verify-vhdx") == 0) {
+        int growth_required = 0;
+        if (argc == 4 && strcmp(argv[3], "--require-growth") == 0)
+            growth_required = 1;
+        else if (argc != 3) {
+            ffq_usage(stderr);
+            return 2;
+        }
+        return ffq_command_verify_vhdx(argv[2], growth_required) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[1], "format-raw") == 0) {

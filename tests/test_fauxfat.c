@@ -319,8 +319,8 @@ int main(void)
         0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
     };
     fauxfat_file files[] = {
-        { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO },
-        { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, FAUXFAT_CLUSTER_AUTO }
+        { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u },
+        { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, FAUXFAT_CLUSTER_AUTO, 0u }
     };
 
     test_io io;
@@ -622,7 +622,7 @@ int main(void)
     /* File names are ISO-8859-1 bytes rendered directly as UTF-16 code units. */
     {
         fauxfat_file latin = {
-            "caf\xe9.bin", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
+            "caf\xe9.bin", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u
         };
 
         fauxfat_config latincfg = cfg;
@@ -639,8 +639,8 @@ int main(void)
     }
     {
         fauxfat_file collision[] = {
-            { "caf\xe9.bin", 10, sizeof(solver), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO },
-            { "CAF\xc9.BIN", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO }
+            { "caf\xe9.bin", 10, sizeof(solver), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u },
+            { "CAF\xc9.BIN", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u }
         };
 
         fauxfat_config badcfg = cfg;
@@ -650,7 +650,7 @@ int main(void)
     }
     {
         fauxfat_file bad = {
-            "BAD/NAME", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
+            "BAD/NAME", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u
         };
 
         fauxfat_config badcfg = cfg;
@@ -669,7 +669,7 @@ int main(void)
     {
         uint8_t short_data[1234];
         fauxfat_file short_file = {
-            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
+            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u
         };
 
         fauxfat_config short_cfg = cfg;
@@ -855,7 +855,7 @@ int main(void)
     {
         uint8_t short_data[1234];
         fauxfat_file short_file = {
-            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
+            "SHORT.BIN", 12, sizeof(short_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u
         };
         fauxfat_opaque_file opaque = {
             "SECRET.BIN", 13, sizeof(opaque_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
@@ -1442,7 +1442,7 @@ int main(void)
      * benign original-name Vendor Extension records. */
     {
         fauxfat_file long_file = {
-            "ABCDEFGHIJKLMNO", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO
+            "ABCDEFGHIJKLMNO", 11, sizeof(config_data), (time_t)1735787045, FAUXFAT_CLUSTER_AUTO, 0u
         };
 
         fauxfat_config lcfg = cfg;
@@ -1488,8 +1488,8 @@ int main(void)
      */
     {
         fauxfat_file placed_files[] = {
-            { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, 0u },
-            { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, 4u }
+            { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, 0u, 0u },
+            { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, 4u, 0u }
         };
         fauxfat_opaque_file placed_opaque = {
             "SOLVER.DB", 13, sizeof(opaque_data), (time_t)1735787045, 7u
@@ -1615,8 +1615,8 @@ int main(void)
      */
     {
         fauxfat_file placed_files[] = {
-            { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, 0u },
-            { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, 4u }
+            { "SOLVER.DB", 10, sizeof(solver), (time_t)1735787045, 0u, 0u },
+            { "CONFIG.BIN", 11, sizeof(config_data), (time_t)2114380798, 4u, 0u }
         };
         fauxfat_opaque_file placed_opaque = {
             "SOLVER.DB", 13, sizeof(opaque_data), (time_t)1735787045, 7u
@@ -1777,7 +1777,7 @@ int main(void)
     /* exFAT cannot encode dates before 1980 or after 2107. */
     {
         fauxfat_file bad_time = {
-            "BADTIME.BIN", 11, sizeof(config_data), (time_t)315532799, FAUXFAT_CLUSTER_AUTO
+            "BADTIME.BIN", 11, sizeof(config_data), (time_t)315532799, FAUXFAT_CLUSTER_AUTO, 0u
         };
 
         fauxfat_config badcfg = cfg;

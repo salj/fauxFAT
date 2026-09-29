@@ -9,8 +9,8 @@ The profile follows Microsoft exFAT 1.00.
 A fauxFAT volume shall have these properties:
 
 1. Every cluster is unavailable for allocation from the instant the volume is manufactured.
-2. A fixed set of host-visible files exists in fixed root-directory slots. Each file is a contiguous `NoFatChain` extent.
-3. An ordinary host may overwrite bytes inside an existing file without changing allocation metadata.
+2. A fixed set of host-visible files exists in fixed root-directory slots. A file without explicit growth capacity is a contiguous `NoFatChain` extent; a file with reserved capacity is a contiguous FAT chain.
+3. An ordinary host may overwrite bytes inside an existing file without changing allocation metadata. A file with reserved capacity may also change its directory length within that fixed extent.
 4. The root directory has no free directory entries and cannot grow.
 5. Private and reserved ranges are blocked from ordinary file allocation by canonical `0xFFFFFFF7` FAT markers. Ranges whose identity must survive a façade rebuild additionally carry a fauxFAT opaque descriptor entry set in the root.
 6. An opaque descriptor is an ordinary hidden zero-length File set followed by fauxFAT Vendor Extension and Vendor Allocation secondaries; the logical private-file name is stored in vendor data while the Vendor Allocation points at the preserved contiguous range.
@@ -202,7 +202,8 @@ Defined fauxFAT flags are:
 
 ```text
 bit 0   qualification-only benign anonymous-reserve owners are present
-bits 1..15   zero
+bit 1   one or more public files have reserved capacity and mutable lengths
+bits 2..15   zero
 ```
 
 Bit 0 corresponds to `FAUXFAT_PRIVATE_BENIGN_PRIMARY_AND_BAD`. It does not
@@ -210,7 +211,12 @@ weaken the canonical private-cluster rule: the same clusters still have bitmap
 bit `1` and FAT value `0xFFFFFFF7`. Unknown flag bits make the OEM identity
 unrecognizable rather than being silently ignored.
 
-The structural epoch changes only when the device intentionally changes the fauxFAT structure: file slot activation/deactivation, file extent movement/resize, public/private range reclassification, or other material layout changes. Ordinary host writes to file contents do not change it.
+Bit 1 is set automatically when a public file has an explicit `allocation_size`.
+For those FAT-chained public files, it permits `DataLength` and
+`ValidDataLength` changes within the unchanged chain. It does not permit moving
+or resizing that chain.
+
+The structural epoch changes only when the device intentionally changes the fauxFAT structure: file slot activation/deactivation, reserved extent movement/resize, public/private range reclassification, or other material layout changes. A host changing `DataLength` within a reserved FAT chain does not change it.
 
 ## 6. FAT: the actual block ownership map
 
@@ -245,7 +251,37 @@ AllocationBitmap[cluster] = 1
 
 The FAT value is deliberately not meaningful for a `NoFatChain` allocation. Zero is fauxFAT's canonical value so the map is deterministic.
 
-### 6.3 Opaque/private/reserved raw data
+### 6.3 Host-visible files with reserved growth capacity
+
+A public file with explicit `allocation_size` uses `AllocationPossible` with
+`NoFatChain = 0`. Its contiguous FAT chain covers the full reserved capacity,
+which can exceed the clusters required by current `DataLength`:
+
+```text
+intermediate cluster  -> next cluster
+last cluster          -> 0xFFFFFFFF
+AllocationBitmap[cluster] = 1
+```
+
+`allocation_size` must be cluster-aligned and at least the initial
+`DataLength`. When the formatter initializes rather than preserves the file,
+it zeros the complete extent, including bytes beyond `ValidDataLength`, so
+later growth does not expose stale media contents. While the FAT chain and
+`FirstCluster` remain fixed, the host may update `DataLength` and
+`ValidDataLength`; strict validation checks that `ValidDataLength <=
+DataLength` and `DataLength` fits the reserved chain.
+
+The synthetic block API accepts writes across the reserved extent, including
+before `DataLength` grows. It also accepts root-directory sector writes that
+change File Set checksums, Archive, and host-modifiable modify/access time
+fields for public files. The two length fields are mutable only for explicitly
+reserved public files. If the
+checksum and stream entry are in separate sectors, either write order is
+accepted; an early checksum is held until the matching update arrives. Runtime
+metadata lives in the `fauxfat_view`; the original config remains the initial
+state. Boot-sector writes may toggle only exFAT's `VolumeDirty` bit.
+
+### 6.4 Opaque/private/reserved raw data
 
 Every cluster which must not be visible or allocatable to the host, including anonymous placement gaps and tail reserve, has:
 
@@ -262,7 +298,7 @@ For a fauxFAT opaque descriptor the Vendor Allocation secondary sets `NoFatChain
 
 `VolumeFlags.MediaFailure` remains zero. In exFAT, zero is valid when known failures have already been represented as bad clusters in the FAT. Generic disk diagnostics may report absurd quantities of bad space. Such diagnostics are not part of the supported write protocol; if they rewrite the map, the OEM seal fails.
 
-### 6.4 FAT padding
+### 6.5 FAT padding
 
 Bytes after `FatEntry[ClusterCount+1]` through the end of `FatLength` are initialized to zero and are ignored by the fauxFAT seal because exFAT defines that FAT excess space as undefined.
 
@@ -478,7 +514,7 @@ At manufacture time create, last-modified, and last-access timestamps all receiv
 | Offset | Size | Content |
 |---:|---:|---|
 | 0 | 1 | `0xC0` |
-| 1 | 1 | `0x03` (`AllocationPossible=1`, `NoFatChain=1`) |
+| 1 | 1 | `0x03` for minimum allocation (`NoFatChain=1`), or `0x01` for reserved capacity (`NoFatChain=0`) |
 | 2 | 1 | zero |
 | 3 | 1 | NameLength |
 | 4 | 2 | exFAT NameHash |
@@ -488,7 +524,12 @@ At manufacture time create, last-modified, and last-access timestamps all receiv
 | 20 | 4 | FirstCluster |
 | 24 | 8 | DataLength |
 
-The stream owns exactly `ceil(DataLength / 65536)` contiguous clusters. `ValidDataLength` is manufactured equal to `DataLength` so an in-place overwrite never needs to extend it. Cluster slack after `DataLength` is undefined presentation data and is not included in content preservation.
+For `NoFatChain=1`, the stream owns exactly `ceil(DataLength / 65536)` contiguous clusters. For `NoFatChain=0`, the FAT chain owns the complete reserved extent and may exceed current `DataLength`. `ValidDataLength` is manufactured equal to `DataLength`; cluster slack after it is zeroed for explicit reserved extents and otherwise is undefined presentation data.
+
+When OEM flag bit 1 is set, strict validation permits `DataLength` and
+`ValidDataLength` to change in FAT-chained public files, as long as the full
+chain remains unchanged. It canonicalizes those two fields and the
+corresponding File SetChecksum when computing the seal.
 
 ### 10.3 File Name, type `0xC1`
 
@@ -770,7 +811,7 @@ Everything else is incompatible, including:
 FAT changes
 Allocation Bitmap changes
 file FirstCluster changes
-DataLength or ValidDataLength changes
+DataLength or ValidDataLength changes when OEM flag bit 1 is clear, or changes outside the reserved chain when it is set
 NoFatChain changes
 name changes
 new/deleted/moved directory entries
@@ -799,14 +840,14 @@ Strict validation performs this bounded sequence:
    sets, fauxFAT opaque descriptor sets, the exact qualification-only `0xBF`
    reserve owners when the OEM flag selects that mode, or canonical `0xA1`
    padding;
-7. verify each public/opaque File set checksum and permit only the host-mutable timestamp/archive fields listed above;
+7. verify each public/opaque File set checksum and permit host-mutable timestamp/archive fields; when OEM flag bit 1 is set, also permit public length changes that fit the unchanged reserved FAT chain;
 8. recompute FAT, bitmap, root, and upcase XXH32 component fingerprints and the map fingerprint;
 9. compare those values to OEM Parameters;
 10. only after structural validation may the higher layer inspect or promote candidate payloads.
 
-The optional loose scanner is a separate acceptance level. It may scan the same bounded one-cluster root, skip valid-but-unsupported entries, and return only regular root files whose Stream Extension directly proves a contiguous `NoFatChain` allocation. It aborts on malformed/ambiguous structures and never walks a FAT chain or descends into directories. A volume which still satisfies the strict fauxFAT seal is reported as fauxFAT-valid even when reached through the loose API; recognizable fauxFAT with a failed structural seal is reported as changed, not valid.
+The optional loose scanner is a separate acceptance level. It may scan the same bounded one-cluster root, skip valid-but-unsupported entries, and return ordinary two-secondary files only when their Stream Extension proves a contiguous `NoFatChain` allocation. Recognized fauxFAT public sets may use a contiguous FAT chain, which is bounded and checked against the public descriptor. The scanner aborts on malformed/ambiguous structures and does not descend into directories. A volume which still satisfies the strict fauxFAT seal is reported as fauxFAT-valid even when reached through the loose API; recognizable fauxFAT with a failed structural seal is reported as changed, not valid.
 
-There is no general path lookup, cluster allocator, directory repair, orphan recovery, free-space reconstruction, arbitrary FAT-chain traversal, TexFAT handling, intent-log interpretation, or journal replay. If some future host behavior would require any of those for strict acceptance, fauxFAT rejects the image instead of learning another filesystem feature.
+There is no general path lookup, cluster allocator, directory repair, orphan recovery, free-space reconstruction, arbitrary FAT-chain traversal beyond bounded contiguous public extents, TexFAT handling, intent-log interpretation, or journal replay. If some future host behavior would require any of those for strict acceptance, fauxFAT rejects the image instead of learning another filesystem feature.
 
 ## 16. Important qualification points
 
@@ -835,9 +876,9 @@ Known Windows qualification findings as of 2026-09-13:
   may immediately allocate something such as `System Volume Information` into
   that extent. Delete/recreate is therefore not part of the supported update
   protocol;
-- `chkdsk` accepts the canonical bad-cluster reservation as structurally clean,
-  but reports the reserved capacity as bad sectors. This ugly presentation is
-  currently preferable to losing the reservation;
+- `chkdsk` accepts the canonical private bad-cluster reservation as structurally
+  clean, but reports that private capacity as bad sectors. This ugly
+  presentation is currently preferable to losing the reservation;
 - bitmap-only anonymous allocation was tested and rejected: `chkdsk` reports
   bitmap corruption and `/F` releases the unexplained allocation;
 - DiskPart quick-format can replace partition 1 while leaving stale fauxFAT OEM

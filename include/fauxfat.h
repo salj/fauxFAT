@@ -38,6 +38,7 @@ typedef struct fauxfat_file {
     /* 1..15 ISO-8859-1 bytes, excluding exFAT-forbidden characters. */
     const char *name;
     int fd;
+    /* Initial host-visible length in bytes. */
     uint64_t size;
 
     /*
@@ -53,6 +54,15 @@ typedef struct fauxfat_file {
      * Explicit placements must be nondecreasing and nonoverlapping.
      */
     uint32_t data_cluster;
+
+    /*
+     * Optional reserved extent capacity in bytes. Zero uses the minimum
+     * cluster-rounded capacity for size. A non-zero value must be a
+     * cluster-aligned size >= size. Explicit capacities use a FAT-described
+     * contiguous chain so the host may update Stream Extension.DataLength
+     * within the reserved extent without allocating new clusters.
+     */
+    uint64_t allocation_size;
 } fauxfat_file;
 
 /*
@@ -79,8 +89,10 @@ typedef struct fauxfat_opaque_file {
 } fauxfat_opaque_file;
 
 /*
- * File payload I/O. offset and length are always bounded by the corresponding
- * fauxfat_file.size. A callback receives the descriptor from fauxfat_file.fd.
+ * File payload I/O. Reads are bounded by the current ValidDataLength. Writes
+ * to files with explicit allocation_size are bounded by that reserved
+ * capacity; other writes stop at the current DataLength. A callback receives
+ * the descriptor from fauxfat_file.fd.
  *
  * Return 0 on success. Any non-zero callback return value is propagated by
  * fauxfat_read_* / fauxfat_write_* unchanged. Callbacks should therefore use
@@ -163,13 +175,30 @@ typedef struct fauxfat_view {
     uint32_t upcase_xxh32;
     uint32_t upcase_checksum;
     uint32_t boot_checksum;
+
+    /* Library-maintained from configured/recovered reserved file extents. */
+    uint8_t mutable_file_lengths;
+    /* Runtime main/backup exFAT VolumeFlags (VolumeDirty is host-writable). */
+    uint16_t volume_flags;
+    uint16_t backup_volume_flags;
+
+    /* Runtime Stream Extension lengths for synthetic public files. */
+    uint64_t file_data_length[FAUXFAT_MAX_FILES];
+    uint64_t file_valid_data_length[FAUXFAT_MAX_FILES];
+
+    /* Host-writable Archive/modify/access fields from each File entry. */
+    uint8_t file_primary_fields[FAUXFAT_MAX_FILES][13];
+
+    /* A host may write the File Set checksum sector before its stream sector. */
+    uint16_t pending_file_set_checksum[FAUXFAT_MAX_FILES];
+    uint8_t pending_file_set_checksum_valid[FAUXFAT_MAX_FILES];
 } fauxfat_view;
 
 /*
  * Translation of one volume-relative disk block into a file access range.
- * length is in 1..512. It can be shorter than a disk block only for the final
- * sector of a file whose DataLength is not sector aligned. Bytes after length
- * are outside the file and must not be passed to the backend.
+ * length is in 1..512. It can be shorter than a disk block only at the end of
+ * a writable range. For an explicitly reserved file, that range is
+ * allocation_size, even if the current DataLength is smaller.
  */
 typedef struct fauxfat_write_mapping {
     size_t file_index;
@@ -326,6 +355,12 @@ int fauxfat_describe_disk_file(const fauxfat_view *view,
                                size_t index,
                                fauxfat_disk_file *out);
 
+/* Current synthetic Stream Extension lengths for one configured public file. */
+int fauxfat_get_file_lengths(const fauxfat_view *view,
+                             size_t file_index,
+                             uint64_t *data_length,
+                             uint64_t *valid_data_length);
+
 /*
  * Render one volume-relative 512-byte block. partition_lba is metadata only;
  * callers presenting a whole disk subtract the partition start before calling.
@@ -344,30 +379,32 @@ int fauxfat_read_blocks(const fauxfat_view *view,
 
 /*
  * Translate one volume-relative block write into a bounded public-file range.
- * Metadata blocks and cluster slack beyond a file's DataLength return
- * FAUXFAT_EUNMAPPED. No backend callback is made.
+ * For files with explicit allocation_size, reserved blocks are writable up to
+ * that capacity, including blocks beyond the current DataLength. Other
+ * metadata and ranges return FAUXFAT_EUNMAPPED. No backend callback is made.
  */
 int fauxfat_translate_write(const fauxfat_view *view,
                             uint64_t block_address,
                             fauxfat_write_mapping *mapping);
 
 /*
- * Apply one translated block write through config.write(). For a partial final
- * sector only the bytes inside DataLength are passed to the backend; the
- * sector tail remains synthetic zero data.
+ * Apply a public payload write through config.write(), or permitted host
+ * metadata updates to a generated boot/root-directory sector. A partial final
+ * payload sector passes only bytes inside the writable allocation.
  */
-int fauxfat_write_block(const fauxfat_view *view,
+int fauxfat_write_block(fauxfat_view *view,
                         uint64_t block_address,
                         const uint8_t in[FAUXFAT_BLOCK_SIZE]);
 
 /*
- * Apply adjacent block writes. The complete disk mapping is preflighted before
- * the first callback, so an unmapped block causes no backend I/O. Adjacent
- * blocks within one file are coalesced into one callback range. A backend
- * failure after an earlier callback can of course leave earlier writes applied;
- * this is mapping-validation atomicity, not durable transactionality.
+ * Apply adjacent block writes. The complete request is preflighted before the
+ * first payload callback, including directory length/checksum changes and
+ * writes to newly exposed reserved blocks. Adjacent payload blocks within one
+ * file are coalesced into one callback range. A backend failure after an
+ * earlier operation can leave earlier writes applied; this is request
+ * validation atomicity, not durable transactionality.
  */
-int fauxfat_write_blocks(const fauxfat_view *view,
+int fauxfat_write_blocks(fauxfat_view *view,
                          uint64_t first_block,
                          size_t block_count,
                          const uint8_t *in);
